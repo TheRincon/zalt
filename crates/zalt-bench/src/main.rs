@@ -354,9 +354,13 @@ fn print_version(zstd: &Path) {
     }
 }
 
+/// `--no-check` for the same reason as `compress_bytes`, which see. The four
+/// bytes are noise in a ratio, but a baseline should describe the same frames
+/// the decode benchmark actually decodes.
 fn compressed_size(zstd: &Path, path: &Path, level: u32) -> Option<u64> {
     let out = Command::new(zstd)
         .arg(format!("-{level}"))
+        .arg("--no-check")
         .arg("-c")
         .arg("-q")
         .arg(path)
@@ -426,8 +430,23 @@ impl MachineState {
     /// free RAM means the memory compressor has been active, and a decode that
     /// allocates its output is then measuring page reclaim as much as entropy
     /// coding.
+    ///
+    /// The swap allowance needs an absolute floor as well as a share, because
+    /// Darwin sizes the swap file *dynamically*: `swap_total_mb` is itself a
+    /// measure of how much pressure the machine has already been under — about
+    /// 1 GB after a reboot, 12 GB after a long uneasy session. A purely
+    /// relative test therefore gets **stricter as the machine gets cleaner**,
+    /// which is backwards. 56 MB of residual swap is 5.5% of a fresh 1 GB file
+    /// and fails a check that 600 MB would pass on a 12 GB one — so the
+    /// warning fired on every run of the quiet session it exists to certify,
+    /// making it unfalsifiable at exactly the moment it matters.
     fn quiet(&self) -> bool {
-        self.load_1min < 2.0 && self.swap_used_mb < 0.05 * self.swap_total_mb
+        /// Below this the compressor has not done enough to move a decode,
+        /// whatever share of the current swap file it happens to represent.
+        const SWAP_FLOOR_MB: f64 = 256.0;
+
+        let swap_allowance = SWAP_FLOOR_MB.max(0.05 * self.swap_total_mb);
+        self.load_1min < 2.0 && self.swap_used_mb < swap_allowance
     }
 
     fn report(&self) {
@@ -715,9 +734,31 @@ fn permissive_limits() -> zalt_codec::params::DecodeLimits {
     zalt_codec::params::DecodeLimits::default()
 }
 
+/// Compress with the reference encoder, **without a content checksum**.
+///
+/// # Why `--no-check`
+///
+/// The corpus is built by shelling out to the zstd *CLI*, and the CLI writes a
+/// content checksum by default. The *library* does not — `ZSTD_c_checksumFlag`
+/// defaults off — so frames produced server-side by application code, which is
+/// what a browser actually receives, typically carry none. Taking the CLI's
+/// default meant every measurement in `doc/ZALT-MAC.md` §10 charged zalt for an
+/// XXH64 pass over the output that the deployed workload does not pay.
+///
+/// It is worth 8% on this corpus (measured by alternating two frames that
+/// differ only in this flag), so the harness was reporting a decoder about 8%
+/// slower than the one that will run in the browser, on the input it will run
+/// on. The checksum path is not thereby untested — correctness is pinned by the
+/// conformance corpus, and its *cost* is measurable on demand by pointing
+/// `zalt-bench profile` at a checksummed frame.
+///
+/// The reference's own `zstd -b` benchmarks no-checksum frames for exactly the
+/// same reason, so this also makes the two directly comparable rather than
+/// requiring the 16% correction that comparison needed before.
 fn compress_bytes(zstd: &Path, path: &Path, level: u32) -> Option<Vec<u8>> {
     let out = Command::new(zstd)
         .arg(format!("-{level}"))
+        .arg("--no-check")
         .arg("-c")
         .arg("-q")
         .arg(path)
@@ -835,4 +876,45 @@ fn drive<B: Backend>(compressed: &[u8], limits: zalt_codec::params::DecodeLimits
         }
     }
     std::hint::black_box(total);
+}
+
+#[cfg(test)]
+mod machine_state_tests {
+    use super::MachineState;
+
+    fn at(load_1min: f64, swap_used_mb: f64, swap_total_mb: f64) -> MachineState {
+        MachineState {
+            load_1min,
+            swap_used_mb,
+            swap_total_mb,
+        }
+    }
+
+    /// The case the threshold was wrong about, and the reason it is pinned:
+    /// this is the state of the machine immediately after the reboot the
+    /// measurement protocol asks for, and the old relative-only test called it
+    /// noisy.
+    #[test]
+    fn residual_swap_in_a_fresh_boots_small_swap_file_is_still_quiet() {
+        assert!(at(1.30, 56.5, 1024.0).quiet());
+    }
+
+    /// The same *share* of a swap file grown large by real pressure is not
+    /// quiet — the floor raises the allowance, it must not lower it.
+    #[test]
+    fn the_floor_never_admits_more_than_the_share_on_a_large_swap_file() {
+        assert!(!at(1.30, 700.0, 12288.0).quiet());
+        assert!(at(1.30, 400.0, 12288.0).quiet());
+    }
+
+    /// Swap heavy enough to matter is noisy however big the file is.
+    #[test]
+    fn swap_past_the_floor_is_noisy_on_a_small_swap_file() {
+        assert!(!at(1.30, 300.0, 1024.0).quiet());
+    }
+
+    #[test]
+    fn load_alone_is_enough_to_make_a_machine_noisy() {
+        assert!(!at(4.00, 0.0, 1024.0).quiet());
+    }
 }

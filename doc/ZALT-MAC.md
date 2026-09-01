@@ -3,7 +3,7 @@
 **Status:** M0–M2 complete; M3 (Apple Silicon) in progress
 **Date:** 2026-08-31 (design draft 2026-08-24)
 **Primary target:** aarch64-apple-darwin (M1 and later)
-**First consumer:** a WASM-native, JavaScript-free web browser
+**First consumer:** GRAZER, a WASM-native, JavaScript-free web browser
 
 ---
 
@@ -1021,25 +1021,34 @@ the host the allocator seam was built for, and it currently cannot reach it.
 - [x] Zero-copy `Sink` — no throughput gain, but no forced caller buffer.
 - [x] `zalt-bench decode` — end-to-end throughput, and a timing core that
       survives a laptop.
+- [x] Harness corrected (seventh pass): corpus frames built with `--no-check` to
+      match what the library emits, and the quiet-machine check given an
+      absolute swap floor. **Both change reported figures without changing the
+      decoder** — see the seventh pass before comparing across them.
 - [~] Fuse sequence decode with execution — tried, ~4% slower, reverted.
 - [~] FSE 3-state interleaving — largely already in place.
 - [~] Double-symbol Huffman tables — implemented, 8.4% slower on real `.zdoc`,
       reverted. Conflicts with the four-stream interleave.
 - [x] Per-block FSE table clones removed (+9.6% on real `.zdoc`).
-- [x] Checksum skipped when the frame declares none (~26% on such frames).
+- [x] Checksum skipped when the frame declares none (8% on a quiet machine; the
+      ~26% first recorded was memory pressure — see the seventh pass).
 - [~] Match-source prefetch — tried, 3.5% slower, struck. (NEON XXH64 struck
       too — see §5.)
 - [x] `backend_equivalence` fuzzing clean — 26,916 runs under ASan.
 - [~] `zalt-darwin` — profiling does not justify it; M2's pool captures the
       memory cost portably. Not built.
 
-**Where it stands.** All figures below were taken on a **busy** machine and are
-lower bounds; see the measurement protocol later in this section, and re-take
-them on a quiet one before treating any as a baseline.
+**Where it stands.** Figures below were taken on a **busy** machine and are
+lower bounds, *except* the standing-numbers table, which was re-taken on a quiet
+one in the seventh pass. Two harness corrections landed there as well, and both
+move reported figures without touching the decoder — read the seventh pass
+before comparing anything in this section against a fresh run.
 
 On 35 MB of varied text at `zstd -3`, the starting point was 99 MB/s. On the
 current 60 MB corpus the same path reaches **640 MB/s** through a zero-copy
-sink, against **1400 MB/s** for `zstd -t` — a **2.2x** gap, down from ~9x.
+sink. The 640 has since been confirmed on a quiet machine and is *not* a floor;
+the **1400 MB/s** reference it was compared against was, and the gap is **2.7x**
+rather than the 2.2x reported here. See the seventh pass.
 
 Two caveats on that comparison. The corpora differ, so the 99 → 640 figures are
 not a single controlled series; the trustworthy numbers are the per-change A/B
@@ -1198,9 +1207,18 @@ followed, and only one of them did anything.
 
 **Hashing was not gated on the frame declaring a checksum.** Every byte of
 output was hashed whether or not anything would ever compare the result. On a
-`--no-check` frame, skipping it is worth **~26%** — more than the 7% the
-profile suggested, because not hashing also avoids pulling all of the output
-back through the cache.
+`--no-check` frame, skipping it measured **~26%** here — more than the 7% the
+profile suggested, and the explanation offered was that not hashing also avoids
+pulling all of the output back through the cache.
+
+**That 26% did not survive a quiet machine; the real figure is 8%.** The
+explanation is what gives the correction away: pulling output back through the
+cache is only expensive when something else is contending for it, so the
+number was largely measuring the memory compressor. The change is still worth
+making — 8% for a branch is a good trade, and it is free on frames that declare
+no checksum, which §10 notes is what server-side library callers actually emit.
+But the reasoning was right in a way that should have predicted its own
+fragility, and did not. See the seventh pass.
 
 That is not a niche case. The zstd *CLI* writes a checksum by default, which is
 why every frame in this document's benchmarks has one; but `ZSTD_c_checksumFlag`
@@ -1319,6 +1337,170 @@ a decoder rather than allocating one per frame was worth ~45% — but M2's
 `Recycler` and pool already capture that portably, which is a better outcome
 than a `mach_vm` dependency.
 
+#### Seventh pass: the quiet machine, and what it corrected
+
+The first session to measure after a restart, with nothing else running. It
+changed no code. Three of the numbers this section had been quoting were wrong,
+and **all three were wrong in the direction that flattered us** — which is the
+finding, because none of them was a coding error and each had a plausible
+reason recorded beside it.
+
+**What held.** `sink` at 640 MB/s on `corpus/varied.txt`, reproduced to within
+0.8%. The real `.zdoc` documents at 175–220 MB/s against the 170–216 recorded.
+`just gate` green at 290 tests. The corpus survived the reboot as designed.
+
+**What did not, and why.**
+
+| claim | recorded | quiet machine | why it was wrong |
+|---|---:|---:|---|
+| `zstd -t` reference | 1400 | **1169** | never reproduced; and `-t` is the wrong shape regardless |
+| checksum skip | ~26% | **8%** | the 26% was mostly the memory compressor |
+| `corpus/ztml` = "3–12 KB documents" | ~434 | **209** | 83% of the corpus by bytes is one 219 KB synthetic file |
+
+The third is the one to take seriously, because it is a *labelling* error rather
+than a measurement error and it has been steering the roadmap. `just measure
+corpus/ztml` time-weights its files, correctly — but `synthetic.zdoc` is 219 KB
+of the corpus's 264 KB and decodes at 558 MB/s, so it supplies most of the
+weight. The aggregate is a number about the synthetic file. The six real
+documents, measured alone, are **209 MB/s time-weighted** against **504 MB/s**
+for `zstd -b3` on the same six: a **2.41x** gap on the workload §8 says is the
+actual target.
+
+| what | ratio | zalt sink | zstd `-b3` | gap |
+|---|---:|---:|---:|---:|
+| `corpus/varied.txt`, 61 MB | 12.0x | 640 · **686** no-check | 1964 | 2.86x* |
+| 6 real `.zdoc`, 3.4–11.8 KB | 2.48x | 209 | 504 | 2.41x† |
+| `synthetic.zdoc`, 219 KB | 12.1x | 558 | — | — |
+
+\* matched, and the 686 is the number in the ratio: `-b3` never checksums, so
+the comparable zalt figure is the no-checksum one from the isolated flag A/B.
+The 640 beside it is the checksummed `just measure` result and is **not**
+comparable to the reference in the same row.
+
+† *not* matched. zalt checksums here and `-b3` does not, so the real gap on the
+target workload is somewhat under 2.41x. This is the row most worth re-taking
+now that the harness passes `--no-check`.
+
+**Interference is one-sided — but only for the code, not for the comparison.**
+This section's governing rule is sound and was applied too broadly. A busy
+machine can only make *zalt* look slower, so zalt's figures really were floors.
+It can only make the *reference* look slower too — so quoting a reference taken
+under load does not produce a conservative gap, it produces a flattering one.
+Every number in a ratio needs the discipline, not just the numerator.
+
+**The quiet-machine warning was itself broken, and failed silently.** It fired
+on every run of this session, at loads as low as 1.30 on a machine doing
+nothing. The swap term was `used < 5% of total`, and Darwin sizes the swap file
+dynamically — so `total` is a measure of past pressure, about 1 GB after a
+reboot against the 12 GB this laptop reaches after a long session. 56 MB of
+residual swap is 5.5% of a fresh file and fails; 600 MB of a grown one passes.
+**The check got stricter as the machine got cleaner**, so it was loudest at
+exactly the moment it was meant to certify, and a session that did the right
+thing was told its numbers were floors anyway. Fixed with an absolute floor
+alongside the share, and pinned by four tests in `zalt-bench` — the first that
+crate has had.
+
+**The harness now compresses with `--no-check`, and this breaks the series.**
+The corpus was being built by the zstd *CLI*, which writes a content checksum
+by default; the *library* does not, so frames produced server-side by
+application code — what a browser actually receives — typically carry none.
+Every figure recorded in this section therefore charged zalt for an XXH64 pass
+the deployed workload does not pay, on a corpus chosen to represent that
+workload. `compress_bytes` now passes `--no-check`, which also matches what
+`zstd -b` benchmarks and removes the correction the comparison needed.
+
+**Consequence, and it is a trap: every number above this paragraph was taken
+with checksummed frames, and every number below will not be.** On
+`corpus/varied.txt` that is a step of about **8%** — 640 becomes roughly 690 —
+caused by a flag and by no change to the decoder whatsoever. Anyone A/B-ing a
+new build against a figure recorded here will read that as an 8% improvement
+they did not make. This is the same "two runs at different times are not
+comparable" hazard this section keeps rediscovering, in its most durable form
+yet, because the discontinuity is now baked into the tool rather than into the
+weather. **Re-baseline before trusting any comparison across it**, and note that
+the change has not been re-measured — the 8% is the isolated A/B of the flag,
+not a fresh corpus run.
+
+**What this changes about what to do next.** The gap on the target workload is
+2.41x, and §10's own profile of a real document puts ~18% in entropy table
+construction before a content byte is touched. That share is not reachable by
+the unsafe seam, which targets inner loops that small documents barely enter;
+it is exactly what a dictionary removes. **M4 addresses a larger share of the
+target workload than the unsafe seam does**, and it does so without spending
+the security claim. §7's adoption caveat is untouched by any of this and
+remains the reason M4 is not a free win.
+
+> **Corrected by the eighth pass.** The first two sentences hold — the 18.7% is
+> real and is not reachable by unsafe. The conclusion does not: a profile taken
+> immediately afterwards puts **48%** of real-`.zdoc` time in bounds-checked
+> inner loops, the same share as on the code corpus. Small documents do not
+> "barely enter" them. M4 and the unsafe seam are complementary, and this
+> paragraph reached a comparative verdict from one side's number alone.
+
+#### Eighth pass: the post-harness baseline, and the profile that corrects the plan
+
+Taken on a quiet machine with the corrected harness (`--no-check` frames, swap
+floor). **This is the reference point for the unsafe-seam experiment**; the
+tables above it are the old, checksummed series and are not comparable.
+
+| workload | scalar | neon | **sink** | `zstd -b3` | gap |
+|---|---:|---:|---:|---:|---:|
+| `corpus/varied.txt`, 61 MB | 498.7 | 643.5 | **698.2** | 1965.6 | **2.82x** |
+| 6 real `.zdoc`, time-weighted | — | — | **213.8** | 503.5 | **2.36x** |
+| `synthetic.zdoc`, 219 KB | 526.8 | 581.7 | **594.6** | — | — |
+
+Per-file real `.zdoc` sink runs 179–227 MB/s. The `--no-check` change moved
+`sink` from 639.8 to 698.2 (+9.1%) on the code corpus and 209.1 to 213.8 (+2.2%)
+on real documents — larger where there is more output to hash, as expected, and
+in both cases from a flag rather than from the decoder. The references reproduce
+to within 0.2% across sessions, which is worth knowing: `-b3` is a far steadier
+instrument than `zstd -t` was.
+
+**The fresh profile, and it overturns the reason given for preferring M4.**
+Leaf-weighted, harness timer excluded, categories aggregated:
+
+| | real `.zdoc` | code corpus |
+|---|---:|---:|
+| match / literal copy | 29.5% | 45.2% |
+| sequence decode (FSE) | 22.6% | 26.1% |
+| **entropy table setup** | **18.7%** | 6.3% |
+| Huffman decode | 13.9% | 2.6% |
+| bit reads | 11.8% | 19.8% |
+| allocator | 2.8% | 0.1% |
+
+The 18.7% confirms the sixth pass's table-setup finding exactly, and it remains
+dictionary-addressable and *not* reachable by unsafe — §6 places
+`forbid(unsafe_code)` on table construction, which is precisely this code.
+
+But the seventh pass concluded from that number that the unsafe seam "targets
+inner loops that small documents barely enter", and **that is wrong**. Summing
+the categories where bounds-checked indexing actually lives — sequence decode,
+Huffman decode and bit reads — gives **48.3% on real `.zdoc` and 48.5% on the
+code corpus**. The surface is the same size on both workloads; small documents
+enter those loops as much as large ones do, they simply also pay a table-setup
+cost that large ones amortise away.
+
+So M4 and the unsafe seam are **complementary, not competing**, and the earlier
+framing of them as alternatives was an artefact of reading one number without
+its complement. Two further cautions on the 48%: bounds checks are only a
+fraction of what those loops cost, so the realisable gain is a fraction of 48%,
+not 48%; and the largest category on both workloads — match and literal copy —
+already runs through `zalt-neon`'s kernels and is *already* unsafe, so it is not
+additional surface.
+
+**Where to put the unsafe, in profile order.** Highest value first, and each is
+independently revertible:
+
+1. **FSE table lookup in `sequences::decode`** — 22.6% / 26.1%, the largest
+   safe-code category on both workloads, and the index is already masked to
+   `1 << accuracy_log` by `entry_masked`, so the bound is established by
+   construction rather than by the check being removed.
+2. **`huf::Table::decode_four`** — 13.9% on real `.zdoc` against 2.6% on the
+   code corpus. Small-document-specific, and the four-stream interleave means
+   four independent bounds checks per step.
+3. **`BackwardBits`** — 11.8% / 19.8%, though this reader is already
+   word-at-a-time, so what remains is the cursor check rather than a per-bit one.
+
 #### The measurement protocol — read this before quoting a number
 
 Everything below is `just measure`. It exists because the figures in this
@@ -1337,10 +1519,37 @@ memory compressor competes for CPU *and* bandwidth, and this laptop has sat at
 the load average and swap usage and warns when they are not clean; believe a
 small delta only when it does not warn.
 
+**Then do not measure for ten minutes.** A reboot starts work of its own, and
+the last one put `ANECompilerService` — Apple's Neural Engine model compiler,
+triggered at login — at 99% of a core for roughly ten minutes. Load average is a
+*lagging* indicator and took several minutes more to show it, so the window
+right after a restart looks quiet on `uptime` and is not. Check what is actually
+running, not just the average:
+
+```sh
+ps -Ao %cpu,comm -r | head -5
+```
+
+It resolves on its own; nothing needs killing. Spend the wait on the builds —
+`cargo build --release -p zalt-bench`, compressing reference frames — so that
+the quiet window, once it arrives, holds only measurements.
+
 **The corpus is `corpus/varied.txt`**, about 60 MB of *distinct* Rust sources.
 Distinct matters: an earlier corpus was one file repeated, which at level 3
 fits inside the window and therefore measured match copy rather than entropy
 decoding. `corpus/` is gitignored and local by design (§5).
+
+**`just measure corpus/ztml` does not report the ZTML number.** Its total is
+time-weighted, correctly — and `synthetic.zdoc` is 219 KB of that corpus's
+264 KB, so it supplies most of the weight and the total mostly describes it.
+For the workload §8 is about, read the per-file rows instead:
+
+```sh
+./target/release/zalt-bench decode corpus/ztml 3   # per-file table
+```
+
+The six real documents run 175–220 MB/s, 209 time-weighted. The total runs ~435.
+Both are true; only one of them is about `.zdoc` traffic.
 
 **The columns.**
 
@@ -1354,15 +1563,39 @@ pressure they include the kernel's page reclaim. Reusing the decoder rather
 than building one per iteration moved `sink` by roughly 45% on its own — the
 harness was measuring `malloc` as much as Huffman.
 
-**The reference.** Compare against `zstd -t`, not `zstd -d -c > /dev/null`:
-test mode decodes and verifies without writing, which is what `sink` does.
-Writing 60 MB to `/dev/null` costs real `write` syscalls and understates the
-reference badly — 948 MB/s piped versus **1400 MB/s** in test mode on this
-corpus.
+**The reference — use `zstd -b3`, not `zstd -t`.** This advice has now been
+wrong twice in the same direction, and the correction is the same each time:
+*the reference must be measured in the same shape as `sink`.*
+
+`sink` decodes from a buffer already in memory, through a decoder it reuses,
+writing nowhere. So must the reference. Three candidates on `corpus/varied.txt`:
+
+| how | MB/s | what it also measures |
+|---|---:|---|
+| `zstd -d -c > /dev/null` | 948 | 60 MB of real `write` syscalls |
+| `zstd -t` | 1169 | a process spawn and a file read *per iteration* |
+| `zstd -t`, spawn subtracted | 1288 | a file read per iteration |
+| **`zstd -b3`** | **1964** | nothing — in-memory, context reused |
+
+The first correction moved from the pipe to test mode, for the right reason.
+It stopped one step short: test mode still forks a process and opens a file
+every iteration, which on this corpus is **4.83 ms** of the 52.7 ms measured —
+about 9%. `zstd -b` is zstd's own benchmark mode, and it is the only one of
+these built to measure the codec rather than the CLI.
+
+One trap left in reading `-b` output: its line is `… , C MB/s, D MB/s`, and the
+*second* figure is decompression.
+
+The checksum used to be a second trap and is now handled. `-b` frames carry no
+content checksum, because `ZSTD_c_checksumFlag` defaults off in the library;
+the CLI defaults it on, and the harness builds `corpus/`'s frames by shelling
+out to the CLI. The two sides therefore measured different work — worth 16% to
+the reference and 8% to us — until `compress_bytes` was changed to pass
+`--no-check`. Both sides now decode checksum-free frames and are directly
+comparable.
 
 ```sh
-zstd -3 -q -f corpus/varied.txt -o /tmp/varied.zst
-zstd -t -q /tmp/varied.zst      # time this, best of several
+zstd -b3 -i5 corpus/varied.txt   # second MB/s figure is decode; no checksum
 ```
 
 **To compare two versions**, none of the above is sufficient. Build both,
@@ -1383,21 +1616,40 @@ was understood.
 
 #### Standing numbers, and what they are worth
 
-Taken on a **busy** machine (load 4–7, 10 GB swap in use), so every figure is
-a lower bound:
+Re-taken on a **quiet** machine (load 1.3–2.4, 56 MB swap, nothing else
+running), best of nine, against the busy figures they replace.
 
-| | MB/s |
-|---|---:|
-| zalt, `sink` | 635 |
-| zalt, `neon`, one-shot with allocation | 571 |
-| zalt, `scalar`, one-shot with allocation | 458 |
-| `zstd -t` | 1400 |
+**All of these are checksummed-frame numbers and the harness no longer produces
+such frames** — `compress_bytes` passes `--no-check` as of the seventh pass, so
+a fresh `just measure` should land about 8% above the quiet column with no code
+change behind it. Treat this table as the last of the old series, not as a
+baseline to compare a new build against.
 
-That is a **2.2x** gap on the like-for-like comparison, not the ~4x this
-section reported before the harness was fixed. How much of the remainder is
-real and how much is the machine is exactly what a quiet run is for; these
-should be re-taken after a restart before any of them is treated as a
-baseline.
+| | busy (floor) | **quiet** |
+|---|---:|---:|
+| zalt, `sink` | 635 | **639.8** |
+| zalt, `neon`, one-shot with allocation | 571 | **594.8** |
+| zalt, `scalar`, one-shot with allocation | 458 | **471.3** |
+
+**The floors were nearly tight, and which ones moved confirms the model.**
+`sink` gained 0.8% — nothing — while the two paths that allocate gained 4.2%
+and 2.9%. That is exactly the split this section predicts: only the allocating
+paths were ever exposed to page reclaim, so only they were being held down.
+`sink` is in-memory and compute-bound, and was never a lower bound at all.
+
+The reference is the figure that was wrong, and it was wrong in the direction
+that flattered us — `zstd -t` measured **1169 MB/s**, not 1400, and the 1400 has
+not been reproduced. Matched shape and matched checksum, on `corpus/varied.txt`:
+
+| comparison | zalt | zstd | gap |
+|---|---:|---:|---:|
+| in-memory steady state, no checksum | 686 | 1964 (`-b3`) | **2.86x** |
+| in-memory steady state, both checksummed | 635 | ~1689 (derived) | **2.66x** |
+
+So the honest gap on this corpus is **~2.7x**, not 2.2x. Nothing regressed;
+the comparison was measuring zalt's in-memory path against zstd's
+process-per-iteration path, and the harness overhead was being counted as our
+margin.
 
 #### The measurements in this section are lower bounds
 
@@ -1419,10 +1671,19 @@ this section and worth re-running before treating the design as settled.
 The lesson generalises past this project: **A/B two binaries back to back, and
 treat any absolute number taken on a shared machine as a lower bound.**
 
+**Since re-taken on a quiet machine** (seventh pass). The floors turned out to
+be within 1–4% of the real figures, so the per-change A/B results above stand.
+The lesson needs one amendment, though: a lower bound on *our* number is not a
+lower bound on a *ratio*. The reference was quoted from the same busy machine
+and was understated by more than zalt was, which turned a 2.7x gap into a
+reported 2.2x. Apply the discipline to the denominator too.
+
 #### What is left, and whether parity is reachable
 
 Profile after this pass: `sequences::decode` 22%, match copy 16%, literal writes
-12%, `execute` 12%, bit reads 17%, Huffman 4%, xxh64 4%.
+12%, `execute` 12%, bit reads 17%, Huffman 4%, xxh64 4%. **Superseded — see the
+eighth pass**, which re-profiles both workloads on the corrected harness. The
+`xxh64` 4% in particular is now zero on the frames the harness builds.
 
 Fusion was tried and reverted. Three-state FSE interleaving is largely already
 in place — the loop fetches all three entries before using any of them and
@@ -1493,12 +1754,21 @@ the same in each is a function the acceleration is not reaching.
 
 #### What is next, in profile order
 
-`memmove` is now 24%, and it is the output copy: every byte is written to the
-window, copied window → caller, then read again by XXH64 — three passes where
-the reference does one write and one read. Closing it means letting the caller
-take slices of the window instead of a `Vec` it owns, which is an API addition
-rather than a tuning change. FSE sequence decode is 23% and still has §5's
-untried item #4, three-state interleaving, against it.
+**Stale — read the eighth pass instead.** This paragraph described a decoder
+that no longer exists, and is kept only so the reasoning is not re-derived.
+
+It said: `memmove` is 24%, being the output copy — every byte written to the
+window, copied window → caller, then read again by XXH64, three passes where the
+reference does one write and one read; closing it means letting the caller take
+slices of the window instead of a `Vec` it owns, an API addition rather than a
+tuning change.
+
+Two of those three passes are already gone. The zero-copy `Sink` removed the
+drain copy (measured at 0%, second pass), and `--no-check` removed the XXH64
+pass on the frames the harness now builds — as it is absent on the wire traffic
+this decoder targets, since the library defaults the checksum off. What the
+eighth pass measures instead is 29.5% / 45.2% in match and literal copy, which
+is the window write itself and already runs through the NEON kernels.
 
 ### M4 — Recipes and dictionaries
 - [ ] Dictionary loading in L1 (`dict.rs`).
