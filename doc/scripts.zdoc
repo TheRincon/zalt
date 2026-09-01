@@ -1,0 +1,89 @@
+
+<!-- A deliberately multilingual fixture, added before E4 begins.
+     The rest of the corpus contains exactly three non-ASCII characters
+     between all seven documents, so nothing in it reaches a right-to-left
+     run, a complex-shaping face, or a font the system has to fall back to.
+     Everything E4 builds - shaping, fallback, bidi, line breaking - would
+     otherwise land with no coverage at all. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" signature="ed25519:QEUVKPb5hVelGDNkk+Ox0N2HjqucmjFH2K/guCpbT6faJdwliouB83uRmpxlZhQCUDeEcEfmXE/53BkgrWEhDw==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+  <head doc-id="urn:uuid:5146a576-ab37-4c75-8505-4fde973bcf06" zs="/style.zss" title="One mechanism, many scripts"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+    }
+
+    entity <zdoc://grazer.local/scripts.zdoc> &doc {
+      @type schema:TextDigitalDocument
+      @substrate: digital
+      name: "One mechanism, many scripts"
+    }
+
+    entity <urn:artifact:antikythera> &mechanism {
+      @type schema:Thing
+      @substrate: physical
+      name: "the Antikythera mechanism"
+    }
+
+    entity <urn:topic:writing-systems> &scripts {
+      @type schema:Thing
+      @substrate: abstract
+      name: "writing systems"
+    }
+
+    claim c_about {
+      subject: <zdoc://grazer.local/scripts.zdoc>
+      predicate: schema:about
+      object: <urn:topic:writing-systems>
+      @warrant: axiom
+    }
+
+    claim c_named {
+      subject: <urn:artifact:antikythera>
+      predicate: schema:name
+      object: "the Antikythera mechanism"
+      @warrant: definition
+    }
+
+    claim c_shaping {
+      subject: <urn:topic:writing-systems>
+      predicate: schema:description
+      object: "Some scripts cannot be rendered by mapping characters to glyphs in order."
+      @warrant: consensus { support: 0.99 }
+    }
+  </weft>
+
+  <body>
+    <h1>One mechanism, many scripts</h1>
+
+    <p>The <e ref="mechanism">Antikythera mechanism</e> is named after the
+       island it sank beside. Written out, that name reaches most of the
+       problems a text engine has:</p>
+
+    <p>Greek, where it was found: to μηχανισμό των Αντικυθήρων.</p>
+
+    <p>Arabic, which runs right to left and joins its letters:
+       <em>آلة أنتيكيثيرا</em> — and a Latin word, Antikythera, set inside
+       the same paragraph so the two directions have to be ordered against
+       each other.</p>
+
+    <p>Thai, which is written without spaces between words, so a line can
+       only be broken by knowing the language: เครื่องกลอันติคีเทรา.</p>
+
+    <p>Devanagari, where vowel signs are reordered and consonants combine:
+       एंटीकाइथेरा यंत्र.</p>
+
+    <p>Chinese, where every character is a possible line break:
+       安提基特拉機械.</p>
+
+    <p>And a sequence that is one thing to a reader and several codepoints
+       to a program: 🇬🇷 ⚙️ 👩‍🔬 — a flag, a gear, and a scientist assembled
+       from a woman, a joiner, and a microscope.</p>
+
+    <p><claim ref="c_shaping">Some scripts cannot be rendered by mapping
+       characters to glyphs in order.</claim> That is why shaping is a
+       separate step from layout, and why it happens before line breaking
+       rather than after.</p>
+  </body>
+</ztml>

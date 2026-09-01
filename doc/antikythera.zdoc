@@ -1,0 +1,241 @@
+<!-- A demonstration ZDOC. The subject is chosen because its scholarship has
+     genuine epistemic texture: hard physical facts, dated estimates carrying
+     real uncertainty, named scholarly positions, and open conjecture — all in
+     one document. On the legacy web these render identically. Here they do
+     not, because the warrant is part of the data. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" lang="en" signature="ed25519:gSsN4b+KD1G2eSzPeoQPgJed7JDXADC707oBCUjj4xsfyS5IvdgyFjiNfZ6BRzst2N40hulIQu8qNWYODaZ3DA==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+
+  <head doc-id="urn:uuid:c8dfafae-46c7-4d16-b30c-4e0af1ca5cdc" zs="/style.zss" title="The Antikythera Mechanism"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+      <https://vocab.example.org/history/> as hist
+    }
+
+    // The page as a node in the graph (PROFILE.md §8.2.1).
+    entity <zdoc://grazer.local/antikythera.zdoc> &doc {
+      @type schema:ScholarlyArticle
+      @substrate: digital
+      name: "The Antikythera Mechanism"
+    }
+
+    entity <urn:artifact:antikythera> &mechanism {
+      @type schema:Thing
+      @substrate: physical
+      name: "Antikythera Mechanism"
+      description: "A geared bronze device recovered from a Roman-era shipwreck."
+    }
+
+    entity <urn:place:antikythera> &wreck {
+      @type schema:Place
+      @substrate: physical
+      name: "Antikythera wreck site"
+    }
+
+    entity <did:key:z6MkPriceDerek> &price {
+      @type schema:Person
+      @substrate: physical
+      name: "Derek J. de Solla Price"
+    }
+
+    entity <did:key:z6MkFreethAlex> &freeth {
+      @type schema:Person
+      @substrate: physical
+      name: "Tony Freeth"
+    }
+
+    entity <urn:concept:lunar-anomaly> &anomaly {
+      @type schema:Thing
+      @substrate: abstract
+      name: "First lunar anomaly"
+    }
+
+    // --- The page's connecting claim: what this document is about.
+    claim c_about {
+      subject: <zdoc://grazer.local/antikythera.zdoc>
+      predicate: schema:about
+      object: <urn:artifact:antikythera>
+      @warrant: definition
+    }
+
+    // --- Axiom: a physical fact, not a confident belief. No number attaches.
+    claim c_recovered {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:recoveredFrom
+      object: <urn:place:antikythera>
+      @warrant: axiom
+    }
+
+    // --- Definition: true by what the words mean.
+    claim c_geared {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:mechanismClass
+      object: "geared analogue computer"
+      @warrant: definition
+    }
+
+    // --- Assertion: a named person's position, with their confidence.
+    //     The claimant travels with the claim when it is cited or extracted.
+    claim c_price_gearing {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:proposedGearTrain
+      object: <did:key:z6MkPriceDerek>
+      @warrant: assertion { claimant: <did:key:z6MkPriceDerek>, confidence: 0.90 }
+      strength: 0.8
+    }
+
+    // --- Empirical: measured, graded, and it names the claims it rests on.
+    claim c_dating {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:constructionDate
+      object: "c. 150-100 BCE"
+      @warrant: empirical { confidence: 0.82, sources: [c_recovered] }
+    }
+
+    // --- Consensus: broad agreement, tracked separately from evidence.
+    claim c_lunar {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:models
+      object: <urn:concept:lunar-anomaly>
+      @warrant: consensus { support: 0.95 }
+    }
+
+    // --- Conjecture: openly a guess. No amount of confidence promotes this
+    //     to a fact — that is the point of a typed warrant.
+    claim c_missing {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:mayHaveDisplayed
+      object: "planetary positions on the lost front dial"
+      @warrant: conjecture { confidence: 0.55 }
+    }
+
+    // --- Derived: a conclusion chained from premises, by a named rule.
+    claim c_sophistication {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:impliesTradition
+      object: "an established Hellenistic gear-making practice"
+      @warrant: derived {
+        rule: "no artefact of this complexity is a first attempt",
+        premises: [c_geared, c_dating]
+      }
+    }
+
+    // --- Attestation: a claim ABOUT another claim. The subject is c_dating.
+    claim c_freeth_attests {
+      subject: c_dating
+      predicate: weft:attestedBy
+      object: <did:key:z6MkFreethAlex>
+      @warrant: assertion { claimant: <did:key:z6MkFreethAlex>, confidence: 0.88 }
+    }
+  </weft>
+
+  <body>
+    <main>
+      <header>
+        <h1>The Antikythera Mechanism</h1>
+        <p>
+          Every sentence below is bound to a claim in this document's graph.
+          The browser knows which are
+          <claim ref="c_recovered">established fact</claim>,
+          which are <claim ref="c_dating">measured estimates</claim>,
+          and which are <claim ref="c_missing">frank conjecture</claim> —
+          and it will not let this page pretend otherwise.
+        </p>
+      </header>
+
+      <section>
+        <h2>What it is</h2>
+        <p>
+          The <e ref="mechanism">Antikythera Mechanism</e> is a
+          <claim ref="c_geared">geared analogue computer</claim> of Hellenistic
+          manufacture. It was <claim ref="c_recovered">recovered from a
+          shipwreck off <e ref="wreck">the island of Antikythera</e></claim> by
+          sponge divers, and survives as 82 corroded bronze fragments.
+        </p>
+        <p>
+          Its density of engineering is startling: at least thirty meshing
+          gears, cut by hand, carrying a model of the sky.
+        </p>
+        <p>
+          <a href="/shipwreck.zdoc" via="hist:recoveredFrom">More on the wreck
+          it came from</a> — the <code>via</code> names the relation this link
+          stands for, making the hyperlink a typed edge rather than an untyped
+          jump.
+        </p>
+      </section>
+
+      <section>
+        <h2>When it was made</h2>
+        <p>
+          Dating rests on inscription letterforms and on the wreck's cargo.
+          The current estimate is
+          <claim ref="c_dating">roughly 150 to 100 BCE</claim> — an empirical
+          claim, carrying a confidence, resting on evidence this document
+          names rather than gestures at.
+        </p>
+        <p>
+          <claim ref="c_freeth_attests"><e ref="freeth">Tony Freeth</e>
+          attests to that dating.</claim> Note what this is: not a louder
+          restatement, but a separate claim <em>about</em> the first one, with
+          its own author and its own signature.
+        </p>
+      </section>
+
+      <section>
+        <h2>What it computed</h2>
+        <p>
+          <claim ref="c_lunar">It models the first lunar anomaly</claim> — the
+          Moon's variable speed through the sky — using a pin-and-slot device
+          that produces a varying rate from two gears turning at a constant
+          one. There is broad scholarly consensus on this.
+        </p>
+        <p>
+          <claim ref="c_price_gearing"><e ref="price">Derek de Solla
+          Price</e> proposed the first full gear train</claim> in 1974, an
+          assertion carried under his name.
+        </p>
+      </section>
+
+      <section>
+        <h2>What we do not know</h2>
+        <blockquote cite="https://example.org/antikythera/front-dial">
+          <p>
+            <claim ref="c_missing">The lost front dial may have displayed
+            planetary positions.</claim>
+          </p>
+        </blockquote>
+        <p>
+          This is a <strong>conjecture</strong>, and grazer renders it as one.
+          It carries a confidence of 0.55, and no threshold anywhere promotes
+          it to a fact: <code>conjecture</code> and <code>axiom</code> are
+          different kinds, not different amounts.
+        </p>
+        <p>
+          <claim ref="c_sophistication">That such a device existed at all
+          implies an established tradition of gear-making</claim> — a derived
+          claim, chained from the two premises it names.
+        </p>
+      </section>
+
+      <section>
+        <h2>Why this document is different</h2>
+        <p>
+          A conventional page asserts all of the above in the same voice. A
+          reader cannot tell the fact from the estimate from the guess without
+          leaving the page. Here the distinction is
+          <em>in the data</em>, the browser enforces it, and the badge in the
+          chrome reports what was actually checked — not "true", but
+          <em>signed, hash-verified, and confidence on record</em>.
+        </p>
+        <p>
+          Alter one character of one claim and its content hash changes
+          completely, the document hash changes with it, and the visual
+          fingerprint becomes unmistakably different. Tamper-evidence is not a
+          feature bolted on; it falls out of addressing claims by their hash.
+        </p>
+      </section>
+    </main>
+  </body>
+</ztml>

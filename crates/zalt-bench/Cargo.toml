@@ -1,0 +1,16 @@
+[package]
+name = "zalt-bench"
+description = "Baseline and kernel benchmarks for zalt. Corpus-directory driven, no built-in content opinion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+zalt-codec.workspace = true
+zalt-embed.workspace = true
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+zalt-neon.workspace = true

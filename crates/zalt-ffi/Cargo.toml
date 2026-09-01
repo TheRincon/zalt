@@ -1,0 +1,19 @@
+[package]
+name = "zalt-ffi"
+description = "C ABI for zalt: in-process embedding from Swift, Objective-C, C and C++."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "zalt"
+# staticlib for linking into an app bundle, cdylib for dynamic loading, rlib so
+# the Rust tests in this crate can exercise the same functions the C header
+# exposes rather than a parallel copy of them.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+zalt-codec.workspace = true
+zalt-embed.workspace = true

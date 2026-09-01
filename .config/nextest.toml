@@ -1,0 +1,28 @@
+# nextest configuration.
+#
+# nextest runs each test in its own process, in parallel. That isolation is
+# worth more here than usual: a decoder bug that corrupts memory or aborts takes
+# down one test process rather than the whole run, and the failure names itself.
+
+[profile.default]
+# Fail fast in the inner loop — the first failure is the one being worked on.
+fail-fast = true
+failure-output = "immediate"
+status-level = "pass"
+
+[profile.ci]
+# In CI the whole picture matters more than the first failure.
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "retry"
+# Never retry to paper over a flake. A flaky decoder test means a real
+# nondeterminism bug — retries would hide exactly what must be investigated.
+retries = 0
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# The exhaustive equivalence and streaming tests iterate a lot in debug mode.
+[[profile.default.overrides]]
+filter = 'test(/exhaustive|streaming_|equivalence/)'
+slow-timeout = { period = "30s", terminate-after = 4 }

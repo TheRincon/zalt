@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/zalt-codec",
+    "crates/zalt-neon",
+    "crates/zalt-embed",
+    "crates/zalt-bench",
+    "crates/zalt-ffi",
+    "crates/zalt-cli",
+]
+# `fuzz` is its own workspace: fuzz targets build with sanitizers and coverage
+# instrumentation and must not perturb this workspace's lockfile or profiles.
+exclude = ["fuzz"]
+
+# Crates arriving at their milestones (see doc/ZALT-MAC.md §10):
+#   zalt-darwin                   -> M3, only if profiling justifies it
+#   zalt-recipe, zalt-ztml,
+#   zalt-recipe-train             -> M4
+# They are deliberately absent rather than empty: an unused crate is build
+# time and review surface with nothing behind it.
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/zalt"
+
+[workspace.dependencies]
+zalt-codec = { path = "crates/zalt-codec", version = "0.0.1" }
+zalt-neon = { path = "crates/zalt-neon", version = "0.0.1" }
+zalt-embed = { path = "crates/zalt-embed", version = "0.0.1" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Deliberately NOT `panic = "abort"`.
+#
+# This library is embedded in someone else's process. Aborting would let a
+# malformed subresource take down a browser's whole network process, when the
+# correct outcome is to fail that one resource. `zalt-ffi` wraps every entry
+# point in `catch_unwind` and converts a panic into an error code, which
+# requires unwinding to exist.
+#
+# Parsing is `forbid(unsafe_code)` and no panic should be reachable from it —
+# but "should" is doing load-bearing work in that sentence, and the boundary is
+# where a wrong assumption stops being our problem and becomes the host's.
+panic = "unwind"
+
+# Benchmarks need unwinding for harness reporting; keep it separate.
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true

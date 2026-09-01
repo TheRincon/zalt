@@ -1,0 +1,220 @@
+<!-- A ZTML showcase. Read the source alongside the rendering: there is not one
+     styling instruction anywhere in this file. No class, no style, no b, no i,
+     no font, no align, no width — those attributes and elements do not exist
+     in the language, so a document cannot express appearance even by accident.
+     Everything you see is grazer's default rendering of the semantics. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" lang="en" signature="ed25519:/AHxHTLs1lilU6B18CGOZ63Z8ZuKPt1P1gBW9rZkb6Igg3uFP5QKRCpNxmqdZIWjcmm39aKzVUafJq2/r+jwDQ==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+
+  <head doc-id="urn:uuid:f284c639-3d4f-4f38-ac20-9982d9905edf" zs="/style.zss" title="What ZTML Removes"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+      <https://vocab.example.org/history/> as hist
+    }
+
+    entity <zdoc://grazer.local/showcase.zdoc> &doc {
+      @type schema:TechArticle
+      @substrate: digital
+      name: "What ZTML Removes"
+    }
+
+    entity <urn:concept:ztml> &ztml {
+      @type schema:ComputerLanguage
+      @substrate: abstract
+      name: "ZTML"
+      description: "Markup carrying structure and semantics, and nothing else."
+    }
+
+    entity <urn:artifact:antikythera> &mechanism {
+      @type schema:Thing
+      @substrate: physical
+      name: "Antikythera Mechanism"
+    }
+
+    claim c_about {
+      subject: <zdoc://grazer.local/showcase.zdoc>
+      predicate: schema:about
+      object: <urn:concept:ztml>
+      @warrant: definition
+    }
+
+    claim c_separation {
+      subject: <urn:concept:ztml>
+      predicate: hist:enforces
+      object: "structure and presentation are different documents"
+      @warrant: axiom
+    }
+
+    claim c_failclosed {
+      subject: <urn:concept:ztml>
+      predicate: hist:parseStrategy
+      object: "fail closed on the first violation"
+      @warrant: definition
+    }
+
+    claim c_gears {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:gearCount
+      object: "at least 30 meshing gears"
+      @warrant: empirical { confidence: 0.94, sources: [c_separation] }
+    }
+
+    claim c_adoption {
+      subject: <urn:concept:ztml>
+      predicate: hist:adoptionOutlook
+      object: "authors will accept a closed vocabulary"
+      @warrant: conjecture { confidence: 0.4 }
+    }
+  </weft>
+
+  <body>
+    <main>
+      <header>
+        <h1>What ZTML Removes</h1>
+        <p>
+          <claim ref="c_separation">Structure and presentation are separate
+          documents</claim>, and this file is the demonstration: it contains no
+          styling instruction of any kind, because the language has no way to
+          express one.
+        </p>
+      </header>
+
+      <section>
+        <h2>A figure, pinned by hash</h2>
+        <figure>
+          <img src="/gears.png"
+               alt="Three meshing gears of decreasing size, drawn in blue, brown and green"
+               hash="sha256:c4b2853cae028b8a54bd529bd72f15718c856c0542a4ea6f0dd0e37abf666736"
+               size="720x360"/>
+          <figcaption>
+            <claim ref="c_gears">The mechanism carries at least thirty meshing
+            gears.</claim> The image above is referenced by content hash, and
+            arrived pushed on its own stream in the same round trip as this
+            document.
+          </figcaption>
+        </figure>
+        <p>
+          The <code>hash</code> attribute is mandatory, not advisory. A
+          reference without one is a parse error, so subresource integrity is
+          how references work rather than something an author opts into.
+        </p>
+      </section>
+
+      <section>
+        <h2>What is gone, and where it went</h2>
+        <table>
+          <caption>Removed from HTML, and its replacement</caption>
+          <thead>
+            <tr>
+              <th scope="col">Removed</th>
+              <th scope="col">Why</th>
+              <th scope="col">Now lives in</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">class</th>
+              <td>a styling hook wearing a semantic costume</td>
+              <td>ZSS selectors on real structure</td>
+            </tr>
+            <tr>
+              <th scope="row">style</th>
+              <td>presentation inlined into content</td>
+              <td>ZSS</td>
+            </tr>
+            <tr>
+              <th scope="row">b, i, font</th>
+              <td>appearance with no meaning</td>
+              <td>strong, em, or ZSS</td>
+            </tr>
+            <tr>
+              <th scope="row">script, on*</th>
+              <td>ambient authority over the document</td>
+              <td>ZAPPs, with declared grants</td>
+            </tr>
+            <tr>
+              <th scope="row">div soup</th>
+              <td>structure with nothing to say</td>
+              <td>section, article, nav, aside</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Semantics that survived</h2>
+        <dl>
+          <dt>abbr</dt>
+          <dd>
+            <abbr title="Zettelkasten Text Markup Language">ZTML</abbr> expands
+            on demand, because an abbreviation is a fact about the word.
+          </dd>
+          <dt>time</dt>
+          <dd>
+            The wreck was found in <time at="1901">1901</time> — the machine
+            form is the element, not an annotation bolted onto it.
+          </dd>
+          <dt>blockquote and cite</dt>
+          <dd>Attribution is structural, not a visual convention.</dd>
+        </dl>
+
+        <blockquote cite="https://example.org/ztml/rationale">
+          <p>
+            HTML's permissive parsing is how it accumulated cruft.
+            <claim ref="c_failclosed">ZTML refuses the first step</claim>.
+          </p>
+        </blockquote>
+      </section>
+
+      <section>
+        <h2>Ordered and unordered</h2>
+        <p>The parse pipeline, in order:</p>
+        <ol>
+          <li>Lex, rejecting anything outside the closed vocabulary.</li>
+          <li>Build the tree, rejecting malformed nesting.</li>
+          <li>Validate the document shape: head, weft, body, in that order.</li>
+          <li>Run the node gate over the embedded graph.</li>
+        </ol>
+        <p>Things this document deliberately cannot do:</p>
+        <ul>
+          <li>Set a colour, a font, or a width.</li>
+          <li>Run code, or register an event handler.</li>
+          <li>Reference a subresource without pinning its bytes.</li>
+          <li>
+            Claim its own authorship — <em>that</em> is rendered in the
+            browser's chrome, from a signature, never from the page.
+          </li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Progressive disclosure, without script</h2>
+        <details>
+          <summary>Why a closed vocabulary?</summary>
+          <p>
+            An open vocabulary means a parser must guess at anything it does
+            not recognise, and guessing is how quirks mode was born. A closed
+            one makes the unknown element a named error instead.
+          </p>
+        </details>
+        <p>
+          <claim ref="c_adoption">Whether authors will accept that trade is
+          genuinely open</claim> — a conjecture at 0.4, and the browser renders
+          it as one rather than letting the confident prose around it carry the
+          reader past the uncertainty.
+        </p>
+      </section>
+
+      <section>
+        <h2>Onward</h2>
+        <p>
+          <a href="/antikythera.zdoc" via="schema:about">The mechanism
+          itself</a>, or <a href="/shipwreck.zdoc" via="hist:recoveredFrom">the
+          wreck it came from</a>.
+        </p>
+      </section>
+    </main>
+  </body>
+</ztml>

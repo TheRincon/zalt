@@ -1,0 +1,838 @@
+//! Benchmark harness.
+//!
+//! Two jobs at M0, before there is a decoder to measure:
+//!
+//! 1. **Baseline** — run the system `zstd` over a corpus directory to establish
+//!    the ratio and throughput numbers zalt will be judged against. Recording
+//!    these *now* means later comparisons are against a measurement rather than
+//!    a memory.
+//! 2. **Kernels** — time the backend seam's implementations against each other,
+//!    so `zalt-neon` changes are justified by numbers from the first commit.
+//!
+//! The harness takes a corpus **directory** and has no built-in opinion about
+//! content. Which files belong in a corpus is a recipe concern (L3), not a
+//! benchmark concern — see `doc/ZALT-MAC.md` §5.
+//!
+//! ```text
+//! cargo run --release -p zalt-bench -- kernels
+//! cargo run --release -p zalt-bench -- baseline <corpus-dir>
+//! cargo run --release -p zalt-bench -- decode <corpus-dir>
+//! cargo run --release -p zalt-bench -- profile <file.zst> [seconds]
+//! ```
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use zalt_codec::{Backend, Scalar};
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(String::as_str).unwrap_or("kernels");
+
+    println!("zalt-bench — backend: {}", zalt_embed::backend_name());
+    println!();
+
+    match mode {
+        "kernels" => bench_kernels(),
+        "baseline" => match args.get(2) {
+            Some(dir) => bench_baseline(Path::new(dir)),
+            None => {
+                eprintln!("usage: zalt-bench baseline <corpus-dir>");
+                std::process::exit(2);
+            }
+        },
+        "profile" => match args.get(2) {
+            Some(file) => profile_decode(
+                Path::new(file),
+                args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20),
+                args.iter().any(|a| a == "scalar"),
+            ),
+            None => {
+                eprintln!("usage: zalt-bench profile <file.zst> [seconds] [scalar]");
+                std::process::exit(2);
+            }
+        },
+        "decode" => match args.get(2) {
+            Some(dir) => bench_decode(Path::new(dir), args.get(3).and_then(|s| s.parse().ok())),
+            None => {
+                eprintln!("usage: zalt-bench decode <corpus-dir> [level]");
+                std::process::exit(2);
+            }
+        },
+        other => {
+            eprintln!(
+                "unknown mode {other:?}; expected 'kernels', 'baseline', 'decode' or 'profile'"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- kernels
+
+/// Match-copy shapes worth timing separately.
+///
+/// Offsets are split around 16 because that is where the NEON kernel changes
+/// strategy, and short offsets are the case that motivates it: indentation runs
+/// and repeated tags produce them constantly in structured text.
+const SHAPES: &[(&str, usize, usize)] = &[
+    ("offset=1   len=64   (byte smear)", 1, 64),
+    ("offset=3   len=64   (short period)", 3, 64),
+    ("offset=7   len=256  (short period, long run)", 7, 256),
+    ("offset=15  len=256  (widest overlapping)", 15, 256),
+    ("offset=16  len=256  (boundary)", 16, 256),
+    ("offset=64  len=256  (non-overlapping)", 64, 256),
+    ("offset=1024 len=4096 (bulk)", 1024, 4096),
+];
+
+fn bench_kernels() {
+    println!("match-copy kernels");
+    println!("{:-<78}", "");
+    println!("{:<44} {:>12} {:>12}", "shape", "scalar GB/s", "neon GB/s");
+
+    for &(name, offset, len) in SHAPES {
+        let scalar = time_copy_match::<Scalar>(offset, len);
+        #[cfg(target_arch = "aarch64")]
+        let accel = time_copy_match::<zalt_neon::Neon>(offset, len);
+        #[cfg(not(target_arch = "aarch64"))]
+        let accel = f64::NAN;
+
+        println!("{name:<44} {scalar:>12.2} {accel:>12.2}");
+    }
+
+    println!();
+    println!("xxh64");
+    println!("{:-<78}", "");
+    for size in [1024usize, 64 * 1024, 1024 * 1024] {
+        let data = vec![0xA5u8; size];
+        let gbs = throughput(size, || {
+            std::hint::black_box(zalt_codec::xxh64::xxh64(&data, 0));
+        });
+        println!("{:<44} {gbs:>12.2}", format!("{size} bytes"));
+    }
+}
+
+fn time_copy_match<B: Backend>(offset: usize, len: usize) -> f64 {
+    let prefix = offset.max(4096);
+    let mut buf = vec![0u8; prefix + len + 64];
+    for (i, b) in buf[..prefix].iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    throughput(len, || {
+        B::copy_match(&mut buf, prefix, offset, len);
+        std::hint::black_box(&buf);
+    })
+}
+
+/// A repeated measurement, kept together with evidence of how much to trust it.
+#[derive(Debug, Clone, Copy)]
+struct Sample {
+    /// Best observed throughput, GB/s.
+    best: f64,
+    /// Middle observed throughput, GB/s.
+    median: f64,
+    /// `(best - worst) / best`. How much the machine moved under the
+    /// measurement.
+    spread: f64,
+}
+
+impl Sample {
+    /// Whether the spread is wide enough that a small difference between two
+    /// samples means nothing.
+    fn noisy(&self) -> bool {
+        self.spread > 0.15
+    }
+}
+
+/// Measure `op`, repeatedly, and report the distribution.
+///
+/// # Why the best sample and not the mean
+///
+/// The first version of this took one timing run per shape, and the end-to-end
+/// decode numbers moved by a factor of two between runs — enough that the same
+/// backend measured both 0.58x and 1.63x against the same rival. Every
+/// optimisation decision made against that would have been made against noise.
+///
+/// Interference on a shared laptop is one-sided: another process, a migration
+/// between P and E cores, a thermal step, or a page fault can only ever make a
+/// sample *slower*. Nothing makes a sample spuriously fast. So the fastest of
+/// several batches is the closest estimate of what the code costs, and the mean
+/// is an average of the code plus however busy the machine happened to be.
+///
+/// `spread` is reported alongside so the noise is visible rather than hidden:
+/// a wide spread means the number is a range, and a caller should say so rather
+/// than print two decimal places of it.
+fn measure(bytes_per_op: usize, mut op: impl FnMut()) -> Sample {
+    /// Long enough that timer granularity and loop overhead are irrelevant,
+    /// short enough that a batch is unlikely to span a scheduling event.
+    const BATCH: Duration = Duration::from_millis(20);
+    const WARMUP: Duration = Duration::from_millis(100);
+    const BATCHES: usize = 9;
+
+    // Calibrate: find how many iterations fill a batch, from one timed probe
+    // rather than a fixed count. A fixed 1000-iteration warmup is instant for a
+    // 64-byte copy and takes seconds for a 10 MB frame.
+    let probe_start = Instant::now();
+    op();
+    let probe = probe_start.elapsed().max(Duration::from_nanos(1));
+    let iters = ((BATCH.as_secs_f64() / probe.as_secs_f64()) as u64).clamp(1, 1 << 24);
+
+    let warm = Instant::now();
+    while warm.elapsed() < WARMUP {
+        for _ in 0..iters {
+            op();
+        }
+    }
+
+    let mut rates = Vec::with_capacity(BATCHES);
+    for _ in 0..BATCHES {
+        let start = Instant::now();
+        for _ in 0..iters {
+            op();
+        }
+        let elapsed = start.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+        rates.push(bytes_per_op as f64 * iters as f64 / elapsed / 1e9);
+    }
+
+    rates.sort_by(|a, b| a.partial_cmp(b).expect("no NaN from a positive divide"));
+    let best = rates[rates.len() - 1];
+    let worst = rates[0];
+    Sample {
+        best,
+        median: rates[rates.len() / 2],
+        spread: if best > 0.0 {
+            (best - worst) / best
+        } else {
+            0.0
+        },
+    }
+}
+
+/// Best-case throughput of `op` in GB/s of `bytes_per_op`.
+fn throughput(bytes_per_op: usize, op: impl FnMut()) -> f64 {
+    measure(bytes_per_op, op).best
+}
+
+// --------------------------------------------------------------- baseline
+
+fn bench_baseline(dir: &Path) {
+    let files = match collect_files(dir) {
+        Ok(f) if !f.is_empty() => f,
+        Ok(_) => {
+            eprintln!("no files found under {}", dir.display());
+            eprintln!();
+            eprintln!("Populate a corpus first — see corpus/README.md. The harness");
+            eprintln!("deliberately ships no sample data: a benchmark corpus that");
+            eprintln!("does not reflect real traffic is worse than none, because it");
+            eprintln!("produces numbers people trust.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("cannot read {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    };
+
+    let Some(zstd) = find_zstd() else {
+        eprintln!("system `zstd` not found on PATH; cannot establish a baseline");
+        std::process::exit(1);
+    };
+    println!("reference: {}", zstd.display());
+    print_version(&zstd);
+    println!();
+
+    println!("{:-<78}", "");
+    println!(
+        "{:<34} {:>10} {:>10} {:>8} {:>10}",
+        "file", "bytes", "zstd -3", "ratio", "level 19"
+    );
+    println!("{:-<78}", "");
+
+    let mut total_raw = 0u64;
+    let mut total_l3 = 0u64;
+    let mut total_l19 = 0u64;
+
+    for path in &files {
+        let Ok(data) = fs::read(path) else { continue };
+        if data.is_empty() {
+            continue;
+        }
+        let raw = data.len() as u64;
+        let l3 = compressed_size(&zstd, path, 3);
+        let l19 = compressed_size(&zstd, path, 19);
+
+        total_raw += raw;
+        total_l3 += l3.unwrap_or(raw);
+        total_l19 += l19.unwrap_or(raw);
+
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let name = truncate(&name, 34);
+        match (l3, l19) {
+            (Some(a), Some(b)) => println!(
+                "{name:<34} {raw:>10} {a:>10} {:>8.2} {b:>10}",
+                raw as f64 / a as f64
+            ),
+            _ => println!("{name:<34} {raw:>10} {:>10} {:>8} {:>10}", "-", "-", "-"),
+        }
+    }
+
+    println!("{:-<78}", "");
+    if total_raw > 0 {
+        println!(
+            "{:<34} {total_raw:>10} {total_l3:>10} {:>8.2} {total_l19:>10}",
+            format!("TOTAL ({} files)", files.len()),
+            total_raw as f64 / total_l3.max(1) as f64
+        );
+        println!();
+        println!(
+            "overall: level 3 {:.3}x, level 19 {:.3}x",
+            total_raw as f64 / total_l3.max(1) as f64,
+            total_raw as f64 / total_l19.max(1) as f64
+        );
+    }
+
+    println!();
+    println!("These are the numbers zalt is judged against. Record them with the");
+    println!("corpus revision; a ratio without its corpus is not a measurement.");
+}
+
+fn collect_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "README.md" {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn find_zstd() -> Option<PathBuf> {
+    for candidate in [
+        "/opt/homebrew/bin/zstd",
+        "/usr/local/bin/zstd",
+        "/usr/bin/zstd",
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let out = Command::new("which").arg("zstd").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+fn print_version(zstd: &Path) {
+    if let Ok(out) = Command::new(zstd).arg("--version").output() {
+        print!("{}", String::from_utf8_lossy(&out.stdout));
+    }
+}
+
+fn compressed_size(zstd: &Path, path: &Path, level: u32) -> Option<u64> {
+    let out = Command::new(zstd)
+        .arg(format!("-{level}"))
+        .arg("-c")
+        .arg("-q")
+        .arg(path)
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout.len() as u64)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("…{}", &s[s.len() - (max - 1)..])
+    }
+}
+
+// ---------------------------------------------------------- machine state
+
+/// What the machine was doing while a measurement was taken.
+///
+/// § "Measurement discipline" says a ratio without its corpus is not a
+/// measurement. The same is true of a throughput without its machine: the same
+/// binary on the same input measured 339 MB/s and 535 MB/s on this laptop, and
+/// the difference was entirely the state recorded here. Printing it beside the
+/// numbers is what stops a figure being copied into a commit message without
+/// the caveat that belongs with it.
+#[derive(Debug)]
+struct MachineState {
+    load_1min: f64,
+    swap_used_mb: f64,
+    swap_total_mb: f64,
+}
+
+impl MachineState {
+    fn read() -> Option<Self> {
+        // `sysctl` rather than a crate: the workspace has no dependencies, and
+        // this is two numbers.
+        let load = sysctl("vm.loadavg")?;
+        // "{ 2.11 2.45 2.60 }"
+        let load_1min = load
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(f64::NAN);
+
+        let swap = sysctl("vm.swapusage")?;
+        // "total = 12288.00M  used = 11152.69M  free = 1135.31M  (encrypted)"
+        let field = |name: &str| -> f64 {
+            swap.split_whitespace()
+                .skip_while(|w| *w != name)
+                .nth(2)
+                .and_then(|v| v.trim_end_matches('M').parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+
+        Some(Self {
+            load_1min,
+            swap_used_mb: field("used"),
+            swap_total_mb: field("total"),
+        })
+    }
+
+    /// Whether conditions are good enough to trust a small difference.
+    ///
+    /// Both thresholds are judgement, not physics. Load above a couple of cores
+    /// means something else is running; swap in use at all on a machine with
+    /// free RAM means the memory compressor has been active, and a decode that
+    /// allocates its output is then measuring page reclaim as much as entropy
+    /// coding.
+    fn quiet(&self) -> bool {
+        self.load_1min < 2.0 && self.swap_used_mb < 0.05 * self.swap_total_mb
+    }
+
+    fn report(&self) {
+        println!(
+            "machine: load {:.2}, swap {:.0}/{:.0} MB",
+            self.load_1min, self.swap_used_mb, self.swap_total_mb
+        );
+        if !self.quiet() {
+            println!();
+            println!("  WARNING: not a quiet machine. Interference is one-sided, so these");
+            println!("  numbers are *lower bounds* — the code is at least this fast. Treat a");
+            println!("  difference under ~10% as unmeasured, and compare two binaries");
+            println!("  alternating rather than two runs at different times.");
+        }
+    }
+}
+
+fn sysctl(name: &str) -> Option<String> {
+    let out = Command::new("sysctl").arg("-n").arg(name).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+// ----------------------------------------------------------------- decode
+
+/// Time zalt's own decoder against the reference, over a corpus.
+///
+/// # Why this mode exists before any NEON work
+///
+/// §5's rule is that nothing lands without a benchmark, and the kernel timings
+/// alone cannot enforce it: a kernel that doubles in isolation moves the end-to-
+/// end number by whatever fraction of decode time it occupied, which is a
+/// question only this mode can answer. The M0 lesson — a hand-written bulk
+/// wildcopy that *lost* 40% to the auto-vectorised scalar loop — was found by
+/// measuring, and would have been invisible without something to measure.
+///
+/// # What is being timed
+///
+/// Decode only. Each file is compressed once, up front, with the reference
+/// encoder; the compressed bytes are then decoded repeatedly from memory. No
+/// file I/O, no compression and no allocation of the input is inside the timed
+/// region.
+///
+/// Both backends are timed on identical input in the same process, so the
+/// comparison is not across runs. The reference decoder is timed through its
+/// CLI, which means its number carries process startup and pipe overhead and is
+/// **not** comparable at small sizes — it is here as an order-of-magnitude
+/// sanity check, not a verdict. Read the scalar/neon columns against each
+/// other; read the zstd column with suspicion.
+fn bench_decode(dir: &Path, level: Option<u32>) {
+    let level = level.unwrap_or(3);
+
+    let files = match collect_files(dir) {
+        Ok(f) if !f.is_empty() => f,
+        Ok(_) => {
+            eprintln!("no files found under {}", dir.display());
+            eprintln!();
+            eprintln!("Populate a corpus first — see corpus/README.md. Pointing this");
+            eprintln!("at any directory works: the harness has no opinion about");
+            eprintln!("content, which is a recipe concern (§5).");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("cannot read {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    };
+
+    let Some(zstd) = find_zstd() else {
+        eprintln!("system `zstd` not found on PATH; cannot build the inputs");
+        std::process::exit(1);
+    };
+
+    println!("decode throughput — level {level}, MB/s of *decoded* output");
+    println!("reference: {}", zstd.display());
+    if let Some(state) = MachineState::read() {
+        state.report();
+    }
+    println!();
+    println!("{:-<92}", "");
+    println!(
+        "{:<24} {:>9} {:>9} {:>11} {:>11} {:>10} {:>8}",
+        "file", "raw", "comp", "scalar MB/s", "neon MB/s", "sink MB/s", "speedup"
+    );
+    println!("{:-<92}", "");
+
+    let mut cases = Vec::new();
+    for path in &files {
+        let Ok(raw) = fs::read(path) else { continue };
+        if raw.len() < 64 {
+            // Too small to time meaningfully: the measurement would be almost
+            // entirely per-call overhead, and reporting it as throughput would
+            // be reporting the harness rather than the decoder.
+            continue;
+        }
+        let Some(compressed) = compress_bytes(&zstd, path, level) else {
+            continue;
+        };
+        // Never benchmark something that does not decode correctly. A kernel
+        // that produces wrong bytes fast is the failure mode this whole seam
+        // is arranged to prevent, and it must not show up as a good number.
+        match zalt_codec::decompress(&compressed, permissive_limits()) {
+            Ok(out) if out == raw => {}
+            Ok(_) => {
+                eprintln!(
+                    "SKIP {}: decoded output differs from the input",
+                    path.display()
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!("SKIP {}: {e}", path.display());
+                continue;
+            }
+        }
+        cases.push((path.clone(), raw.len(), compressed));
+    }
+
+    if cases.is_empty() {
+        eprintln!("nothing decodable in {}", dir.display());
+        std::process::exit(1);
+    }
+
+    let (mut total_raw, mut total_comp) = (0u64, 0u64);
+    let (mut sum_scalar_time, mut sum_neon_time) = (0f64, 0f64);
+    let mut sum_sink_time = 0f64;
+
+    let mut any_noisy = false;
+
+    for (path, raw_len, compressed) in &cases {
+        let scalar = time_decode::<Scalar>(compressed, *raw_len);
+        #[cfg(target_arch = "aarch64")]
+        let accel = time_decode::<zalt_neon::Neon>(compressed, *raw_len);
+        #[cfg(not(target_arch = "aarch64"))]
+        let accel = Sample {
+            best: f64::NAN,
+            median: f64::NAN,
+            spread: 0.0,
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        let sink = time_decode_sink::<zalt_neon::Neon>(compressed, *raw_len);
+        #[cfg(not(target_arch = "aarch64"))]
+        let sink = time_decode_sink::<Scalar>(compressed, *raw_len);
+
+        total_raw += *raw_len as u64;
+        total_comp += compressed.len() as u64;
+        // Sum *time*, not throughput: an average of MB/s figures weights a
+        // 64-byte file the same as a 10 MB one and means nothing.
+        sum_scalar_time += *raw_len as f64 / (scalar.best * 1e6);
+        if accel.best.is_finite() {
+            sum_neon_time += *raw_len as f64 / (accel.best * 1e6);
+        }
+        if sink.best.is_finite() {
+            sum_sink_time += *raw_len as f64 / (sink.best * 1e6);
+        }
+
+        // A ratio between two noisy samples is a rumour. Say so in the row
+        // rather than printing two decimal places of it and letting a reader
+        // act on the digits.
+        let noisy = scalar.noisy() || accel.noisy();
+        any_noisy |= noisy;
+
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        println!(
+            "{:<24} {raw_len:>9} {:>9} {:>11.1} {:>11.1} {:>10.1} {:>7.2}x{}",
+            truncate(&name, 24),
+            compressed.len(),
+            scalar.best,
+            accel.best,
+            sink.best,
+            accel.best / scalar.best,
+            if noisy { "  ~noisy" } else { "" }
+        );
+    }
+
+    println!("{:-<92}", "");
+    let overall_scalar = total_raw as f64 / sum_scalar_time / 1e6;
+    let overall_neon = total_raw as f64 / sum_neon_time / 1e6;
+    let overall_sink = total_raw as f64 / sum_sink_time / 1e6;
+    println!(
+        "{:<24} {total_raw:>9} {total_comp:>9} {overall_scalar:>11.1} {overall_neon:>11.1} {overall_sink:>10.1} {:>7.2}x",
+        format!("TOTAL ({} files)", cases.len()),
+        overall_neon / overall_scalar
+    );
+    println!();
+    println!(
+        "corpus ratio {:.2}x over {} files",
+        total_raw as f64 / total_comp.max(1) as f64,
+        cases.len()
+    );
+    if any_noisy {
+        println!();
+        println!("~noisy: best and worst batch differed by >15%. The machine moved");
+        println!("        under the measurement; treat those rows as a range, and");
+        println!("        re-run on an idle system before believing a small delta.");
+    }
+    println!();
+    println!("Record these with the corpus revision before changing a kernel.");
+    println!("A speedup without the number it improved on is not a measurement.");
+    // A stable, machine-readable line so a driver script never has to guess at
+    // column positions in a table meant for humans.
+    println!("SUMMARY scalar={overall_scalar:.1} neon={overall_neon:.1} sink={overall_sink:.1}");
+}
+
+/// Time one whole-frame decode, reported in MB/s of decoded output.
+///
+/// A fresh decoder per iteration on purpose: that is the shape of the target
+/// workload — many small resources, each a new frame — so per-frame setup
+/// belongs *inside* the measurement. Hoisting it out would flatter exactly the
+/// cost that dominates a 4 KB response.
+/// Time the same decode through a zero-copy [`Sink`], which is what a host
+/// that can consume borrowed runs actually does.
+///
+/// The sink here only counts bytes. That is not cheating by measuring nothing:
+/// the decoder still writes every byte to its window and still checksums it,
+/// and what disappears is precisely the copy into a buffer the caller did not
+/// need. A real sink writes to a socket or a parser and pays its own cost,
+/// which is not zalt's to measure.
+fn time_decode_sink<B: Backend>(compressed: &[u8], decoded_len: usize) -> Sample {
+    let limits = permissive_limits();
+    // One decoder, reset between iterations, rather than a fresh one each time.
+    //
+    // This is what a host with a decoder pool does (§6), and it is also what
+    // makes the measurement about the decoder. Allocating the window and block
+    // buffer per iteration measures the allocator, and on a machine under
+    // memory pressure it measures the *kernel* — reclaiming pages, and on
+    // Darwin the memory compressor. With 11 GB of swap in use the same binary
+    // and input measured 339 MB/s and 535 MB/s, a spread larger than any
+    // change this harness exists to detect.
+    let mut decoder = zalt_codec::Decoder::<B>::new(limits);
+    let s = measure(decoded_len, || {
+        decoder.reset();
+        let mut total = 0usize;
+        let mut sink = zalt_codec::FnSink(|chunk: &[u8]| total += chunk.len());
+        let mut cursor = 0usize;
+        loop {
+            let progress = decoder
+                .decompress_into(&compressed[cursor..], &mut sink)
+                .expect("verified decodable before timing");
+            cursor += progress.consumed;
+            if cursor >= compressed.len() {
+                break;
+            }
+            if progress.consumed == 0 {
+                break;
+            }
+        }
+        std::hint::black_box(total);
+    });
+    Sample {
+        best: s.best * 1000.0,
+        median: s.median * 1000.0,
+        spread: s.spread,
+    }
+}
+
+fn time_decode<B: Backend>(compressed: &[u8], decoded_len: usize) -> Sample {
+    let limits = permissive_limits();
+    // `measure` reports GB/s, which is the right unit for a kernel moving bytes
+    // and the wrong one for whole-frame decode — entropy decoding lands in the
+    // hundreds of MB/s, and a table of "0.1" tells nobody anything.
+    let s = measure(decoded_len, || {
+        let out = zalt_codec::decompress_with::<B>(compressed, limits)
+            .expect("verified decodable before timing");
+        std::hint::black_box(&out);
+    });
+    Sample {
+        best: s.best * 1000.0,
+        median: s.median * 1000.0,
+        spread: s.spread,
+    }
+}
+
+/// Bounds wide enough not to reject a corpus file.
+///
+/// A benchmark is not a security boundary: a browser's 8 MiB ceiling is policy
+/// for untrusted input, and applying it here would silently drop the large
+/// files from the corpus and quietly change what is being measured.
+fn permissive_limits() -> zalt_codec::params::DecodeLimits {
+    zalt_codec::params::DecodeLimits::default()
+}
+
+fn compress_bytes(zstd: &Path, path: &Path, level: u32) -> Option<Vec<u8>> {
+    let out = Command::new(zstd)
+        .arg(format!("-{level}"))
+        .arg("-c")
+        .arg("-q")
+        .arg(path)
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+// ---------------------------------------------------------------- profile
+
+/// Decode one frame in a loop so a sampling profiler can attach.
+///
+/// # Why this is a shipped mode and not a scratch file
+///
+/// Every worthwhile change in M3 came from a profile, and none of them came
+/// from the ranked list in `doc/ZALT-MAC.md` §5 that was written without one.
+/// The largest — a wrapping match copy that never reached an accelerated kernel
+/// — was **invisible** in the throughput table: NEON and scalar decoded at the
+/// same speed, which looked like the kernels not helping and was actually the
+/// kernels not running. Only attribution showed that, and only because both
+/// backends could be profiled the same way in the same process.
+///
+/// So the harness is permanent. `just profile-decode` drives it with `sample`,
+/// which ships with macOS; the `profile` recipe drives Instruments for the
+/// cycle-level work when the question is finer than "which function".
+///
+/// The loop deliberately allocates a fresh output buffer per iteration, because
+/// that is what `decompress` does for a caller and hiding it would profile a
+/// function nobody calls. It shows up as time in `main`, and it is real.
+fn profile_decode(file: &Path, seconds: u64, force_scalar: bool) {
+    let compressed = match fs::read(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("cannot read {}: {e}", file.display());
+            std::process::exit(1);
+        }
+    };
+    let limits = permissive_limits();
+
+    // Fail here rather than inside the timed loop, where the error would be
+    // reported once per iteration and buried under the profiler's output.
+    let decoded_len = match zalt_codec::decompress(&compressed, limits) {
+        Ok(out) => out.len(),
+        Err(e) => {
+            eprintln!("{}: {e}", file.display());
+            std::process::exit(1);
+        }
+    };
+
+    let backend = if force_scalar {
+        "scalar"
+    } else {
+        zalt_embed::backend_name()
+    };
+    eprintln!(
+        "profiling {} — {} -> {} bytes, backend {backend}, {seconds}s",
+        file.display(),
+        compressed.len(),
+        decoded_len,
+    );
+    eprintln!("attach with:  sample {} {seconds}", std::process::id());
+
+    // Steady state, matching what the `sink` column measures: one decoder,
+    // reset between frames, and no output buffer. Profiling the one-shot path
+    // instead means a large share of the samples land in the allocator and, on
+    // a machine under memory pressure, in the kernel — real costs, but not the
+    // ones a kernel change moves.
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut iterations = 0u64;
+    while Instant::now() < deadline {
+        decode_once(&compressed, limits, force_scalar);
+        iterations += 1;
+    }
+
+    let produced = decoded_len as u64 * iterations;
+    eprintln!(
+        "{iterations} iterations, {produced} bytes, ~{:.0} MB/s",
+        produced as f64 / seconds as f64 / 1e6
+    );
+}
+
+/// One decode through the chosen backend.
+///
+/// `force_scalar` exists so both backends can be profiled from one binary: the
+/// question "is the accelerated path even being taken" is answered by comparing
+/// two profiles, and comparing across two builds introduces differences that
+/// have nothing to do with the backend.
+fn decode_once(compressed: &[u8], limits: zalt_codec::params::DecodeLimits, force_scalar: bool) {
+    #[cfg(target_arch = "aarch64")]
+    if !force_scalar {
+        return drive::<zalt_neon::Neon>(compressed, limits);
+    }
+    let _ = force_scalar;
+    drive::<Scalar>(compressed, limits);
+}
+
+/// Decode one frame through a fresh decoder into a counting sink.
+///
+/// The decoder is built per call rather than hoisted because the profiler runs
+/// one frame per iteration over a 60 MB corpus; the construction is amortised
+/// to nothing, and hoisting it would need the borrow to outlive the loop for
+/// no measurable gain.
+fn drive<B: Backend>(compressed: &[u8], limits: zalt_codec::params::DecodeLimits) {
+    let mut decoder = zalt_codec::Decoder::<B>::new(limits);
+    let mut total = 0usize;
+    let mut sink = zalt_codec::FnSink(|chunk: &[u8]| total += chunk.len());
+    let mut cursor = 0usize;
+    loop {
+        let progress = decoder
+            .decompress_into(&compressed[cursor..], &mut sink)
+            .expect("verified decodable before the loop");
+        cursor += progress.consumed;
+        if cursor >= compressed.len() || progress.consumed == 0 {
+            break;
+        }
+    }
+    std::hint::black_box(total);
+}

@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Use the `ci` nextest profile: no fail-fast, no retries, junit output.
+  NEXTEST_PROFILE: ci
+
+jobs:
+  # The primary target. Apple Silicon runners exercise the NEON kernels and the
+  # equivalence tests that make the backend seam trustworthy.
+  apple-silicon:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,nextest
+      # One command, and it is the same one run locally before pushing. CI and
+      # the developer loop cannot drift apart if they share the recipe.
+      - run: just gate
+      - name: kernel benchmarks (smoke)
+        run: just bench
+
+  # zalt-codec claims to be a general zstd crate. This job is what makes that
+  # claim true rather than aspirational: if it only ever built on aarch64, the
+  # portability story would rot silently.
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,nextest
+      - run: just fast-test
+      - run: just no-std
+
+  layering:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - run: just layering
+
+  # Fuzz targets are dev-only, so nothing else builds them. Without this they
+  # rot silently: a target referencing a renamed API compiles nowhere and nobody
+  # notices until someone tries to fuzz.
+  fuzz-build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-fuzz
+      - run: just fuzz-build
+
+  # Miri over the scalar path. It cannot execute NEON intrinsics, which is
+  # precisely why the scalar backend is never deleted — it is the only way to
+  # get UB detection over this code at all.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,nextest
+      - run: just miri

@@ -1,0 +1,87 @@
+<!-- painted.zdoc — the fixture E5 needed and the corpus did not have.
+     Backgrounds, borders, radii, opacity and nested clip ports, on purpose.
+
+     Every other document here is prose: `showcase.zdoc` emits 82 glyph runs
+     and exactly TWO rects, one of which is the page background painted on an
+     identical canvas and therefore invisible. So the whole rect half of the
+     display list was exercised by one 3px border strip, 1553px down a page.
+
+     `position.rs` already recorded this shape for positioning — "the corpus
+     has nothing positioned, so every unit test would pass for a pass that
+     never ran" — and E5.5 hit it again for backgrounds. This is the standing
+     answer rather than a per-test sheet. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" signature="ed25519:eErELZkX6+T4Ig0lO1BhhQoxkLBqLr27Z6iWT/B4S3Y2jw2V6+wK8PQAv7cCb1IbWK6GXGCb7x7VMik8ppz7CQ==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+  <head doc-id="urn:uuid:7c1f3a54-9b2e-4d61-8a03-5e2f7c9d1b48" zs="/painted.zss" title="painted surfaces"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+    }
+
+    entity <zdoc://grazer.local/painted.zdoc> &doc {
+      @type schema:TextDigitalDocument
+      @substrate: digital
+      name: "painted surfaces"
+    }
+
+    entity <urn:topic:paint> &topic {
+      @type schema:Thing
+      @substrate: abstract
+      name: "the display list's rect half"
+    }
+
+    claim c1 {
+      subject: <zdoc://grazer.local/painted.zdoc>
+      predicate: schema:about
+      object: <urn:topic:paint>
+      @warrant: axiom
+    }
+  </weft>
+
+  <body>
+    <h1>Painted surfaces</h1>
+
+    <p>Every block below carries a background, a border, or both, so the
+       rect half of the display list has something to be wrong about.</p>
+
+    <!-- Plain background, no border. -->
+    <section id="plain">
+      <p>A filled block with no border at all.</p>
+    </section>
+
+    <!-- Background plus a wide border, to catch the two overlapping. -->
+    <section id="bordered">
+      <p>A filled block with a wide inline-start border. The border draws
+         over the background, which is why they are emitted in that order.</p>
+    </section>
+
+    <!-- Radius, which cascaded into nothing until E5.5. -->
+    <section id="rounded">
+      <p>Rounded corners. <code>border-radius</code> parsed and cascaded from
+         the beginning and reached no consumer until the display list.</p>
+    </section>
+
+    <!-- Opacity, which is a per-command alpha multiply and not CSS's group
+         composite. Two children so the difference is visible. -->
+    <section id="faded">
+      <p>Half-transparent. The engine scales this command's alpha; CSS would
+         composite the whole subtree as one group.</p>
+      <p>A sibling, at full strength, because opacity does not inherit.</p>
+    </section>
+
+    <!-- Nested clip ports: the case a flat sweep cannot express, and the
+         reason paint became a tree walk in E5.7. -->
+    <section id="outer-port">
+      <p>Outer clip.</p>
+      <section id="inner-port">
+        <p>An inner clip inside the outer one. Both must find their own pop.</p>
+      </section>
+    </section>
+
+    <!-- Inline backgrounds, which sit on `observed-box` rather than
+         `world-box` — E4.27's third column. -->
+    <p>Inline elements can be painted too:
+       <mark>a highlighted run</mark>, and
+       <code>a monospaced one</code>, inside ordinary prose.</p>
+  </body>
+</ztml>

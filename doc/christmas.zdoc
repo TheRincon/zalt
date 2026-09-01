@@ -1,0 +1,235 @@
+<!-- The christmas tree: every element ZTML's registry knows, in one document.
+     Its job is coverage, not realism. `christmas_covers_every_registered_element`
+     in tests/golden.rs fails when the registry grows and this does not, which is
+     what keeps it honest — a fixture that claims to cover everything and is not
+     checked is worth less than one that admits what it misses. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" signature="ed25519:jvnml3555AiJVtoeZUNOBv6dx+VXty8qlb4GYSrXF6Ns8BhwqUl0NxR95KiPXKmsAIYCYLuLMhMnTZYa5vkuAQ==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+  <head doc-id="urn:uuid:7c1f0b52-9a3e-4d61-8f24-1b6d5e0a9c73" zs="/style.zss /christmas.zss" title="christmas tree"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+      <https://vocab.example.org/orchard/> as orch
+    }
+
+    entity <zdoc://grazer.local/christmas.zdoc> &doc {
+      @type schema:TextDigitalDocument
+      @substrate: digital
+      name: "christmas tree"
+    }
+
+    entity <urn:orchard:spruce> &spruce {
+      @type schema:Thing
+      @substrate: physical
+      name: "Picea abies"
+      height: 21.4
+      planted: 1974
+    }
+
+    entity <urn:orchard:survey> &survey {
+      @type schema:Dataset
+      @substrate: digital
+      name: "orchard survey"
+    }
+
+    claim about {
+      subject: <zdoc://grazer.local/christmas.zdoc>
+      predicate: schema:about
+      object: <urn:orchard:spruce>
+      @warrant: axiom
+    }
+
+    claim measured {
+      subject: <urn:orchard:spruce>
+      predicate: orch:heightMetres
+      object: 21.4
+      @warrant: assertion { claimant: <did:key:z6MkSurveyor>, confidence: 0.93 }
+    }
+
+    claim guessed {
+      subject: <urn:orchard:spruce>
+      predicate: orch:ageYears
+      object: 52
+      @warrant: conjecture { confidence: 0.41 }
+    }
+  </weft>
+
+  <body>
+    <header>
+      <h1>Every element, once</h1>
+      <nav>
+        <ul>
+          <li><a href="zdoc://grazer.local/index.zdoc">Index</a></li>
+          <li><a href="zdoc://grazer.local/showcase.zdoc" via="schema:relatedLink">Showcase</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main>
+      <article>
+        <h2>Sectioning and headings</h2>
+        <h3>Third</h3>
+        <h4>Fourth</h4>
+        <h5>Fifth</h5>
+        <h6>Sixth</h6>
+        <p>A paragraph with <span id="inline-span">a span that declares a
+           purpose</span> and <div id="inline-div">a div that declares
+           one</div>.</p>
+
+        <section id="clipped-port">
+          <h3>A clip port</h3>
+          <p>This section sets <code>overflow: hidden</code> and a fixed
+             block size, so its content overflows and E4.16's
+             <code>clipped</code> column has something true to report. Nothing
+             else in the corpus establishes a scroll or clip port at all, so
+             without this the column is all-false everywhere.</p>
+          <p>A second paragraph, to be sure the port is overrun.</p>
+          <p id="escapes-the-port">Inset past the port's own height, so an
+             ancestor with a clip port genuinely does not contain it.</p>
+        </section>
+
+        <section id="stacking">
+          <h3>Stacking</h3>
+          <p id="beneath">Beneath, in flow.</p>
+          <p id="floats-over">Out of flow, painted over.</p>
+          <!-- A static wrapper between the positioned ancestor and the
+               positioned box, so `containing-block` differs from `parent`
+               and E4.23's walk has something to walk. Without this every
+               out-of-flow box's containing block is simply its parent, and
+               the column looks identical to `parent`. -->
+          <section id="static-wrapper">
+            <p id="pinned">Pinned to the containing block, not to the wrapper.</p>
+          </section>
+        </section>
+
+        <aside id="an-aside">
+          <p>An aside, which no other fixture has.</p>
+        </aside>
+      </article>
+
+      <article>
+        <h2>Text semantics</h2>
+        <p><em>emphasis</em>, <strong>strong</strong>, <mark>marked</mark>,
+           <code>code</code>, <kbd>Ctrl</kbd>, <samp>output</samp>,
+           <var>x</var>, <cite>A Citation</cite>, H<sub>2</sub>O,
+           2<sup>16</sup>, <abbr title="Zed Text Markup Language">ZTML</abbr>,
+           <dfn>a definition</dfn>.</p>
+        <p><del cite="zdoc://grazer.local/index.zdoc" at="2026-01-02">struck</del>
+           <ins cite="zdoc://grazer.local/index.zdoc" at="2026-01-03">inserted</ins>
+           <q cite="zdoc://grazer.local/index.zdoc">an inline quotation</q></p>
+        <p><ruby>漢<rt>kan</rt></ruby> and
+           <bdi>עברית</bdi> and
+           <bdo dir="rtl">reversed</bdo> and a break<wbr/>opportunity.</p>
+        <pre>  preformatted
+  two lines</pre>
+        <blockquote cite="zdoc://grazer.local/shipwreck.zdoc">
+          <p>A block quotation.</p>
+        </blockquote>
+        <verse>A verse block,
+line broken as written.</verse>
+      </article>
+
+      <article>
+        <h2>Lists and tables</h2>
+        <ol start="3" reversed="true">
+          <li value="3">Third</li>
+          <li>Second</li>
+        </ol>
+        <dl>
+          <dt>Term</dt>
+          <dd>Definition</dd>
+        </dl>
+        <table>
+          <caption>A table with every part</caption>
+          <colgroup><col span="2"/></colgroup>
+          <thead>
+            <tr><th scope="col">Axis</th><th scope="col">Value</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>height</td><td>21.4</td></tr>
+          </tbody>
+          <tfoot>
+            <tr><td colspan="2">One row measured</td></tr>
+          </tfoot>
+        </table>
+      </article>
+
+      <article>
+        <h2>Graph-bearing and generated</h2>
+        <p>The subject is <e ref="&spruce">a spruce</e>, and
+           <claim ref="measured">its height is asserted at high
+           confidence</claim>, while
+           <claim ref="guessed">its age is only conjectured</claim>.</p>
+        <p>Surveyed <time at="2026-03-14" render="relative"/>, over
+           <time span="P3M"/>.</p>
+        <p>Integrity: <fingerprint of="&doc"/></p>
+
+        <!-- §5.4/§5.5/§5.6: `into=` and `from=` name a <zapp>, never a weft
+             alias. The parser enforces it, which is how this document learned
+             it needs a component before it can have a chart. -->
+        <zapp src="/orchard.wasm"
+              hash="sha256:1b3d5f7a9c1e3b5d7f0a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d"
+              name="orchard"
+              grants="none"
+              title="Orchard survey viewer"/>
+        <chart from="orchard" kind="line" x="planted" y="height"
+               title="Growth"/>
+        <usermedia kind="camera" into="orchard" title="Field camera"/>
+        <figure>
+          <img src="/gears.png" alt="Bronze gearing"
+               hash="sha256:9f2c1e7a4b6d8f03a5c9e1b7d4f6082a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d"
+               size="480x320"/>
+          <figcaption>A figure with a caption.</figcaption>
+        </figure>
+        <picture>
+          <!-- Sized, so E4.29 has something with a real height to lose: a
+               block inside an inline used to be dropped entirely, and an
+               unsized image would give it a zero box either way. -->
+          <img src="/gears.png" alt="Bronze gearing again"
+               hash="sha256:9f2c1e7a4b6d8f03a5c9e1b7d4f6082a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d"
+               size="600x200"/>
+        </picture>
+      </article>
+
+      <article>
+        <h2>Declarative interaction</h2>
+        <details open="true">
+          <summary>A disclosure</summary>
+          <p>Its content.</p>
+        </details>
+        <dialog>
+          <p>A dialog, closed.</p>
+        </dialog>
+        <form>
+          <fieldset>
+            <legend>Measurements</legend>
+            <label for="h">Height</label>
+            <input type="number" id="h" name="height" min="0" max="100" step="0.1"
+                   value="21.4" list="common"/>
+            <datalist id="common">
+              <option value="21.4">measured</option>
+            </datalist>
+            <select name="species" label="Species, genus and epithet">
+              <optgroup label="Picea">
+                <option value="abies" selected="true">abies</option>
+              </optgroup>
+            </select>
+            <label>Care notes
+              <textarea name="notes" placeholder="Notes"/>
+            </label>
+            <button type="submit" name="save" value="1">Save</button>
+            <output for="h">21.4</output>
+            <progress value="7" max="10"/>
+            <meter value="21.4" min="0" max="30" low="5" high="25"
+                   optimum="20"/>
+          </fieldset>
+        </form>
+      </article>
+    </main>
+
+    <footer>
+      <p>The end of the tree.</p>
+    </footer>
+  </body>
+</ztml>

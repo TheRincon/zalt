@@ -1,0 +1,321 @@
+<!-- handsome.zdoc — a document that looks like something, without containing a
+     single instruction about how it should look.
+
+     Read this source next to the rendering. There is no class, no style, no
+     colour, no font, no width anywhere in it, because ZTML has no way to
+     express any of those. Everything the page does visually comes from
+     handsome.zss selecting on structure that is here for other reasons —
+     scope=row because it is a row header, warrant=conjecture because the
+     claim really is a guess.
+
+     The paper is dark. That is the sheet's decision, and grazer's contrast
+     floor holds the sheet to it: every colour was authored against the dark
+     paper, and the one that was not gets corrected at render time. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" lang="en" signature="ed25519:sMF4N5W4+eYh4tUZxc7UqDBH+3IRUArO+thTClGqg1ltaxmXtf2iKRreXhP5/ouOK/siUzqNbLBSCsikzzUZAQ==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+
+  <head doc-id="urn:uuid:662719a7-a596-49e9-80ea-0fe3444d9242" zs="/handsome.zss" title="The Colour of a Claim"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+      <https://vocab.example.org/typography/> as typo
+    }
+
+    entity <zdoc://grazer.local/handsome.zdoc> &doc {
+      @type schema:TechArticle
+      @substrate: digital
+      name: "The Colour of a Claim"
+    }
+
+    entity <urn:concept:zss> &zss {
+      @type schema:ComputerLanguage
+      @substrate: abstract
+      name: "ZSS"
+      description: "A style language that selects on meaning, including how a statement is warranted."
+    }
+
+    entity <urn:person:ottosson> &ottosson {
+      @type schema:Person
+      @substrate: physical
+      name: "Björn Ottosson"
+    }
+
+    entity <urn:place:oklab> &oklab {
+      @type schema:Place
+      @substrate: abstract
+      name: "OKLab"
+    }
+
+    entity <urn:org:grazer-spec> &spec {
+      @type schema:Organization
+      @substrate: abstract
+      name: "SPEC-ZSS"
+    }
+
+    claim c_about {
+      subject: <zdoc://grazer.local/handsome.zdoc>
+      predicate: schema:about
+      object: <urn:concept:zss>
+      @warrant: definition
+    }
+
+    claim c_separation {
+      subject: <urn:concept:zss>
+      predicate: typo:enforces
+      object: "presentation is a separate document from structure"
+      @warrant: axiom
+    }
+
+    claim c_closed {
+      subject: <urn:concept:zss>
+      predicate: typo:parseStrategy
+      object: "a sheet parses entirely or it does not apply"
+      @warrant: definition
+    }
+
+    claim c_oklch {
+      subject: <urn:person:ottosson>
+      predicate: typo:published
+      object: "OKLab, a perceptual colour space with even lightness"
+      @warrant: empirical { confidence: 0.98 }
+    }
+
+    claim c_floor {
+      subject: <urn:concept:zss>
+      predicate: typo:enforces
+      object: "computed text below the contrast floor is corrected, not rejected"
+      @warrant: definition
+    }
+
+    claim c_red {
+      subject: <urn:concept:zss>
+      predicate: typo:observes
+      object: "saturated red carries too little luminance to pass on dark paper"
+      @warrant: empirical { confidence: 0.72, sources: [c_oklch] }
+    }
+
+    claim c_authors {
+      subject: <urn:concept:zss>
+      predicate: typo:adoptionOutlook
+      object: "authors will prefer selecting on meaning to inventing class names"
+      @warrant: conjecture { confidence: 0.45 }
+    }
+
+    claim c_dark {
+      subject: <urn:concept:zss>
+      predicate: typo:observes
+      object: "a document is a surface, and a surface has a colour of its own"
+      @warrant: assertion { claimant: <urn:org:grazer-spec>, confidence: 0.6 }
+    }
+  </weft>
+
+  <body>
+    <main>
+      <header>
+        <h1>The Colour of a Claim</h1>
+        <p>
+          A style sheet that can ask how a sentence is warranted, and a
+          browser that will not let it make the answer unreadable.
+        </p>
+      </header>
+
+      <section id="paper">
+        <h2>The paper is part of the argument</h2>
+        <p>
+          <claim ref="c_dark">A document is a surface, and a surface has a
+          colour of its own</claim> — so this sheet paints one. The
+          declaration is a single <code>background-color</code> on
+          <code>body</code>, and it does two jobs at once: it is what the
+          window is painted with, and it is the datum the contrast floor
+          measures every run against.
+        </p>
+        <p>
+          Those two have to be the same colour. When they are not, the floor
+          certifies text as legible on a surface nobody draws, and the reader
+          gets dark ink on a dark window together with a clean bill of health.
+        </p>
+
+        <blockquote cite="https://example.org/zss/rationale">
+          <p>
+            <claim ref="c_floor">Computed text below the floor is corrected
+            rather than rejected.</claim> A sheet with one dim rule is not a
+            malformed sheet, and refusing the document over it would make the
+            floor an obstacle authors route around instead of a guarantee
+            readers get.
+          </p>
+          <cite>SPEC-ZSS §4</cite>
+        </blockquote>
+      </section>
+
+      <section id="warrants">
+        <h2>Prose, coloured by how it is known</h2>
+        <p>
+          Each sentence below is bound to a claim in this document's graph, and
+          the sheet selects on the warrant rather than on anything the prose
+          declares about itself.
+        </p>
+
+        <dl>
+          <dt>Axiom</dt>
+          <dd>
+            <claim ref="c_separation">Presentation is a separate document from
+            structure.</claim> Taken as given; the language is built on it.
+          </dd>
+
+          <dt>Definition</dt>
+          <dd>
+            <claim ref="c_closed">A sheet parses entirely or it does not
+            apply.</claim> True because of what the words mean.
+          </dd>
+
+          <dt>Empirical</dt>
+          <dd>
+            <claim ref="c_oklch">Björn Ottosson published OKLab, a perceptual
+            colour space with even lightness.</claim> Checkable, and checked.
+          </dd>
+
+          <dt>Assertion</dt>
+          <dd>
+            Someone said it, and the browser says who rather than pretending
+            the page is a neutral narrator.
+          </dd>
+
+          <dt>Conjecture</dt>
+          <dd>
+            <claim ref="c_authors">Authors will prefer selecting on meaning to
+            inventing class names.</claim> A guess at 0.45, rendered as one —
+            faded and slanted, so the confident prose around it does not carry
+            you past the uncertainty.
+          </dd>
+        </dl>
+
+        <h3>Entities, by type and substrate</h3>
+        <p>
+          The graph also types its subjects, and the sheet can reach that too:
+          <e ref="ottosson">Björn Ottosson</e> is a person and a physical one;
+          <e ref="oklab">OKLab</e> is a place only in the sense that a colour
+          space is somewhere you can be. <e ref="zss">ZSS</e> is abstract, and
+          renders as such.
+        </p>
+      </section>
+
+      <section id="red">
+        <h2>Why the red had to move</h2>
+        <p>
+          <claim ref="c_red">Saturated red carries too little luminance to
+          clear the floor on dark paper.</claim> A red that looks vivid on
+          white lands near <samp>Lc 47</samp> here. The fix was not to abandon
+          it but to raise its lightness until the author met the floor instead
+          of the browser:
+        </p>
+
+        <table>
+          <caption>The palette, measured against this document's own paper</caption>
+          <thead>
+            <tr>
+              <th scope="col">Role</th>
+              <th scope="col">OKLCH</th>
+              <th scope="col">Lc</th>
+              <th scope="col">Verdict</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">ink</th>
+              <td><code>oklch(93% 0.015 320)</code></td>
+              <td><samp>91.9</samp></td>
+              <td>clears comfortably</td>
+            </tr>
+            <tr>
+              <th scope="row">rose</th>
+              <td><code>oklch(82% 0.14 25)</code></td>
+              <td><samp>63.8</samp></td>
+              <td>clears, after lifting</td>
+            </tr>
+            <tr>
+              <th scope="row">purple</th>
+              <td><code>oklch(82% 0.14 310)</code></td>
+              <td><samp>67.2</samp></td>
+              <td>clears</td>
+            </tr>
+            <tr>
+              <th scope="row">gold</th>
+              <td><code>oklch(84% 0.16 85)</code></td>
+              <td><samp>73.8</samp></td>
+              <td>clears easily</td>
+            </tr>
+            <tr>
+              <th scope="row">the first red</th>
+              <td><del>oklch(72% 0.20 20)</del> <ins>oklch(82% 0.14 25)</ins></td>
+              <td><samp>47.2</samp></td>
+              <td></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p>
+          The last row's verdict cell is empty on purpose — an empty cell reads
+          as deliberately empty rather than as broken, because
+          <code>td:empty</code> is a thing a sheet can say.
+        </p>
+      </section>
+
+      <section id="mechanics">
+        <h2>What the sheet is actually doing</h2>
+
+        <h3>Selecting on position</h3>
+        <ol>
+          <li>The standfirst is <code>h1 + p</code> — a paragraph is a
+              standfirst because of where it sits.</li>
+          <li>Table striping is <code>tr:nth-child(odd)</code>, so the markup
+              never learns it is being striped.</li>
+          <li>Row headers are <code>th[scope=row]</code>, styled off a fact
+              about the table.</li>
+          <li>This item is last, and knows it only via
+              <code>li:last-child</code>.</li>
+        </ol>
+
+        <h3>Selecting on the graph</h3>
+        <p>
+          <dfn>Graph-facet selection</dfn> is the part with no CSS equivalent.
+          <abbr title="Zettelkasten Style Sheets">ZSS</abbr> reaches through a
+          bound element into the claim graph, so
+          <code>claim[confidence&lt;0.5]</code> is a legal selector and
+          <code>claim[warrant&gt;=axiom]</code> is a named error rather than a
+          silently useless match.
+        </p>
+
+        <details>
+          <summary>Why hue is never the only signal</summary>
+          <p>
+            Every warrant above carries weight, slope or an underline as well
+            as a colour. A reader who does not separate these hues, or who
+            prints the page, still sees the distinction. Colour is the second
+            signal, never the first.
+          </p>
+        </details>
+
+        <p>
+          Press <kbd>Cmd</kbd> and follow <a href="/showcase.zdoc"
+          via="schema:about">what ZTML removes</a>, or read
+          <a href="/antikythera.zdoc" via="schema:about">the mechanism</a>.
+          A typed edge renders differently from a bare link because
+          <code>a[via]</code> says the relationship is declared.
+        </p>
+      </section>
+
+      <section id="colophon">
+        <h2>Colophon</h2>
+        <p id="colophon-note">
+          This paragraph is set in a purple at <samp>Lc 14.6</samp> against
+          this paper, which is far below the floor. It is here on purpose.
+          grazer lifts it along OKLCH lightness — same hue, same chroma — and
+          reports the correction in the chrome, because a floor you cannot see
+          working is indistinguishable from one that was never implemented.
+          Set on <time at="2026-07-31">31 July 2026</time>.
+        </p>
+      </section>
+    </main>
+  </body>
+</ztml>

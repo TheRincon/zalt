@@ -1,0 +1,1636 @@
+# ZALT — A Composable Zstandard Implementation in Rust
+
+**Status:** M0–M2 complete; M3 (Apple Silicon) in progress
+**Date:** 2026-08-31 (design draft 2026-08-24)
+**Primary target:** aarch64-apple-darwin (M1 and later)
+**First consumer:** a WASM-native, JavaScript-free web browser
+
+---
+
+## 1. Context and the layering decision
+
+Zalt began as "a zstd alternative, NEON-optimized." Two constraints have since
+reshaped it.
+
+**The wire format is not ours to choose.** The first consumer is a browser, and
+origin servers emit `Content-Encoding: zstd` (RFC 8878, IANA-registered). A
+browser that cannot decode a standard zstd frame is broken. The wire path is
+RFC 8878, bit-exact, non-negotiable.
+
+**But the specialization must not contaminate the codec.** Zalt is meant to be,
+in order:
+
+1. A clean, general, stable, and reliable Rust zstd implementation — modern format only, no
+   deprecated or legacy cruft.
+2. An embeddable library suitable for a browser or app — streaming, bounded,
+   hostile-input-safe.
+3. A tuned specialization for Apple Silicon, and separately for specific content
+   classes such as ZTML (ZDOCs).
+
+Each of those is useful without the ones above it. Someone should be able to
+take layer 1 alone as a general-purpose zstd crate and never encounter the word
+"browser." That is the organizing constraint of this document.
+
+### The layers
+
+| Layer | Concern | Knows about |
+|---|---|---|
+| **L1 — Codec** | RFC 8878 format: parse, decode, encode | Bytes. Nothing else. |
+| **L1a — Accel** | SIMD kernels behind the same interfaces | CPU architecture |
+| **L2 — Embed** | Streaming, memory budget, allocators, pooling, FFI | Host process constraints |
+| **L2a — Platform** | OS integration (Darwin VM, dispatch, allocator) | The OS |
+| **L3 — Recipes** | Dictionaries + tuning profiles, loaded as *data* | Content classes |
+
+### The dependency rule
+
+**Dependencies point downward only. No lower layer may name a higher one.**
+
+This is a testable invariant, not a convention. In CI:
+
+```sh
+! grep -riE 'ztml|zdoc|weft|browser|darwin|apple' crates/zalt-codec/src
+! grep -riE 'ztml|zdoc|weft' crates/zalt-embed/src crates/zalt-neon/src
+```
+
+If ZTML tuning requires a change inside `zalt-codec`, that is a design failure
+to be fixed by widening a *generic* seam, never by adding a content-specific
+branch.
+
+### Specialization is data, not code
+
+The mechanism for tuning is a **recipe**: a manifest plus an optional dictionary,
+loaded at runtime or baked in at build time. Recipes select dictionaries,
+encoder parameters, and decoder policy. They cannot alter the bitstream, so they
+can never break correctness — only performance and ratio. ZTML is then not a
+feature of zalt; it is *the first recipe*, and it lives in its own crate that
+the codec has never heard of. See §7.
+
+---
+
+## 2. Scope
+
+### In scope (P0)
+
+- L1: streaming, incremental **zstd decoder**, RFC 8878 conformant, `no_std + alloc`.
+- L2: hostile-input hardening, memory bounding, streaming API, C FFI.
+- L1a: NEON kernels for aarch64.
+- CLI for benchmarking and differential testing.
+
+### In scope (later)
+
+- zstd **encoder** — correctness first, ratio second (P1).
+- L3: recipe mechanism, dictionary loading, `dcz` transport (P1).
+- Recipe *trainer* as a dev-time tool (P2).
+- `zalt::native` cache codec (P3, gated on measurement — see §10).
+
+### Explicitly out of scope
+
+- **Legacy zstd format versions.** v0.1–v0.7 frame support is cruft; modern
+  frames only. This is a deliberate simplification the reference library cannot
+  make and we can.
+- Beating `zstd -19` on ratio.
+- Runtime CPU dispatch (see §5 — unnecessary on aarch64).
+- Non-Apple platforms as *tuning* targets. L1 stays portable; only L1a/L2a are
+  Apple-specific, and both are optional.
+
+---
+
+## 3. Crate layout
+
+```
+zalt/
+├── Cargo.toml                  # workspace
+├── doc/
+│   ├── ZALT-MAC.md             # this file
+│   └── showcase.zdoc           # sample ZTML document (L3 reference only)
+└── crates/
+    ├── zalt-codec/             # L1. no_std + alloc. THE GENERAL ZSTD CRATE.
+    │   └── src/
+    │       ├── frame.rs            # frame + block headers, skippable frames
+    │       ├── literals.rs         # literals section
+    │       ├── huf.rs              # Huffman table build + 1/4-stream decode
+    │       ├── fse.rs              # FSE table build + decode
+    │       ├── sequences.rs        # sequence section, LL/ML/OF
+    │       ├── execute.rs          # sequence execution -> output
+    │       ├── lz.rs               # match copy, window, wildcopy
+    │       ├── bits.rs             # forward + backward bit readers
+    │       ├── xxh64.rs            # checksum
+    │       ├── dict.rs             # dictionary *loading* (format, not training)
+    │       ├── params.rs           # encoder/decoder parameter types
+    │       ├── backend.rs          # trait: the seam L1a plugs into
+    │       └── encode/             # P1
+    ├── zalt-neon/              # L1a. aarch64 kernels implementing `backend`.
+    ├── zalt-embed/             # L2. streaming, budget, pool, buffer sources.
+    ├── zalt-darwin/            # L2a. mach VM, madvise, dispatch. OPTIONAL.
+    ├── zalt-recipe/            # L3 mechanism. Generic. Manifest + dict loading.
+    ├── zalt-recipe-train/      # L3 dev tool. Dictionary training, param search.
+    ├── zalt-ztml/              # L3 instance. Mostly DATA. Depends on nothing above.
+    ├── zalt-ffi/               # C API, hand-written header + ABI drift check
+    ├── zalt-cli/               # zalt(1): decompress, info, check
+    ├── zalt-fuzz/              # cargo-fuzz targets
+    └── zalt-bench/             # criterion harness + corpora
+```
+
+### Notes on the seams
+
+**`backend.rs` is the L1/L1a seam.** L1 defines traits for the handful of
+operations worth accelerating — wildcopy, overlapping match copy, checksum,
+literal bulk copy — and ships a scalar implementation of each. `zalt-neon`
+provides an alternative implementation. Selection is compile-time via `cfg`,
+not runtime dispatch. The scalar path is never deleted: it is the Miri-testable
+correctness oracle (§9) and the portability story.
+
+**`zalt-embed` is content-agnostic.** It knows about memory budgets and
+streaming, not about what is being decoded. Browser *policy* (an 8 MiB default
+window cap) lives here as a default value; browser *identity* does not.
+
+**`zalt-ztml` is mostly a dictionary and a manifest.** If it accumulates
+meaningful amounts of Rust, that is a signal the seam in `zalt-recipe` is too
+narrow.
+
+**Why `zalt-neon` and `zalt-darwin` are separate.** aarch64 is not macOS. The
+NEON kernels are valid on aarch64 Linux; the Darwin crate is about `mach_vm`,
+`madvise`, and `dispatch`. Conflating them would forfeit a portability axis for
+no benefit.
+
+---
+
+## 4. L1 — The codec
+
+A clean-room RFC 8878 implementation. Modern frames only.
+
+### Frame
+
+- Magic `0xFD2FB528` (LE).
+- Skippable frames: magic `0x184D2A50`–`0x184D2A5F`, 4-byte size, skip payload.
+  **Must be handled** — `dcz` dictionary transport uses `0x184D2A5E`.
+- `Frame_Header_Descriptor` byte: bits 7–6 `Frame_Content_Size_flag`,
+  bit 5 `Single_Segment_flag`, bit 4 unused, bit 3 reserved (must be zero),
+  bit 2 `Content_Checksum_flag`, bits 1–0 `Dictionary_ID_flag`.
+- `Window_Descriptor` (absent when `Single_Segment_flag`): exponent = high 5 bits,
+  mantissa = low 3 bits.
+  `windowLog = 10 + exponent`, `windowBase = 1 << windowLog`,
+  `windowSize = windowBase + (windowBase / 8) * mantissa`.
+- Optional 4-byte content checksum = low 32 bits of XXH64 of decoded content.
+
+### Blocks
+
+- `Block_Header` is 3 bytes LE: bit 0 `Last_Block`, bits 1–2 `Block_Type`,
+  bits 3–23 `Block_Size`.
+- Types: 0 Raw, 1 RLE, 2 Compressed, 3 Reserved (**reject type 3**).
+- `Block_Maximum_Size = min(128 KiB, windowSize)`.
+
+### Literals section
+
+- Types: 0 Raw, 1 RLE, 2 Compressed (new Huffman table), 3 Treeless
+  (reuse previous block's table — **stateful across blocks**, a classic source
+  of bugs and of use-before-init vulnerabilities).
+- Raw/RLE `Size_Format`: `00`/`10` → 1-byte header, 5-bit size;
+  `01` → 2 bytes, 12-bit; `11` → 3 bytes, 20-bit.
+- Compressed/Treeless `Size_Format`: `00` → 1 stream, 3-byte header, 10+10 bits;
+  `01` → 4 streams, 3 bytes, 10+10; `10` → 4 streams, 4 bytes, 14+14;
+  `11` → 4 streams, 5 bytes, 18+18.
+- 4-stream mode has a 6-byte jump table: three 2-byte sizes for streams 1–3;
+  stream 4's size is inferred from the remainder. **Validate against underflow.**
+- Huffman `tableLog` max 11; weight-FSE accuracy log max 6.
+
+### Sequences section
+
+- `Number_of_Sequences`: `b0 < 128` → `b0`; `128..=254` → `((b0-0x80)<<8) + b1`;
+  `255` → `b1 + (b2<<8) + 0x7F00`.
+- `Symbol_Compression_Modes` byte: LL 2 bits, OF 2 bits, ML 2 bits, 2 bits
+  reserved (must be zero). Modes: 0 Predefined, 1 RLE, 2 FSE_Compressed,
+  3 Repeat (**stateful** — reject Repeat with no prior table).
+- Predefined accuracy logs: LL = 6, OF = 5, ML = 6.
+- **The sequence bitstream is read backwards.** State init order: LL, OF, ML.
+  Per sequence, value bits read offset → match_length → literals_length. State
+  updates: LL, ML, OF. Wrong ordering yields plausible garbage; pin with spec
+  vectors early.
+- Offset codes: `Offset_Value` 1–3 select repeat offsets; else
+  `real_offset = Offset_Value - 3`.
+- **Repeat-offset update has a special case when `literals_length == 0`.** The
+  single most commonly botched part of the format. Test it directly.
+
+### Validation obligations
+
+Input is attacker-controlled. All of these are mandatory:
+
+- Offset ≤ `min(windowSize, bytes_decoded_so_far + dictSize)`.
+- Literal lengths sum to the literals section's regenerated size.
+- Decoded block size ≤ `Block_Maximum_Size`.
+- Total decoded size ≤ `Frame_Content_Size` when declared.
+- Reserved bits zero; `Block_Type` 3 rejected.
+- FSE/Huffman table construction rejects malformed distributions — accuracy log
+  out of range, symbol counts not summing to `1 << accuracyLog`.
+- **`Single_Segment_flag` frames: `windowSize` is defined as `Frame_Content_Size`,
+  a u64.** Any window cap must cover this branch. Capping only the
+  `Window_Descriptor` path leaves the equivalent door open — a likely bug in a
+  first implementation.
+- **Literals `Regenerated_Size` ≤ `Block_Maximum_Size`.** The field is 20 bits,
+  so a three-byte header can claim 1,048,575 bytes — eight times the largest
+  legal block. This is the window amplification one layer down, and it must be
+  checked *before* the section is decoded, not after: the first version of this
+  decoder allocated the full megabyte and only failed later for an unrelated
+  reason.
+- **`Number_of_Sequences` ≤ `Block_Maximum_Size / 3`.** Every sequence emits a
+  match of at least three bytes. The field reaches ~98,000 in three bytes, which
+  would otherwise reserve over a megabyte of sequence records before decoding
+  one.
+- **Zero sequences ends the section.** No symbol-modes byte follows, and any
+  trailing bytes make the block corrupt. Accepting them is a validation gap the
+  reference's own `zeroSeq_extraneous` fixture catches.
+- **The sequence bitstream must be entirely consumed.** Otherwise a truncated or
+  over-long bitstream still decodes the declared number of sequences and reports
+  success, because the reader returns zero bits past the end rather than failing.
+- **Jump table sizes must not exceed the streams payload** (RFC 8878 §3.1.1.3.1.2).
+- **A malformed FSE distribution must cost an error, never a hang.**
+
+---
+
+## 5. L1a — Apple Silicon acceleration
+
+### Baseline facts
+
+- **NEON is mandatory on aarch64.** No runtime dispatch, no feature detection,
+  no fallback paths. 128-bit vectors; M1 has 4 NEON/FP pipes. A real
+  simplification over x86 SSE/AVX2/AVX-512 dispatch — lean on it.
+- **SVE is unavailable** on M1–M3. Do not design for it.
+- **128-byte cache lines** (vs 64 on x86). Affects prefetch distance, wildcopy
+  overrun padding, struct layout.
+- **Unaligned loads/stores are cheap.**
+- Firestorm is ~8-wide with a deep reorder buffer. It rewards *exposing
+  independent dependency chains* far more than clever vectorization of a serial
+  loop.
+
+### Ranked wins
+
+1. **4-stream Huffman literal decode.** The format provides four independent
+   bitstreams precisely so they can be decoded in parallel. Interleave all four
+   in one loop body; the four chains fill the machine width. Likely the largest
+   single win, and it requires **no SIMD at all** — just ILP.
+2. **Small-offset overlapping match copy.** Offsets < 16 defeat naive vector
+   copy. Rather than a byte-loop fallback, build the repeating pattern once and
+   expand it branchlessly with `vqtbl1q_u8` over a per-offset shuffle-index
+   table. Turns a common worst case into a fast path.
+3. **Bulk wildcopy.** `vld1q_u8`/`vst1q_u8` for 16/32-byte unaligned copies,
+   overrunning into padded output slack (≥32 B, ideally to a 128 B line). This
+   is also the dominant path for incompressible input, which decodes as raw
+   literals and raw blocks at near-`memcpy` speed.
+4. **FSE state interleaving.** Serial per state, but LL/ML/OF are independent.
+   Interleave them; consider decoding a sequence ahead where the bit budget allows.
+5. ~~**Double-symbol Huffman tables** for low-entropy literals — two symbols per
+   lookup.~~ **Struck at M3.** Measured 8.4% slower on real `.zdoc`: the paired
+   table costs `1 << table_log` to build per frame, and pairing conflicts with
+   win #1 above, because streams emitting one or two symbols per step can no
+   longer be interleaved on a shared index. See §10.
+6. ~~**XXH64 with NEON.** Four 64-bit accumulators map to two Q registers.~~
+   **Struck at M3.** AArch64 NEON has no 64-bit integer multiply, so this
+   cannot be done without emulating every product from 32-bit pieces — slower
+   than the scalar multiply Firestorm issues two of per cycle. The real win in
+   the checksum was not computing it at all when the frame declares none; see
+   §10.
+7. ~~**Match-source prefetch** one sequence ahead.~~ **Struck at M3.**
+   Implemented behind the backend seam and measured at a consistent **3.5%
+   regression** in an isolated A/B. The premise is that a match source misses
+   cache; it does not. A 2 MiB window — and even the 8 MiB browser ceiling —
+   sits inside the M1 P-cluster's 12 MiB shared L2, so the load is already
+   ~15 cycles and an out-of-order core hides it without help. What the hint
+   added was instructions, and an address computation needing three integer
+   divisions to find the *future* cursor position in a ring. Worth revisiting
+   only for windows that genuinely exceed L2.
+
+### Not worth doing
+
+- Vectorizing the bit reader itself — the dependency chain through the bit
+  accumulator defeats it. Use cross-stream ILP instead.
+- Table-driven vector gather. NEON has none; `vqtbl` indexes only within
+  registers, 16 bytes per table register.
+
+### Measured at M0 — and the lesson
+
+First kernel, M1, match copy, `cargo run --release -p zalt-bench -- kernels`:
+
+| shape | scalar GB/s | neon GB/s |
+|---|---:|---:|
+| offset=1, len=64 (byte smear) | 0.62 | 3.12 |
+| offset=7, len=256 | 1.27 | 12.38 |
+| offset=15, len=256 (widest overlapping) | 1.88 | 12.54 |
+| offset=16, len=256 (boundary) | 6.33 | 9.74 |
+| offset=64, len=256 | 16.35 | 34.97 |
+| offset=1024, len=4096 (bulk) | 34.14 | 59.67 |
+
+Single-run figures on an M1 with meaningful run-to-run variance; treat them as
+shape, not as precision.
+
+**The first version of the bulk row was a 40% regression** — 14.7 GB/s NEON
+against 24.6 scalar. A flat one-vector-per-iteration intrinsic loop lost to the
+scalar code, because LLVM auto-vectorises *and unrolls* the scalar loop into
+wider accesses than the hand-written version used. The fix was to tier the loop
+width against `offset` and delegate the truly non-overlapping case to
+`copy_within` (platform `memmove`).
+
+The lesson is worth keeping, because it predicts which items on the ranked list
+will pay: **hand-written NEON earns its place where the compiler cannot help.**
+Short overlapping offsets carry a loop-carried dependency that blocks
+auto-vectorisation entirely — a 6–10x win. Bulk non-overlapping copy is
+something the compiler and libc already do well, and hand-writing it is a
+regression waiting to be measured. This is the same reasoning that led
+`copy_literals` to delegate to `memcpy` rather than vectorise by hand.
+
+Ranked-list items #1 (4-stream Huffman ILP) and #2 (small-offset overlap) are
+both "compiler cannot help" cases. Item #3 (bulk wildcopy) is not, and should be
+expected to yield little.
+
+**Measured at M3, and the ranking did not survive.** Item #1 was worth ~5% on a
+real corpus; the two changes that mattered — a word-at-a-time bit reader and a
+wrapping match copy that reaches the kernels at all — appear nowhere on this
+list. The list ranks *kernels*, and the decoder's time was going to the code
+around them. §10's M3 notes carry the numbers. Nothing above is wrong about the
+architecture; it was simply never checked against a profile, and this section
+said so about itself two paragraphs ago.
+
+### Measurement discipline
+
+Nothing lands without a benchmark. Build `zalt-bench` *before* the optimization
+phase. Compare against system `zstd` 1.5.7 (`/opt/homebrew/bin/zstd`).
+
+Use `cargo-instruments` / Instruments for cycle-level work; the M1 PMU gives
+cache-miss and branch-miss attribution worth having.
+
+**Corpus selection is a recipe concern, not a codec concern** — see §7. The
+benchmark harness takes a corpus directory as input and has no built-in opinion
+about content.
+
+---
+
+## 6. L2 — Embedding
+
+Everything a host process needs and a codec should not contain.
+
+### Streaming is mandatory
+
+Consume socket-sized chunks, produce output incrementally, suspend and resume at
+*arbitrary byte boundaries* — mid-header, mid-block, mid-literals. A pull-based
+`decompress(&mut self, input, output) -> Status` interface is the model. Never
+require a whole response body in memory. This shapes the internal design, so
+build it in from the first commit rather than retrofitting.
+
+### The window clamp
+
+The window is the LZ77 back-reference limit, and therefore the decoded history
+the decoder must keep resident. It is not a buffer that can be flushed: a
+sequence arriving later may reference any byte in it. It is irreducible resident
+memory for the frame's lifetime — and it is declared by the sender.
+
+`Window_Descriptor` allows `windowLog` up to 41, so a **spec-legal ~6-byte frame
+header can demand a 2 TiB window** (libzstd's own refusal above `windowLog` 31 is
+implementation policy, not format). That is an unauthenticated remote
+memory-exhaustion primitive with unbounded amplification, reachable from any
+origin on any subresource.
+
+Two independent defenses; both are needed:
+
+- **Lazy allocation** — never hold more than
+  `min(declaredWindow, bytes_actually_decoded)`. A frame producing 10 KB needed
+  10 KB of history regardless of its header. This alone defeats header
+  amplification, and libzstd's streaming path does *not* do it, so it is a real
+  differentiator. It is also a **performance** requirement wherever many small
+  resources decode concurrently: touching a declared 8 MiB window per resource
+  would be a storm of page faults for data never used.
+- **A hard cap, checked at header parse** — covers what lazy allocation cannot:
+  an attacker sending *real* content. zstd compresses degenerate input at
+  enormous ratios, so a modest request can legitimately decode to gigabytes, and
+  matches placed at maximum distance force retention of the whole window.
+  Reject-early matters: you cannot decode with a smaller window than declared and
+  hope, because you would fail partway through when a long-distance match arrives.
+
+**On the value.** Security says "have a cap"; it does not pick a number. 8 MiB is
+an *ecosystem* observation, not a Chrome-compatibility requirement: RFC 8878 names
+8 MB as the interop floor decoders should support, and public browser caps have
+made it the de facto ceiling that origins already target. Below it you reject
+legitimate content; above it you accept content nobody sends while raising your
+worst case. It is a **default in a config struct**, not a constant, and it applies
+only to untrusted input — a trusted local cache needs no cap.
+
+### Per-frame caps are not sufficient
+
+8 MiB is *per decoder instance*. A hostile page referencing a hundred
+zstd-encoded subresources, decoded concurrently, authorizes 800 MB.
+
+L2 therefore owns a **global budget across live decoders** — a bounded decoder
+pool or an accounting allocator that applies backpressure to the network layer.
+This makes caller-provided allocators and footprint reporting load-bearing
+requirements rather than conveniences. Decoder instances must be cheap to
+`reset()` and reuse; prefer pooling over per-response allocation.
+
+### Hostile input
+
+The strongest argument for Rust here. Historically, browser decompressor CVEs are
+memory-safety bugs in C.
+
+- `#![forbid(unsafe_code)]` on all parsing and table-construction code.
+- `unsafe` confined to audited SIMD/copy kernels in `zalt-neon` and `lz.rs`,
+  each with a documented safety contract and bounds established by the caller.
+- No `unwrap`/`panic` reachable from parsing; enforced by lint and fuzz target.
+- Panics must never unwind into Swift/ObjC: `catch_unwind` at the FFI boundary,
+  error codes not panics.
+
+---
+
+## 7. L3 — Recipes: the tuning mechanism
+
+The composability answer. A **recipe** is a manifest plus an optional dictionary,
+consumed as data. Recipes tune; they never alter the bitstream.
+
+### What a recipe can and cannot control
+
+| Can | Cannot |
+|---|---|
+| Which dictionary to use | The frame/block format |
+| Encoder parameters (level, windowLog, strategy, literal mode) | Decoded output bytes |
+| Decoder policy (window cap, budget, size limits) | Validation rules |
+| Content-type → profile routing | Anything in L1 |
+| Whether to attempt compression at all (stored-block fast path) | Wire compatibility |
+
+### Filters — rejected for now
+
+Pre/post-processing filters are **out of scope**. Not measured, not prototyped,
+deliberately deferred. Recorded here only so the reasoning is not re-derived:
+
+- A filtered stream is still a well-formed zstd frame, but it decodes to
+  `F(document)`. **If it is ever revisited, it must be served under its own
+  content-coding token** (`Accept-Encoding: zstd-ztml`), never under `zstd`.
+  Caching intermediaries key on `Content-Encoding`; filtered bytes served as
+  `zstd` will eventually be cached and handed to a generic client, corrupting
+  content in a way neither endpoint can detect. This is the mechanism `dcz`/`dcb`
+  used, and the reason they used it.
+- The cost is two byte-exactly reversible implementations (Go and Rust) in
+  lockstep, cross-language differential fuzzing, and a new attacker-controlled
+  parser on the untrusted path. A dictionary is inert data; a filter is code.
+
+Architecturally a filter would sit above L1 (`bytes → filter → zstd → wire`), so
+nothing in the current design forecloses it later.
+
+### Block splitting (encoder, wire-compatible)
+
+Unrelated to filters and worth doing on its own: zstd permits arbitrary block
+boundaries, and **each block builds its own literals Huffman table**. An encoder
+that splits blocks at statistical transitions — compressible markup in one block,
+incompressible hash/signature regions in another — lets each get a fitted table
+instead of forcing one table to cover both. Today they interleave and both
+compress worse for it.
+
+This needs no token, no negotiation, and no server-side coordination: it is
+entirely an encoder-side decision within RFC 8878, and any decoder handles the
+output. Tracked in M5.
+
+### Sketch
+
+```toml
+[recipe]
+name = "ztml-0.3"
+
+[match]
+content_type = ["application/ztml"]
+extension    = [".zdoc"]
+
+[dictionary]
+path = "ztml-0.3.dict"
+id   = 0x5A544D4C          # carried in Dictionary_ID; both peers resolve it
+
+[encode]
+level = 6
+window_log = 17
+
+[decode]
+max_window = "8MiB"
+
+[[rule]]                    # content already compressed: don't bother
+match_content_type = ["image/webp", "image/png", "image/avif", "font/woff2"]
+strategy = "stored"
+```
+
+Recipes load from a directory, from an embedded blob compiled into the binary, or
+ad hoc from a path — the browser bakes ZTML in; the CLI takes `--recipe foo.toml`.
+
+### Dictionaries
+
+Two very different jobs, and the split is favorable:
+
+- **Loading** (decode side) is easy and belongs in L1 `dict.rs`: parse the
+  dictionary format, install the entropy tables and content prefix.
+- **Training** (encode side) is the real work — COVER/fastCover-style selection —
+  and lives in `zalt-recipe-train` as a **dev-time tool**, entirely off the
+  browser's critical path.
+
+Staging: v1 uses a **content-prefix dictionary**, which is just a concatenation
+of representative samples and needs no algorithm at all. It works surprisingly
+well and unblocks the whole mechanism. Upgrade to trained dictionaries later.
+
+`zalt recipe train --input corpus/ --out ztml.recipe` is the ad-hoc path: point
+it at a directory of representative files, get a dictionary and a parameter set.
+
+### Why dictionaries matter disproportionately here
+
+A zstd dictionary carries **pre-computed Huffman and FSE tables**, not only a
+content prefix. Entropy table construction is a *per-frame fixed cost*, so on
+small resources it can rival actual decoding. Any workload dominated by many
+small files gets a double win — better ratio and less setup.
+
+**Caveat, and it is a real one:** a dictionary-compressed frame can only be
+decoded with the dictionary that compressed it. A client-side dictionary is
+therefore worthless on the wire unless origins adopt the same one. The mechanism
+is a well-known `Dictionary_ID` both peers resolve out of band — which removes
+*per-request* negotiation but still requires ecosystem adoption. Where we own
+both ends (a local cache), the win is unilateral and free. Do not plan as though
+shipping a dictionary in a browser binary unilaterally improves wire performance;
+it does not.
+
+`dcz` (Compression Dictionary Transport) is the standardized alternative for
+negotiated dictionaries: a 40-byte prelude — skippable magic `0x184D2A5E`,
+length `0x20`, then the dictionary's 32-byte SHA-256 — ahead of an ordinary
+frame. Since skippable frames and dictionary IDs are required anyway, keeping
+this in the decoder's shape from the start avoids a painful refactor.
+
+---
+
+## 8. L3 instance — the ZTML profile
+
+**This section is the only place in the document where ZTML appears, and
+`zalt-ztml` is the only crate that may reference it.** It is recorded here to
+justify the recipe's contents, not to influence L1.
+
+### What a `.zdoc` looks like to a compressor
+
+Three statistically distinct regions coexist (see `doc/showcase.zdoc`):
+
+1. **Structural markup** — heavy short-range repetition (`<section>`,
+   `<th scope="row">`, `</tr>`) plus space-run indentation on nearly every line.
+   Produces **small-offset overlapping matches** — exercises §5 win #2.
+2. **The WEFT data layer** — near-template repetition at medium distance. Every
+   `claim` block repeats `subject:`/`predicate:`/`object:`/`@warrant:`, and URIs
+   and prefixes (`<urn:concept:ztml>`, `schema:`, `hist:`) recur. Excellent match
+   material at offsets in the hundreds of bytes, and ideal dictionary material.
+3. **Mandatory incompressible tokens** — the root element carries an ed25519
+   signature (88 chars base64) and public key (44 chars); entities are
+   `urn:uuid:` identifiers; and because `hash` is **mandatory rather than
+   advisory**, every subresource reference carries a 64-character SHA-256 hex
+   string.
+
+Region 3 is the distinctive one: a reference-dense `.zdoc` has a large
+incompressible fraction no match finder can touch, all of it flowing through the
+Huffman literals path. Hex draws from 16 symbols and base64 from 64, so Huffman
+earns real gains — but these regions are **literal-dominated and match-poor**.
+
+**Consequence: the literals path is disproportionately hot.** This corroborates
+ranking 4-stream Huffman decode first in §5 — but note the ranking was derived
+from architecture, not from ZTML, and stands without it.
+
+### The push model
+
+Subresources are hash-pinned and pushed on their own streams in the same round
+trip: **many small resources decoded concurrently**. Per-frame fixed cost
+dominates over steady-state throughput. This is the workload that most rewards
+dictionaries (§7) and lazy window allocation (§6), and it stresses the global
+memory budget more than any single large transfer would.
+
+ZTML's **closed vocabulary** makes it an unusually good dictionary target — the
+entire tag set and WEFT keyword set is known at build time. Subject to the
+adoption caveat in §7.
+
+### Corpus for the ZTML recipe
+
+| Category | Notes |
+|---|---|
+| `.zdoc`, small (1–16 KB) | Dominant case. Per-frame overhead rules. |
+| `.zdoc`, large | Long articles; steady-state throughput. |
+| `.zdoc`, WEFT-dense | Many `entity`/`claim` blocks — template matching. |
+| `.zdoc`, reference-dense | Many hashes/UUIDs — worst-case literal entropy. |
+| WASM modules (ZAPPs) | Binary; LEB128 varints, opcode streams. Distinct stats. |
+| WebP / PNG / AVIF / AV1 | Already compressed — throughput path, see below. |
+| Fonts (WOFF2) | Already compressed (Brotli inside). |
+
+Explicitly **not** in this corpus: HTML, CSS, JavaScript, Silesia, enwik. None
+reflect what this browser fetches.
+
+**On pre-compressed media.** WebP/PNG/AVIF/AV1 payloads are already compressed;
+zstd over them yields ~1.0x while costing full decode time, and origins should
+serve them `identity`. They belong in the corpus as a **throughput** measurement,
+not a ratio one — incompressible input travels the raw-literal and raw-block
+paths where the target is near-`memcpy`. The recipe's `strategy = "stored"` rule
+(§7) is what keeps the encoder from wasting cycles on them.
+
+---
+
+## 9. Correctness and testing
+
+A security boundary. Testing is not a phase at the end.
+
+### The reference corpus
+
+`zstd-fixtures/` holds facebook/zstd's own regression files, and they are worth
+more per byte than anything generated, because each one is a trap somebody
+already fell into:
+
+| Set | What it pins |
+|---|---|
+| `golden-decompression/` | Frames that must decode exactly — including `rle-first-block` (a block type encoders almost never emit) and `zeroSeq_2B` (the zero-sequences edge case) |
+| `golden-decompression-errors/` | Frames that must be **refused** |
+| `golden-compression/` | Inputs that stress specific encoder paths, and therefore the matching decoder paths — `large-literal-and-match-lengths` reaches the high LL/ML codes with their wide extra-bit fields |
+| `golden-dictionaries/` | For M4 |
+
+Derived artifacts (expected outputs, compressed forms) are generated by
+`just zstd-fixtures` rather than committed.
+
+**The errors directory is the important one.** Round-trip tests only ever prove
+a decoder is permissive enough; nothing in them detects a decoder that is *too*
+permissive. It found a real gap on first run — see below.
+
+### Fuzzing
+
+Five targets in `fuzz/`, seeded from both fixture sets by `just fuzz-seed`.
+
+| Target | Property |
+|---|---|
+| `decode_hostile` | Arbitrary bytes never panic, hang, or allocate without bound |
+| `decode_differential` | Against libzstd — see the asymmetry note below |
+| `roundtrip_valid` | libzstd compresses, zalt must reproduce exactly |
+| `streaming_equivalence` | Chunked decode equals one-shot, with output discarded between calls |
+| `backend_equivalence` | Scalar and NEON agree byte for byte |
+
+**Random bytes are nearly useless on their own.** They essentially never form a
+valid zstd frame past the magic number, so an unseeded fuzzer hammers header
+validation and never builds an entropy table. `roundtrip_valid` exists to reach
+the decode paths: the fuzzer's bytes are the *content*, libzstd compresses them,
+and every mutation changes the entropy tables and streams that come back.
+
+**The differential oracle must be asymmetric, and weaker than it looks.** zalt
+deliberately supports less than libzstd (no legacy frames, no dictionaries yet,
+a window cap). And a frame *without a content checksum* carries no way to detect
+a flipped bit, so two conformant decoders may produce different garbage and
+neither is wrong — a mutating fuzzer generates that case constantly. What
+survives:
+
+- zalt accepts what libzstd rejects → **always a bug**, a hole in validation.
+- Both accept and the frame declares a checksum → outputs must be identical
+  (both verified the same XXH64, so this is meaningful).
+- Both accept, no checksum → no assertion is possible.
+- zalt rejects what libzstd accepts → fine; being stricter is allowed.
+
+The unconditional output check lives in `roundtrip_valid`, where frames are
+valid by construction and none of that reasoning is needed.
+
+### Other layers
+
+- **Memory safety**: fuzz corpus under ASan; Miri over the scalar path (Miri
+  cannot execute NEON intrinsics — the retained scalar backend is what makes
+  this possible at all, and doubles as the correctness oracle).
+- **Layering CI**: the `grep` invariants from §1. A violation fails the build.
+- **No `unwrap`/`panic` reachable from parsing.**
+
+## 10. Milestones
+
+### M0 — Skeleton ✅
+- [x] Workspace, crate layout, CI (build/test/clippy/fmt + layering greps).
+- [x] `backend.rs` trait seam with the scalar implementation.
+- [x] `zalt-bench` harness taking a corpus directory, comparing vs system `zstd`.
+- [x] `zalt-neon` first kernel + exhaustive `backend_equivalence` tests.
+- [x] Magic-number registry with collision tests.
+
+- [x] `justfile` — one entry point for every task; CI runs the same recipes, so
+      the local loop and CI cannot drift apart.
+
+`ci/layering.sh` enforces the §1 contract. Corpus is unpopulated — the baseline
+mode has nothing to measure until real `.zdoc` traffic is captured.
+
+`just gate` runs everything CI runs, in CI order. `just t` is the inner loop
+(nextest, parallel, sub-second). `just fixtures` regenerates the interop
+fixtures **deterministically** — from AES-CTR over zeros rather than
+`/dev/urandom`, because fixtures built from real randomness change on every
+regeneration, silently changing what the suite tests and making a failure
+impossible to reproduce.
+
+### M1 — Correct scalar decoder (critical path) — decoding works end to end
+- [x] Frame/block headers, skippable frames.
+- [x] Raw and RLE blocks.
+- [x] XXH64 checksum, verified against real `zstd` frame output.
+- [x] Streaming state machine — suspend/resume at arbitrary boundaries.
+- [x] Window clamp incl. the `Single_Segment` content-size path.
+- [x] Decoded size bounded *during* decode, not after.
+- [x] Forward (LSB-first) and backward (MSB-first) bit readers.
+- [x] FSE table description parsing, table construction, predefined tables.
+- [x] Huffman tree description (direct + FSE-compressed weights), table build,
+      1-stream and 4-stream decode.
+- [x] Literals section: raw / RLE / Huffman / treeless.
+- [x] Sequence decode — backward bitstream, all three orderings.
+- [x] Sequence execution and repeat offsets **including `literals_length == 0`**.
+- [x] Window management as a bounded ring buffer, lazily grown.
+- [x] Reference conformance corpus (`zstd-fixtures/`) passes — golden frames
+      decode exactly, golden **error** frames are refused, golden compression
+      inputs round-trip at levels 1/3/9/19.
+- [x] Differential, round-trip, streaming and backend fuzz targets.
+- [x] Validation set from §4 complete (see below).
+- [x] Sustained fuzz campaign — see below. `just fuzz-all` cycles targets
+      briefly and is a smoke test; a real run pins one target with `-workers=N`
+      and detaches.
+
+**A real `zstd -3` compressed frame now decodes byte for byte** — four-stream
+Huffman literals with FSE-coded weights, an FSE-coded sequences section, and
+match execution through the backend seam. Both backends agree on it.
+
+#### Two spec bugs, and why the tests missed them
+
+**The FSE weight-stream termination.** Emitting a symbol *includes* advancing
+its state, and the end-of-stream test belongs **after** that advance. Testing
+before it — the intuitive reading — stops one symbol early, shifting every
+symbol index past the truncation point down by one.
+
+**The `ML_DEFAULT` distribution.** The predefined match-length distribution's
+`-1` run begins at index 46, not 48: 37 ones and 7 minus-ones, not 39 and 5.
+
+The second is the more instructive failure. The wrong split **sums to 64 just
+like the right one**, so `predefined_distributions_sum_to_their_table_size`
+passed, the table built, and every internal-consistency check held. The only
+symptom was that some states decoded to the wrong symbol — and the entire
+existing fixture set used `FSE_Compressed` mode, so the *predefined* tables were
+never exercised by a single test. A whole code path was unverified and nothing
+said so.
+
+Both bugs are now pinned by tests that check *shape*, not totals
+(`predefined_distributions_have_the_exact_shape_from_the_rfc`) and by golden
+state-to-symbol assertions taken from a real frame.
+
+RFC 8878 is vendored at `doc/rfc8878.txt`. Both bugs were invisible to
+inference and obvious on reading the spec text; that is worth the 100 KB.
+
+#### What the first real campaign found
+
+All five targets, multi-worker, under ASan, seeded from both fixture sets:
+
+| target | runs | result |
+|---|---:|---|
+| `decode_differential` | — | **two bugs** (below) |
+| `decode_differential`, after both fixes | 1,016,826 | clean |
+| `decode_hostile` | 216,565 | clean |
+| `backend_equivalence` | 26,916 | clean — no scalar/NEON disagreement |
+| `roundtrip_valid` | 40,055 | clean |
+| `streaming_equivalence` | 7,379 | clean |
+
+The corpus grew roughly fourfold across the run and is worth keeping; §10's
+note about `just clean-corpus` applies.
+
+**Miri needed gating, not fixing.** The exhaustive oracles added in M3 — every
+bit position and width, every combination of ring capacity, cursor phase, offset
+and length — are seconds natively and unbounded under an interpreter; a first
+run burned 34 minutes of CPU without finishing. Each now scales itself down
+under `cfg(miri)` the way `conformance.rs` already did, keeping the property
+while dropping the cross-product. The scalar path is clean in 221 seconds.
+
+`backend_equivalence` mattered most for confidence in the M3 work — it is what
+holds the new `unsafe` in `zalt-neon`'s small-copy kernels against the scalar
+oracle — and `roundtrip_valid` is what proves the two new validation checks do
+not refuse frames libzstd actually produces.
+
+Every crash was a 19-byte frame, and every one was the asymmetry §9 names as
+the only unconditionally meaningful one: **zalt accepted what libzstd
+rejects.**
+
+The frame declares seven literals under a Huffman table whose codes are one or
+two bits, so at most fourteen bits are consumed — against twenty readable bits
+in the stream. zalt produced the correct seven bytes and reported success.
+
+**The obligation was already written down, one section up, for the wrong
+section.** §4 requires that *the sequence bitstream* be entirely consumed, and
+explains exactly why: "a truncated or over-long bitstream still decodes the
+declared number of sequences and reports success, because the reader returns
+zero bits past the end rather than failing." Every word of that applies to a
+Huffman literals stream, `sequences.rs` implemented it, and `huf.rs` never did.
+The reference refuses these frames at `BIT_endOfDStream` for the same reason.
+
+`check` was not enough on its own: it catches reading *past* the end, and this
+is the opposite failure. Both are now required, in the one-stream and
+four-stream paths alike, and the three frames are pinned as
+`literal_streams_with_unconsumed_bits_are_refused` rather than left in
+`fuzz/artifacts/`, which `just clean-fuzz` deletes.
+
+**The second bug, found by re-running the campaign after fixing the first.**
+A Huffman tree description whose declared depth no symbol reaches. Weights
+`[0, 2, 0]` derive a final weight of 2, giving `table_log` 2 — a four-entry
+table — for two symbols whose codes are one bit each. Since `nb_bits` is
+`table_log + 1 - weight`, a symbol of weight 1 is the one that actually uses
+the full depth, and this description has none. The same code written minimally
+is `[1, 1]` at `table_log` 1, which both decoders accept.
+
+It decodes perfectly well, which is exactly why nothing objected: the spans sum
+to the table size, every state is populated, the stream is fully consumed, and
+the output is the seven bytes the bits imply. Nothing downstream can tell that
+every lookup read a bit it never consumed.
+
+Finding it took bisection rather than inspection, and the sequence is worth
+recording because the first three hypotheses were all wrong:
+
+1. Rebuilt the same table with a **direct** weight description instead of an
+   FSE-compressed one. Both decoders behaved identically → the FSE weight path
+   was not at fault.
+2. Same framing with **raw** literals → both accept, so the block and frame
+   layout were fine.
+3. A **flat four-symbol** table → both reject, so ordinary table construction
+   was fine.
+4. The same code written **minimally** → both accept.
+
+Only (4) separated them, and it names the rule. Guessing at libzstd's internals
+produced nothing; four controls that differed in one variable each produced a
+one-line check.
+
+Two things worth keeping from this:
+
+- **The generalisation was available and nobody made it.** A validation
+  obligation discovered for one entropy-coded stream is a hypothesis about
+  every entropy-coded stream. That is a cheap review question and it would have
+  found the first bug without a fuzzer.
+- **Fixing one bug is what exposed the next.** The second frame was reachable
+  only once the first no longer stopped the campaign, and the same is likely
+  true again — a clean run means "no more findings at this depth", not "no more
+  bugs". Both fixes are the same shape: a structure that decodes without
+  complaint but that no encoder would ever emit.
+- **It was not a regression from the M3 optimisation work**, which was the first
+  suspicion — `entry_masked` deliberately traded an error for a masked index.
+  An assertion added temporarily in its place never fired on these inputs,
+  which ruled it out before any time went into it. Fuzzing a decoder right
+  after rewriting its hot paths is worth doing for exactly this: the campaign
+  distinguishes "the change broke it" from "it was always broken".
+
+#### The bug worth remembering
+
+The first end-to-end attempt produced 15366 of 15366 bytes with a handful wrong:
+`entitx` where `entity` belonged. `x` never appears in the source at all, so the
+symbol index was off by one — and only for the *highest* symbol value, because
+the Huffman tree description omits the last symbol's weight and derives it.
+
+The cause was the FSE weight-stream termination. Emitting a symbol *includes*
+advancing its state, and the end-of-stream test belongs **after** that advance.
+Testing before it — the intuitive reading — stops one symbol early, shifting
+every symbol past the truncation point down by one.
+
+What makes it worth recording is how nearly invisible it was: the table still
+built, the checksum was the only thing that objected, and had the input happened
+to use every byte value the error would have been spread across the output
+instead of concentrated in one rarely-used symbol. This is precisely the failure
+class the differential fuzzing in §9 exists to catch, and an argument for
+prioritising it.
+
+#### The window
+
+History now lives in the decoder, not in the caller's buffer. Before, matches
+indexed into the output `Vec`, so a caller had to retain an entire frame — a
+500 MB response could not be streamed to disk. `caller_may_discard_output_between_calls`
+is the test that pins the new property: the caller clears its buffer after every
+call and decoding stays correct.
+
+A **ring** rather than a sliding buffer with compaction. Compaction keeps history
+contiguous — so the accelerated kernels always apply — but costs write
+amplification of `window_size / slack`; at 8 MiB with 128 KiB slack that is 64x,
+and making it cheap means roughly doubling memory. The ring costs neither, at the
+price of a match spanning the wrap point not being one flat operation. That
+trade is right here because **a frame smaller than its window never wraps**, so
+the common case stays on the flat path that reaches the NEON kernels, and only
+frames exceeding their own window pay.
+
+Capacity is a ceiling, not a reservation: a frame declaring 8 MiB and producing
+4 KB allocates 4 KB.
+
+Miri is clean over the scalar path.
+
+### M2 — Embedding ✅
+- [x] Global budget with **resizable leases**, footprint reporting.
+- [x] `zalt-embed::Decoder` — policy-bound, budget-charged, streaming.
+- [x] `DecoderPool` — reset-and-reuse, bounded idle set, shrink-on-return.
+- [x] Caller-provided allocator — `BufferSource` + `Recycler`.
+- [x] `zalt-ffi` C API + header, panic-proof boundary.
+- [x] `zalt-cli`.
+
+The header is **hand-written rather than cbindgen-generated**, which is a
+deliberate reversal of the plan above. A generated header follows whatever the
+Rust happens to look like, so an accidental signature change silently becomes
+the new API; a hand-written one *is* the contract. The cost of hand-writing is
+drift, and `ci/check-abi.sh` is what pays it — it compares exported symbols and
+constant *values* between the two, because a constant that disagrees is worse
+than one that is missing: the caller links fine and misreads every error.
+`just ffi-smoke` then compiles a real C program against the staticlib, which is
+the part that otherwise breaks at integration time rather than in CI.
+
+#### Accounting against a footprint that grows
+
+The awkward part, and the reason leases resize.
+
+A decoder's memory is not known when it starts, because the window is allocated
+lazily. Reserving the declared maximum up front is simple and wrong: it charges
+every response for memory it never touches, and would refuse the ninth
+concurrent 4 KB response on a 64 MiB budget. Reserving nothing is not accounting
+at all.
+
+So a `Lease` tracks *actual* usage, re-checked after every `decompress` call.
+When the budget refuses growth the decode returns `Error::OverBudget` — its own
+variant, not a parse error, because the caller can act on it: queue the
+response, retry when other decoders finish, or fail one resource instead of the
+page.
+
+#### Why pooled decoders are shrunk before going idle
+
+A decoder that once served a large response keeps a large buffer and keeps it
+*reserved* while idle. Left alone, a pool converges on every slot holding the
+high-water mark of anything it ever decoded — budget charged permanently for a
+peak that has passed. A decoder returning above `idle_footprint_max` is shrunk
+instead, trading one allocation on its next use for not holding the peak.
+
+#### The allocator is a buffer source, not an allocator
+
+"Caller-provided allocator" reads as a per-allocation hook, and that is
+`allocator_api` — unstable, so a codec built on it builds only on nightly, and a
+library nobody can ship on stable is not a library. A `#[global_allocator]` is
+worse: process-wide, so it cannot be scoped to a decoder, and it forces `unsafe`
+into a crate that is `forbid(unsafe_code)`.
+
+Buffer donation is the stable answer, and it is the one libzstd reaches for as
+well (`ZSTD_initStaticDCtx` and its workspace). L1 already spoke the currency —
+`Buffers`, `take_buffers`, `donate_buffers` — so L2 only had to decide where
+buffers come from and where they go: `BufferSource` is the trait a host
+implements over an arena, a slab or a `mach_vm` region, and `Recycler` is the
+built-in bounded free list.
+
+Two things this had to get right.
+
+**Retained buffers are charged.** A free list nothing accounts for makes the
+budget lie by exactly the size of the free list — which is the same mistake as
+not accounting at all, one level down. A `Recycler::budgeted` holds its own
+`Lease`, charging on retain and refunding on hand-out, and **when the budget
+refuses the charge it drops the buffers rather than retaining them**. A recycler
+can never push the process over its ceiling; the worst it can do is fail to help.
+
+**Reset refills, and order matters.** The pool's `give_back` originally shrank
+and then reset. With a source that is a no-op loop: shrink hands the buffers to
+the free list and reset takes them straight back, so nothing is ever shrunk.
+Resetting first and shrinking second is correct, and a shrunk decoder gets its
+buffers again on checkout — which is the *point*, since the alternative is
+re-faulting pages that existed moments ago.
+
+The security property that buffer reuse introduces is pinned directly:
+`a_recycled_buffer_never_leaks_the_previous_response` decodes a distinctive
+payload, returns the buffers to the free list, and asserts none of it appears in
+the next response's output. Capacity is donated; contents never are. This holds
+by construction today — `forbid(unsafe_code)` means nothing can read past a
+buffer's length — which is precisely why it is worth a test before an
+accelerated path starts making assumptions about pre-filled memory.
+
+#### What the CLI is for
+
+`zalt(1)` is the first consumer of `zalt-embed` that is not a test, and that is
+most of its value. A host has to hold the streaming API a particular way — feed
+socket-sized chunks, drain output as it appears, never require the whole
+response in memory — and an API awkward for that will be awkward for a browser.
+`--in-buf 1` decodes byte-by-byte through every header field and bitstream
+boundary there is, and the integration tests assert output is identical at eight
+chunk sizes.
+
+It also makes the policy surface *visible*. The window cap, the memory budget
+and the buffer recycler are the interesting parts of L2 and are otherwise
+unreachable outside a test; here they are flags, so they can be demonstrated and
+deliberately misused. `zalt check` over `golden-decompression-errors/` is a
+one-line way to ask the question that matters — is this decoder too permissive —
+and `zalt info` walks frame and block structure without decoding, which is what
+one actually wants open beside RFC 8878.
+
+Zero dependencies, so the argument parser is hand-written. A CLI with four flags
+does not need a derive macro and a dependency tree.
+
+**Known gap.** The C ABI exposes `zalt_decoder_footprint` but no `Budget`,
+`DecoderPool` or `BufferSource` — a C host can *observe* what a decoder holds
+and account for it, but cannot hand zalt a ceiling or an arena. That matches the
+boundary's stated philosophy for threading ("the host already has a model and
+does not need ours"), and it is defensible for footprint too. It is recorded
+here rather than assumed, because a Mac app embedding this in-process is exactly
+the host the allocator seam was built for, and it currently cannot reach it.
+
+### M3 — Apple Silicon — in progress
+- [x] `zalt-neon`: wildcopy, `vqtbl1q_u8` small-offset overlap (M0).
+- [x] Word-at-a-time bit reader with a cached container.
+- [x] Wrapping match copy in flat runs, reaching the kernels.
+- [x] 4-stream Huffman ILP interleaving.
+- [x] Inline small-copy paths for matches and literals.
+- [x] Fused FSE lookups and combined bit reads in the sequence loop.
+- [x] Zero-copy `Sink` — no throughput gain, but no forced caller buffer.
+- [x] `zalt-bench decode` — end-to-end throughput, and a timing core that
+      survives a laptop.
+- [~] Fuse sequence decode with execution — tried, ~4% slower, reverted.
+- [~] FSE 3-state interleaving — largely already in place.
+- [~] Double-symbol Huffman tables — implemented, 8.4% slower on real `.zdoc`,
+      reverted. Conflicts with the four-stream interleave.
+- [x] Per-block FSE table clones removed (+9.6% on real `.zdoc`).
+- [x] Checksum skipped when the frame declares none (~26% on such frames).
+- [~] Match-source prefetch — tried, 3.5% slower, struck. (NEON XXH64 struck
+      too — see §5.)
+- [x] `backend_equivalence` fuzzing clean — 26,916 runs under ASan.
+- [~] `zalt-darwin` — profiling does not justify it; M2's pool captures the
+      memory cost portably. Not built.
+
+**Where it stands.** All figures below were taken on a **busy** machine and are
+lower bounds; see the measurement protocol later in this section, and re-take
+them on a quiet one before treating any as a baseline.
+
+On 35 MB of varied text at `zstd -3`, the starting point was 99 MB/s. On the
+current 60 MB corpus the same path reaches **640 MB/s** through a zero-copy
+sink, against **1400 MB/s** for `zstd -t` — a **2.2x** gap, down from ~9x.
+
+Two caveats on that comparison. The corpora differ, so the 99 → 640 figures are
+not a single controlled series; the trustworthy numbers are the per-change A/B
+results below. And a large part of the apparent gain came from *fixing the
+harness* rather than the decoder — measuring a reused decoder instead of
+allocating one per iteration moved the number by roughly 45% on its own.
+
+#### The benchmark had to be fixed first, and that was not a formality
+
+The first `decode` run said NEON was **0.62x of scalar** — that the accelerated
+backend made whole-frame decoding *slower*. Taken at face value it would have
+inverted the entire L1a premise.
+
+It was noise. Three consecutive runs of the same binary on the same input gave
+49.5, 86.3 and 88.3 MB/s, and the NEON ratio ranged 0.58x to 1.63x. The
+estimator took a single timing run per shape, and a single run on a laptop
+measures the machine as much as the code.
+
+The fix is that interference is **one-sided**. Another process, a P-to-E core
+migration, a thermal step, a page fault — each can only make a sample slower;
+nothing makes one spuriously fast. So the *fastest* of nine batches is the
+closest estimate of what the code costs, and a mean is an average of the code
+plus however busy the machine was. Spread is reported alongside, and a row whose
+best and worst batch differ by more than 15% is printed `~noisy` so it cannot be
+mistaken for a precise number.
+
+This is worth recording because the same trap caught the same work twice: the
+4-stream Huffman interleaving *also* first measured as a regression, and was
+also a false alarm — that time from a `cargo build` running concurrently with
+the benchmark. Both would have been acted on. **Re-run before believing a
+result, and A/B two binaries back to back rather than across edits.**
+
+#### Profile first: the ranked list was right about the mechanism, wrong about the file
+
+§5 ranks 4-stream Huffman decode as the largest single win. On this corpus it
+was worth ~5%, and the two changes that mattered were not on the list at all.
+The ranking was derived from architecture rather than measurement, which the
+section says of itself — this is what that caveat cost.
+
+Leaf-weighted samples, before and after:
+
+| | before | after |
+|---|---:|---:|
+| sequence execution (`copy_match`) | 51% | 5% |
+| FSE sequence decode | 41% | 23% |
+| Huffman literals | 9% | 7% |
+| output copy (`memmove`) | 4% | 24% |
+
+**The accelerated kernel was unreachable.** `Window::copy_match` was half of all
+decode time, and the NEON and scalar builds spent *identically* as long in it —
+3264 against 3175 samples. The reason is in this document: the ring's wrapping
+path was byte-at-a-time with an integer division per byte, justified on the
+grounds that "a frame smaller than its window never wraps". True, and irrelevant
+for anything large — the benchmark frame declares a 2 MiB window and 33.8 MiB of
+content, so it wraps after 6% of its life and spends the other 94% on the slow
+path, never once reaching a kernel. Splitting a wrapping match into flat runs
+(three enumerated cases, each bounded by hand) took it to 5% and is what finally
+made NEON visible end to end.
+
+So: **the NEON kernels were never the problem, and tuning them further would
+have bought nothing.** They were fine; the code around them denied them the work.
+
+#### What each change bought
+
+| change | | measured |
+|---|---|---:|
+| Word-at-a-time backward bit reader | 99 → 140 MB/s | +41% |
+| Wrapping match copy in flat runs | 140 → 210 MB/s | +50% |
+| Bounded output pre-reservation | 210 → 213 MB/s | +1% |
+| 4-stream Huffman ILP + cached bit container | 213 → 216 MB/s | +5%* |
+
+\* A/B of two binaries alternating on an idle machine: 211/213/216 interleaved
+against 188/205/206 sequential. Measured across edits it looked like a
+regression twice.
+
+#### Second pass: the per-sequence cost
+
+With the ranked list exhausted, the profile pointed somewhere it had not:
+`memmove` at 26%. The first guess — the window-to-caller drain copy — was
+wrong, and measurably so.
+
+| change | | measured |
+|---|---|---:|
+| Zero-copy `Sink` (removes the drain copy) | 216 → 216 | **0%** |
+| Inline small match copy (`copy_small`) | 216 → 245 | +16% |
+| FSE: one table lookup per state, masked | 245 → 251 | +2% |
+| One combined read for three state advances | 251 → 279 | +11% |
+| One combined read for three value fields | 279 → 299 | +8% |
+| Literal writes through the backend, inline small copy | 299 → 304 | +2% |
+| Hoist the per-sequence limit checks | 304 → 317 | +5% |
+| xxh64: borrow each stripe instead of copying it | 317 → 321 | **0%** |
+
+(`Vec`-returning path; the sink path tracks about 5% above it.)
+
+**Two of these bought nothing, and both were predicted to be large.** The drain
+copy was estimated at 20% and measured at zero: a 35 MB `memcpy` at memory
+bandwidth is about 1 ms against a 105 ms decode. The xxh64 stripe copy was a
+genuine redundancy — every byte of output moved once more for no reason — and
+LLVM was already eliding it.
+
+What `memmove` actually was: **thousands of tiny calls**, not one big one. A
+literal run between two matches is a handful of bytes, and both `copy_within`
+and `copy_from_slice` lower to a libc call that must branch on a length it
+cannot see before moving anything. Below about 32 bytes the call costs more
+than the copy. Two fixed-width moves anchored to the head and the tail of the
+range cover any length in between, write nothing outside it — so no slack is
+needed past the destination — and are a single load and store each. That one
+change was worth more than everything on §5's ranked list combined.
+
+The other theme is that **the sequence loop was doing the same work repeatedly**.
+It fetched each FSE entry twice (once for the symbol, once to advance out of the
+same unchanged state), took six separate bit reads where the format lays the
+fields out consecutively so three reads suffice, and recomputed
+`block_size_max`, `window.total()` and two `Option`s twice per sequence for a
+ceiling that cannot move during a block. None of that is clever; it is the cost
+of writing the correct version first, which was the right order to write it in.
+
+#### Third pass: three attempts, one kept
+
+| change | measured |
+|---|---|
+| Fuse sequence decode with execution | **~4% slower** — reverted |
+| Precomputed shuffle tables in the small-offset kernel | +1% — kept |
+| Flatten the LL/ML code `match` into a lookup table | **9% slower** — reverted |
+
+Two of three made it worse, and the two that did were both "obvious"
+optimisations.
+
+**Fusing decode with execution.** The `Vec<Sequence>` a block fills and then
+walks is ~70 MB of traffic against 35 MB of output, so removing it looked
+free. It cost about 4%, and `#[inline(always)]` on the executor recovered only
+part of that. The merged loop has to hold three FSE states, three table
+entries, a bit-reader and the window's cursor at once; the separate loops each
+fit. Sequential bulk traffic is cheap and register pressure is not — which is
+the **third** time in this section that an estimate of memory-traffic cost was
+too high, after the drain copy and the xxh64 stripe.
+
+**Flattening the code tables.** `literals_length_code` reads as a range
+`match` that should obviously be an array index. As a `match`, the low codes —
+the common ones — resolve in a compare and a move with no memory access at all.
+As a table, every sequence pays a load. 9% slower, consistently.
+
+The kernel change is the only one that stuck, and it is small: two 16-byte
+shuffle index tables were being built with a modulo per byte on every call,
+thirty-two integer divisions before a byte moved, and the sub-vector tail was a
+byte loop. Both are now `const` tables and a fixed-width store. It is worth
+only ~1% here because most matches on this corpus have offsets past 16 and
+never reach that kernel; it should matter more on markup, where indentation
+runs and repeated tags produce exactly the short offsets it exists for.
+
+#### Fourth pass: the checksum nobody asked for
+
+With the harness no longer measuring `malloc`, XXH64 went from 3.5% of the
+profile to **7.3%** — it had been hiding behind the allocator. Two changes
+followed, and only one of them did anything.
+
+**Hashing was not gated on the frame declaring a checksum.** Every byte of
+output was hashed whether or not anything would ever compare the result. On a
+`--no-check` frame, skipping it is worth **~26%** — more than the 7% the
+profile suggested, because not hashing also avoids pulling all of the output
+back through the cache.
+
+That is not a niche case. The zstd *CLI* writes a checksum by default, which is
+why every frame in this document's benchmarks has one; but `ZSTD_c_checksumFlag`
+in the **library** defaults to off, so frames produced server-side by
+application code — which is what a browser actually receives — typically carry
+none. The measurement corpus is the unrepresentative one here.
+
+**Hoisting the accumulators into locals did nothing** (641 against 640,
+alternating binaries). The four chains are independent and were already being
+promoted out of `&mut self` by the optimiser.
+
+§5's ranked item #6 is "XXH64 with NEON. Four 64-bit accumulators map to two Q
+registers." That will not work: **AArch64 NEON has no 64-bit integer
+multiply** — `MUL` covers 8, 16 and 32-bit elements only — so a vector XXH64
+must emulate each product from 32-bit widening multiplies and reassemble the
+carries, which is slower than the scalar `mul` Firestorm already issues two of
+per cycle. The item should be struck rather than attempted; it is the fourth
+entry on that list to fail on contact with a measurement, and the second to
+fail on an architectural fact rather than a surprise.
+
+#### Fifth pass: prefetch, and the shape of this whole exercise
+
+Match-source prefetch was the last untried item on §5's ranked list. It cost
+3.5%, isolated A/B, and is struck with the reasoning recorded there.
+
+That makes the tally for the ranked list of "wins" this document opened with:
+
+| § 5 item | outcome |
+|---|---|
+| #1 4-stream Huffman ILP | +5%, kept |
+| #2 small-offset overlap kernel | already present from M0; +1% more from precomputing its tables |
+| #3 bulk wildcopy | correctly predicted to yield little — but the *small*-copy case it did not consider was the single largest win of M3 |
+| #4 FSE state interleaving | largely subsumed by fusing the lookups and combining the reads |
+| #5 double-symbol Huffman | untried; Huffman is now under 3% on code-shaped input |
+| #6 NEON XXH64 | struck — the instruction does not exist |
+| #7 match-source prefetch | struck — 3.5% slower |
+
+Two of seven were worth what they claimed. The changes that actually moved the
+number — a word-at-a-time bit reader, a wrapping match copy that reached the
+kernels at all, inline small copies, hoisted per-sequence checks, and not
+computing an unwanted checksum — appear nowhere on the list, because the list
+ranked *kernels* and the time was going to the code around them.
+
+The list was written from architecture without a profile, and says so. This is
+what that costs, and the correction is cheap: **profile before ranking.**
+
+#### Sixth pass: measuring the workload this is actually for
+
+Seven real `.zdoc` documents arrived, and they change the picture more than any
+optimisation in this section.
+
+| corpus | size | ratio | sink MB/s |
+|---|---|---:|---:|
+| `corpus/varied.txt` (code) | 61 MB | 12.0x | ~640 |
+| `synthetic.zdoc` | 219 KB | 12.1x | ~556 |
+| real `.zdoc` | 3.4–11.8 KB each | 1.9–2.8x | **170–216** |
+
+**Real documents decode at a third of the throughput of large files**, and that
+is the workload: §8's push model is many small resources, not a few big ones.
+Per-frame fixed cost dominates, exactly as §7 said it would.
+
+Where it goes, on a 7.8 KB document:
+
+| | code corpus | real `.zdoc` |
+|---|---:|---:|
+| `huf::decode_four` | 2.7% | **15.5%** |
+| `memset` (table zeroing) | 1.8% | **6.9%** |
+| `DecodeTable::build` | 1.5% | **4.3%** |
+| `Distribution::parse` + `from_weights` | ~1% | **6.8%** |
+
+Entropy table setup is ~18% before decoding a byte. This is the cost §7 says
+dictionaries remove, because a dictionary carries the tables pre-built — and it
+is the strongest argument in this document for prioritising M4. It is *not* a
+complete answer: `decode_four`'s 15.5% is real decoding, not setup, and §7's
+adoption caveat means the no-dictionary path stays the wire reality until `dcz`
+negotiation exists.
+
+**One prediction in §8 did not survive contact.** It expects `.zdoc` to be
+literal-dominated and match-poor — "a reference-dense `.zdoc` has a large
+incompressible fraction no match finder can touch," from mandatory SHA-256
+hashes, ed25519 signatures and `urn:uuid` identifiers. Across 264 KB of real
+documents those tokens are **0.8% of the bytes**: 4 hashes, 18 base64 runs, 14
+UUIDs. The documents are structural markup, and their 1.9–2.8x ratios reflect
+that. §8's corpus table should be re-derived from real traffic before it drives
+a recipe.
+
+**What that pass bought.** `resolve_table` built each of a block's three FSE
+tables, returned it *by value*, and then **cloned** it into the slot that
+carries it across blocks — and `Repeat` mode cloned a table it already had. A
+`DecodeTable` is a fixed 512-entry array, so that was ~2 KB per table and 6 KB
+per block. Invisible on a 60 MB frame; on a 7.8 KB document it is a large
+fraction of the work. Writing into the slot and borrowing from it is **+9.6% on
+real `.zdoc`** and +1% on the code corpus.
+
+**Double-symbol Huffman, tried and rejected.** §5's item #5, and on this
+workload the one item whose target was genuinely large — 15.5%. Implemented by
+deriving the paired table from the single-symbol one (for a window `w`, the
+second symbol's bits are all real exactly when `a.nb_bits + b.nb_bits <=
+table_log`, which is both the pairing rule and its validity test). It measured
+**8.4% slower** on real `.zdoc` and 2% slower on the code corpus.
+
+Two reasons, and the second is the one worth keeping. Building the paired table
+costs `1 << table_log` iterations *per frame*, landing on precisely the
+workload that can least afford per-frame cost. But the larger problem is that
+**pairing and the four-stream interleave conflict**: streams emitting one or
+two symbols per step advance at different rates, so they can no longer share an
+index, and the natural implementation walks them one at a time — trading the
+four independent dependency chains that won +5% for a single chain. Keeping
+both would mean four cursors stepped in lockstep with per-stream bounds checks,
+for a gain that the build cost already eats into. Reverted.
+
+**`zalt-darwin` is not justified.** The checklist says "if profiling justifies
+it — not before", and it does not: no OS or allocator symbol appears anywhere
+in the top of either profile. Memory management *did* prove to matter — reusing
+a decoder rather than allocating one per frame was worth ~45% — but M2's
+`Recycler` and pool already capture that portably, which is a better outcome
+than a `mach_vm` dependency.
+
+#### The measurement protocol — read this before quoting a number
+
+Everything below is `just measure`. It exists because the figures in this
+section were repeatedly wrong in ways that had nothing to do with the code.
+
+```sh
+just bench-corpus     # once: builds corpus/varied.txt (survives a reboot)
+just measure          # 5 rounds, machine state stamped on the output
+just measure corpus 9 # more rounds
+```
+
+**Prepare the machine.** Close other editors and build tools — a background
+`cargo` moved figures here by up to 58%. Reboot if swap is in use: Darwin's
+memory compressor competes for CPU *and* bandwidth, and this laptop has sat at
+11 GB of 12 GB swap with 3.2 billion pages compressed. `just measure` prints
+the load average and swap usage and warns when they are not clean; believe a
+small delta only when it does not warn.
+
+**The corpus is `corpus/varied.txt`**, about 60 MB of *distinct* Rust sources.
+Distinct matters: an earlier corpus was one file repeated, which at level 3
+fits inside the window and therefore measured match copy rather than entropy
+decoding. `corpus/` is gitignored and local by design (§5).
+
+**The columns.**
+
+| column | what it measures |
+|---|---|
+| `scalar` / `neon` | one-shot `decompress`: allocates a fresh output `Vec` per frame |
+| `sink` | steady-state decode through a reused decoder and a zero-copy `Sink` |
+
+`sink` is the codec; `scalar`/`neon` include the allocator, and under memory
+pressure they include the kernel's page reclaim. Reusing the decoder rather
+than building one per iteration moved `sink` by roughly 45% on its own — the
+harness was measuring `malloc` as much as Huffman.
+
+**The reference.** Compare against `zstd -t`, not `zstd -d -c > /dev/null`:
+test mode decodes and verifies without writing, which is what `sink` does.
+Writing 60 MB to `/dev/null` costs real `write` syscalls and understates the
+reference badly — 948 MB/s piped versus **1400 MB/s** in test mode on this
+corpus.
+
+```sh
+zstd -3 -q -f corpus/varied.txt -o /tmp/varied.zst
+zstd -t -q /tmp/varied.zst      # time this, best of several
+```
+
+**To compare two versions**, none of the above is sufficient. Build both,
+keep both binaries, and alternate them:
+
+```sh
+cp target/release/zalt-bench /tmp/bench-before   # ... change code ...
+cargo build --release -p zalt-bench
+for r in 1 2 3; do
+  /tmp/bench-before decode corpus 3 | grep ^SUMMARY
+  ./target/release/zalt-bench decode corpus 3 | grep ^SUMMARY
+done
+```
+
+Two runs at different times on this machine are not comparable. A 4%
+"regression" and a 9% "improvement" were both recorded that way before this
+was understood.
+
+#### Standing numbers, and what they are worth
+
+Taken on a **busy** machine (load 4–7, 10 GB swap in use), so every figure is
+a lower bound:
+
+| | MB/s |
+|---|---:|
+| zalt, `sink` | 635 |
+| zalt, `neon`, one-shot with allocation | 571 |
+| zalt, `scalar`, one-shot with allocation | 458 |
+| `zstd -t` | 1400 |
+
+That is a **2.2x** gap on the like-for-like comparison, not the ~4x this
+section reported before the harness was fixed. How much of the remainder is
+real and how much is the machine is exactly what a quiet run is for; these
+should be re-taken after a restart before any of them is treated as a
+baseline.
+
+#### The measurements in this section are lower bounds
+
+Late in the M3 work a second, unrelated build was running on the same machine
+for long stretches, and the load average sat between 4 and 22. The estimator
+(§10, best of nine batches) absorbs variance *within* a run; it cannot absorb
+the machine being in a different state between runs. The same binary on the
+same input measured 339 MB/s under load and 535 MB/s when the machine was
+briefly idle — a 58% spread, which is larger than every individual change
+recorded above.
+
+So: **the absolute figures here are floors, not measurements**, and the
+relative ones are only trustworthy where they came from two binaries
+alternating under the same conditions. That is how the flat-table and
+shuffle-table comparisons were taken. The fusion comparison was not — it was
+two builds measured at different times — so its 4% is the weakest number in
+this section and worth re-running before treating the design as settled.
+
+The lesson generalises past this project: **A/B two binaries back to back, and
+treat any absolute number taken on a shared machine as a lower bound.**
+
+#### What is left, and whether parity is reachable
+
+Profile after this pass: `sequences::decode` 22%, match copy 16%, literal writes
+12%, `execute` 12%, bit reads 17%, Huffman 4%, xxh64 4%.
+
+Fusion was tried and reverted. Three-state FSE interleaving is largely already
+in place — the loop fetches all three entries before using any of them and
+takes their bits as one combined read — so what remains of it is small.
+Double-symbol Huffman tables are the one untried item, and Huffman is now under
+4% of the profile here; halving it buys under 2%. It would matter considerably
+more on literal-dominated content, which §8 predicts ZTML to be and for which
+there is not yet a corpus.
+
+That is the honest position: **the safe-code work is close to exhausted.**
+Estimates in this section have a poor record, and the remaining items are each
+1–2%.
+
+Beyond that the gap is structural. libzstd's inner loops use raw pointers with
+no bounds checks and unaligned 64-bit loads throughout; ours compare-and-branch
+on every slice access, several times per sequence. §6 puts
+`forbid(unsafe_code)` on **parsing and table construction** and explicitly
+allows audited unsafe in kernels, so moving the entropy inner loops behind the
+backend seam is within the stated design rather than a breach of it — but it is
+a decision to take deliberately, with the numbers in hand, not a tuning step.
+**Parity is not reachable without it.**
+
+The bit reader was the cheapest and the largest. `read(n)` was an `n`-iteration
+loop with a bounds-checked byte load *per bit*; this reader's bit string is the
+byte-reversed input read big-endian, which is exactly `u64::from_le_bytes` of
+the eight bytes behind the cursor, so the whole thing collapses to one load, one
+shift and one mask. `bits.rs` had reserved this for M3 in its own module doc.
+
+#### One change that measured worse, and was reverted
+
+Replacing the flat-path `resize(pos + len, 0)` — which zero-fills memory it
+immediately overwrites — with `extend_from_within` doubling, so no byte is
+written twice. The reasoning was sound and the result was 133 MB/s against 140.
+The memset is a few bytes per match and the call overhead of the replacement
+exceeded it. Reverted; the zero-fill stays.
+
+#### The oracles are what made any of this safe
+
+Every change here is index arithmetic whose failure mode is *plausible output*,
+not a crash — the class §10 already records twice. So each fast path keeps the
+obvious implementation it replaced, `#[cfg(test)]`, as its oracle:
+
+- `BackwardBits::bit` → `backward_word_refill_matches_the_bit_at_a_time_reference`,
+  every bit position and width from 1 to 32 across twelve buffer lengths,
+  including past the end.
+- `Window::byte_back`/`push_byte` → `wrapping_matches_the_byte_at_a_time_reference`,
+  every combination of capacity, cursor phase, offset and length that fits.
+
+This is the same discipline that keeps the scalar backend alive as the NEON
+oracle, applied one layer down. Both tests were written before the measurement
+was taken, and the reference corpus and `zstd-fixtures` error frames pass
+unchanged.
+
+#### The profiling harness is kept
+
+`zalt-bench profile <file.zst> [seconds] [scalar]` decodes one frame in a loop
+so a sampler can attach, and `just profile-decode <file.zst>` drives it with
+macOS's own `sample` and prints the leaf-weighted table. Nothing needs
+installing; `just profile` still drives Instruments when the question is finer
+than "which function".
+
+It is a recipe rather than a scratch file because of the specific thing it
+caught. **A throughput table cannot distinguish "the kernels do not help" from
+"the kernels never ran."** Both look like NEON ≈ scalar. Only attribution
+separates them, and the answer was worth 50% on its own. The `scalar` argument
+exists so both backends can be profiled from one binary: a hot function costing
+the same in each is a function the acceleration is not reaching.
+
+#### What is next, in profile order
+
+`memmove` is now 24%, and it is the output copy: every byte is written to the
+window, copied window → caller, then read again by XXH64 — three passes where
+the reference does one write and one read. Closing it means letting the caller
+take slices of the window instead of a `Vec` it owns, which is an API addition
+rather than a tuning change. FSE sequence decode is 23% and still has §5's
+untried item #4, three-state interleaving, against it.
+
+### M4 — Recipes and dictionaries
+- [ ] Dictionary loading in L1 (`dict.rs`).
+- [ ] `zalt-recipe`: manifest format, loading, content-type routing.
+- [ ] `zalt-ztml`: content-prefix dictionary + manifest. No Rust logic if possible.
+- [ ] `dcz` Compression Dictionary Transport.
+- [ ] `zalt-recipe-train`: content-prefix v1, then trained dictionaries.
+
+### M5 — Encoder
+- [ ] Correctness-first encoder; `encode_decode` differential fuzzing.
+- [ ] Parameter plumbing from recipes; stored-block fast path.
+- [ ] Block splitting at statistical transitions (§7) — wire-compatible, no
+      negotiation required.
+- [ ] Ratio work only after correctness.
+
+### M6 container header — design note
+
+Recorded now because the reasoning is easy to lose, not because it is due.
+**None of this touches the wire**, where frames are `ZSTD_FRAME` and carry
+nothing of ours.
+
+The temptation is to copy PNG's signature — `89 50 4E 47 0D 0A 1A 0A` — which is
+the canonical example of magic-number engineering: `0x89` catches 7-bit
+stripping, `PNG` identifies it to a human, `0D 0A` catches CRLF→LF, `1A` stops
+DOS `type` spewing binary, `0A` catches LF→CRLF. Every byte earns its place.
+
+**Every hazard on that list is extinct for a local cache file.** FTP ASCII mode,
+mail gateways and DOS `type` are not in the path between our writer and our
+reader on the same APFS volume. Copying those bytes would imitate the *form* of
+the technique while missing its substance, which was: identify the hazards this
+artifact actually faces, and spend a byte on each.
+
+The hazards that are real here:
+
+- **Version skew** — the browser auto-updates and leaves old cache files for a
+  new binary. Far and away the most likely "corruption", and not corruption at
+  all. Needs a major (refuse and discard) and a minor (ignore, forward-compatible).
+- **Truncation** — power loss, crash mid-write, disk full, SIGKILL. A partial
+  entry is likelier than any bit-level damage, and a magic at the front cannot
+  detect it.
+- **Silent bit rot** — APFS checksums metadata but deliberately **not user
+  data**, on the reasoning that Apple's storage hardware carries its own ECC.
+  Unlike ZFS or btrfs, a flipped bit in file contents comes back silently. This
+  is a platform-specific argument for a content checksum.
+- **Wrong file entirely** — a path bug feeds a `.png` to the cache reader. The
+  magic already covers this.
+
+Proposed layout:
+
+```
+off  size  field
+  0     4  magic            5A 4C 54 FD
+  4     1  format_major     unknown -> discard the entry, never parse
+  5     1  format_minor     unknown -> ignore, forward-compatible
+  6     2  flags
+  8     8  payload_length   (LE)
+ 16     8  uncompressed_len (LE)
+ 24     8  content_xxh64
+ 32     4  header_xxh32     over bytes 0..32
+ 36    ..  payload
+```
+
+`payload_length` gives **truncation detection with no trailer**. PNG needs
+`IEND` because a PNG is a stream that may be concatenated or embedded; a cache
+entry is a discrete file we `stat` anyway, so `st_size != 36 + payload_length`
+*is* the truncation check, costing nothing beyond a field we want regardless.
+
+The two checksums are split because they answer different questions at different
+costs: `header_xxh32` covers 32 bytes and says whether the file is worth opening;
+`content_xxh64` requires reading all of it.
+
+**A checksum is not authentication.** An attacker who can write the cache
+directory controls decompressor input, and recomputes any checksum trivially.
+These fields catch *accidents* — truncation, rot, skew. Defending the cache
+against a local attacker needs a MAC keyed to something unreadable by them,
+which is a browser threat-model decision with a real cost, not a container
+format decision.
+
+### M6 — `zalt::native` cache codec (gated)
+- [ ] Design: interleaved rANS (8/16 lanes matching NEON width), NEON-friendly
+      match encoding, incompressibility detector.
+- [ ] Benchmark against `zstd -3` on cache-shaped workloads.
+- [ ] **If it does not clearly win, do not ship it.** A second format is a real
+      maintenance and security cost and only earns its place with numbers.
+
+---
+
+## 11. Open questions
+
+1. **Does the browser need a zstd encoder at all?** If request-body compression
+   is not planned, M5 shrinks to only what dictionary support and round-trip
+   testing require — a large reduction.
+2. **ZSS stylesheets.** You excluded them from the corpus, but the sample
+   document references `zs="/style.zss"`, so they are fetched over the wire and
+   will arrive zstd-encoded. Was the exclusion about not using *generic CSS* as a
+   proxy, or is ZSS genuinely low-volume enough to ignore? They would be a
+   natural fit for the same dictionary.
+3. **Is WEFT ever fetched standalone?** If the data layer can be requested
+   separately from the document, it is a distinct content type with very
+   different statistics and deserves its own recipe entry.
+4. **Threading model.** One decoder per response, or a shared pool? Determines
+   whether instances must be `Send` and whether the budget is per-thread or global.
+5. **Dictionary adoption path.** Given §7's caveat, is there a plan for origins
+   to compress with a well-known ZTML dictionary ID — or should the effort go to
+   `dcz` negotiation instead?
+6. **`no_std` strictness.** Is the host willing to link `std`? If so, `no_std` in
+   L1 is self-imposed discipline with a real cost; worth confirming it is wanted
+   for the general-crate story.
+7. **Recipe format.** TOML is assumed above. If recipes must be embedded in a
+   `no_std` context, a binary format or `build.rs` codegen may serve better.
+
+---
+
+## 12. References
+
+- RFC 8878 — Zstandard Compression and the `application/zstd` Media Type.
+- Zstandard reference implementation (`facebook/zstd`) — `lib/decompress/`,
+  and `decodecorpus` for test generation.
+- Compression Dictionary Transport — defines the `dcb` / `dcz` content codings.
+- Apple Silicon CPU Optimization Guide — Firestorm/Icestorm pipeline details.
+- `core::arch::aarch64` — Rust NEON intrinsics.
+
+---
+
+## 13. Summary
+
+The wire format is fixed; the freedom is in the layering. Build a clean,
+general zstd codec that knows nothing about browsers or ZTML. Wrap it in an
+embedding layer that knows about memory and hostile input but not about content.
+Accelerate it with NEON behind a seam that keeps a scalar oracle alive. Then
+express every content-specific tuning decision as *data* — a dictionary and a
+manifest — so that ZTML is the first recipe rather than a feature.
+
+If specializing for a new content class ever requires touching L1, the seam was
+wrong, and widening it generically is the fix.

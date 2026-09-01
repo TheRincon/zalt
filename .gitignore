@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Corpus is local: large, and in some cases captured from live traffic.
+/corpus/*
+!/corpus/README.md
+
+# Derived from zstd-fixtures/ by `just zstd-fixtures`; regenerable, and large.
+/zstd-fixtures/generated
+
+# Fuzzing artifacts (M3+)
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/target
+
+.DS_Store
