@@ -172,6 +172,57 @@ gate: fmt-check clippy layering abi-check test test-release
     @echo
     @echo "gate passed."
 
+# ------------------------------------------------------------------- hooks
+
+# What the pre-push hook runs.
+#
+# `gate` is not by itself what CI checks. The workflow has five jobs, and gate
+# is one of them; `no-std` is a separate job and gate does not cover it. That
+# gap is the one worth closing here, because it is the cheapest to break without
+# noticing — a `std` import in `zalt-codec` compiles fine on this laptop and
+# fails only on the cross-compile that proves the crate is still general.
+#
+# The two CI jobs deliberately left out are `miri` (~4 minutes) and `fuzz-build`
+# (needs nightly and cargo-fuzz). Both still run in CI. They are excluded on the
+# reasoning that **a hook people bypass is worse than a shorter hook they run**:
+# past a few minutes, `--no-verify` becomes the habit and then nothing is
+# checked at all. `just pre-push-full` runs them when the change warrants it.
+[doc("What the pre-push hook runs: gate + no-std.")]
+pre-push: gate no-std
+    @echo
+    @echo "pre-push passed (gate + no-std)."
+    @echo "for the slow CI jobs too:  just pre-push-full"
+
+# Everything CI runs, including the slow jobs. Worth it before a PR, and before
+# anything touching `unsafe` — though note Miri cannot execute NEON intrinsics,
+# so it validates the scalar oracle rather than the accelerated path. What
+# guards the kernels is `test-release` (already in gate, where `debug_assert` is
+# compiled out) and the `backend_equivalence` tests and fuzz target.
+[doc("Everything CI runs, slow jobs included (adds fuzz-build + miri).")]
+pre-push-full: gate no-std fuzz-build miri
+    @echo
+    @echo "pre-push-full passed (gate + no-std + fuzz-build + miri)."
+
+# Activate the repo's git hooks.
+#
+# Hooks live in `ci/hooks/` so they are version-controlled and reviewed like
+# everything else in `ci/`, rather than in `.git/hooks/` where they are
+# per-clone, invisible and unshareable. `core.hooksPath` is itself per-clone, so
+# this has to be run once after cloning.
+[doc("Activate the repo git hooks (sets core.hooksPath).")]
+hooks-install:
+    @git config core.hooksPath ci/hooks
+    @chmod +x ci/hooks/* 2>/dev/null || true
+    @echo "core.hooksPath = $(git config core.hooksPath)"
+    @echo "hooks active:   $(ls ci/hooks | tr '\n' ' ')"
+    @echo
+    @echo "bypass once with:  git push --no-verify"
+
+[doc("Deactivate the repo git hooks.")]
+hooks-uninstall:
+    @git config --unset core.hooksPath 2>/dev/null || true
+    @echo "hooks deactivated."
+
 # ------------------------------------------------------------- benchmarking
 
 # Time the backend kernels, scalar vs NEON.
