@@ -350,10 +350,23 @@ _gap DIR SINK:
     [ -n "{{SINK}}" ] || exit 0
     files=$(find "{{DIR}}" -type f ! -name 'README*' 2>/dev/null)
     [ -n "$files" ] || exit 0
-    # `-b3` decompression is the second MB/s figure on the line, and its frames
+    # `-b3` decompression is the *second* MB/s figure on a line, and its frames
     # carry no checksum — which is why the corpus is built with `--no-check`.
+    #
+    # Match only lines carrying both figures. zstd rewrites its progress line in
+    # place, so `tr '\r' '\n'` turns each repaint into a line and some of them
+    # are *partial* — compression measured, decompression not yet:
+    #
+    #   /- 7 files : 263798 -> 35999 (x7.328),  763.3 MB/s
+    #   =- 7 files : 263798 -> 35999 (x7.328),  763.3 MB/s, 1768.7 MB/s
+    #
+    # Taking the last `MB/s` in the stream therefore picks a *compression* rate
+    # whenever the output happens to end on a partial repaint, which reported a
+    # gap of 1.05x where the truth was 2.7x. A measurement tool that is quietly
+    # wrong is worse than none, so this insists on a complete line.
     z=$(printf '%s\n' $files | xargs {{zstd}} -b3 -i3 2>&1 | tr '\r' '\n' \
-        | grep -o '[0-9.]* MB/s' | tail -1 | cut -d' ' -f1)
+        | grep -E '[0-9.]+ MB/s, *[0-9.]+ MB/s' | tail -1 \
+        | sed -E 's|.*, *([0-9.]+) MB/s.*|\1|')
     [ -n "${z:-}" ] || exit 0
     echo
     awk -v a="{{SINK}}" -v z="$z" 'BEGIN{
@@ -554,12 +567,26 @@ fuzz-list:
 [doc("Build all fuzz targets (compile check).")]
 fuzz-build:
     #!/usr/bin/env bash
-    set -euo pipefail
+    set -uo pipefail
     cd fuzz
+    fail=0
     for t in $(cargo +nightly fuzz list); do
         printf '%-26s ' "$t"
-        cargo +nightly fuzz build "$t" >/dev/null 2>&1 && echo ok || { echo FAILED; exit 1; }
+        # Capture rather than discard. The first version sent both streams to
+        # /dev/null, so a CI failure read `backend_equivalence FAILED` and
+        # nothing else — a red build with the diagnosis thrown away, which cost
+        # a round trip to even start guessing at.
+        if out=$(cargo +nightly fuzz build "$t" 2>&1); then
+            echo ok
+        else
+            echo FAILED
+            printf '%s\n' "$out" | sed 's/^/    /'
+            fail=1
+        fi
     done
+    # Every target is built before reporting: one rotted target should not hide
+    # the state of the other four.
+    exit $fail
 
 # Run a fuzz target. Requires nightly.
 #

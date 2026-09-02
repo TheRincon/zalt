@@ -116,8 +116,10 @@ impl Header {
 /// Decode a literals section.
 ///
 /// `previous` carries the Huffman table from an earlier block in the same
-/// frame, for treeless sections. On success it is replaced when this section
-/// describes a new tree.
+/// frame, for treeless sections. A section describing a new tree builds
+/// **into** it rather than replacing it, so the allocation survives the frame
+/// boundary; `huf::Table::is_built` is what a treeless section checks, and a
+/// failed build leaves it unbuilt rather than plausible.
 ///
 /// `max_regenerated` is the block's `Block_Maximum_Size`. It is not a
 /// convenience: `Regenerated_Size` is a 20-bit field, so a three-byte header
@@ -126,7 +128,7 @@ impl Header {
 /// stops a four-byte RLE section from asking for a megabyte.
 pub fn decode(
     input: &[u8],
-    previous: &mut Option<huf::Table>,
+    previous: &mut huf::Table,
     out: &mut Vec<u8>,
     max_regenerated: u64,
 ) -> Result<usize> {
@@ -151,21 +153,22 @@ pub fn decode(
             out.resize(out.len() + regenerated, byte);
         }
         LiteralsType::Compressed => {
-            let (table, consumed) = huf::Table::parse(payload)?;
+            let consumed = previous.parse_into(payload)?;
             let streams = payload.get(consumed..).ok_or(Error::Truncated)?;
             if header.four_streams {
-                table.decode_four(streams, regenerated, out)?;
+                previous.decode_four(streams, regenerated, out)?;
             } else {
-                table.decode_single(streams, regenerated, out)?;
+                previous.decode_single(streams, regenerated, out)?;
             }
-            *previous = Some(table);
         }
         LiteralsType::Treeless => {
-            let table = previous.as_ref().ok_or(Error::NoPriorTable)?;
+            if !previous.is_built() {
+                return Err(Error::NoPriorTable);
+            }
             if header.four_streams {
-                table.decode_four(payload, regenerated, out)?;
+                previous.decode_four(payload, regenerated, out)?;
             } else {
-                table.decode_single(payload, regenerated, out)?;
+                previous.decode_single(payload, regenerated, out)?;
             }
         }
     }
@@ -273,7 +276,7 @@ mod tests {
         let value = (10u64 << 4) | (5u64 << 14) | 0b0011;
         let mut input = alloc::vec![value as u8, (value >> 8) as u8, (value >> 16) as u8];
         input.extend_from_slice(&[0u8; 5]);
-        let mut previous = None;
+        let mut previous = huf::Table::default();
         let mut out = Vec::new();
         assert_eq!(
             decode(&input, &mut previous, &mut out, 1 << 20).unwrap_err(),
@@ -285,7 +288,7 @@ mod tests {
     fn raw_section_round_trips() {
         let mut input = alloc::vec![4u8 << 3];
         input.extend_from_slice(b"abcd");
-        let mut previous = None;
+        let mut previous = huf::Table::default();
         let mut out = Vec::new();
         let consumed = decode(&input, &mut previous, &mut out, 1 << 20).unwrap();
         assert_eq!(out, b"abcd");
@@ -295,7 +298,7 @@ mod tests {
     #[test]
     fn rle_section_expands() {
         let input = [(7u8 << 3) | 0b01, b'Z'];
-        let mut previous = None;
+        let mut previous = huf::Table::default();
         let mut out = Vec::new();
         let consumed = decode(&input, &mut previous, &mut out, 1 << 20).unwrap();
         assert_eq!(out, b"ZZZZZZZ");

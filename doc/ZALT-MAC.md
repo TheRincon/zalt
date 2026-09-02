@@ -1800,6 +1800,54 @@ boundaries *within* execution, which is a different thing from merging the two
 halves. The structural difference is real and visible in the disassembly; the
 causal story attached to it was one step too far.
 
+#### Thirteenth pass: the entropy tables keep their allocations
+
+The best change of the session, and it came from finally measuring *which*
+allocation the profile was complaining about rather than inferring it.
+
+`_platform_memset` was 5% of the `.zdoc` profile and `malloc`/`free` another
+2.5%. The first guess was the FSE tables, whose `build` zeroes a fixed
+512-entry array and returns it by value. Rebuilding those in place cut that
+function by 24% and moved the end-to-end number by **nothing** — LLVM was
+already eliding the stack array's zeroing, and `memset` did not budge (446 to
+438 samples). The change is kept because it does strictly less work and drops an
+`Option` indirection, but it earned nothing on the clock.
+
+The memset was `huf::Table`, and the mistake was assuming "per frame":
+
+```rust
+let mut entries = vec![Entry::default(); table_size];   // malloc + memset
+```
+
+`table_size` is `1 << table_log`, up to 2048 entries, and a **new table is built
+for every block that describes one** — not once per frame. `reset_frame_state`
+then dropped it wholesale (`self.huffman = None`). So the 61 MB corpus, one
+frame of 553 blocks, was allocating and zeroing a table 553 times and freeing
+552 of them.
+
+The table now builds in place, grows to fit and never shrinks, and marks itself
+unbuilt with `table_log = 0` rather than being dropped — so the `Option`
+disappears the same way it did for the FSE tables, and `is_built` is what a
+treeless section checks. Everything indexing the table bounds itself by `size()`
+rather than `entries.len()`, since the allocation may now outlive a smaller
+table.
+
+| | before | after | | gap |
+|---|---:|---:|---:|---|
+| real `.zdoc` | 719.3 | **752.2** | **+4.6%** | 2.84x → **2.71x** |
+| 61 MB corpus | 1089.1 | **1165.7** | **+7.0%** | 2.85x → **2.69x** |
+
+Best of six and best of four, alternating, zstd interleaved in every round;
+every single round improved on both the raw figure and the ratio. The code
+corpus gains *more* despite entropy setup being only 6.3% of its profile, which
+is the per-block detail above showing up: 553 allocations avoided against one.
+
+Two lessons, and the second is the one worth keeping. The obvious one is that a
+profile line names a *symbol*, not a cause — `memset` was real and 5%, and the
+first thing it was attributed to was innocent. The sharper one is that "per
+frame" and "per block" are an order of magnitude apart on a 553-block frame, and
+the estimate that made this look like a small `.zdoc`-only win had the wrong one.
+
 #### Never quote a raw MB/s — quote the gap
 
 The rule this section has been circling for two milestones, now enforced by

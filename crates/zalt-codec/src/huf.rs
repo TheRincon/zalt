@@ -14,7 +14,6 @@
 //! interchangeable for correctness and differ only in how much of the machine
 //! they keep busy. See `doc/ZALT-MAC.md` §5, ranked win #1.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::bits::BackwardBits;
@@ -38,7 +37,7 @@ struct Entry {
 }
 
 /// A Huffman decoding table for literals.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Table {
     entries: Vec<Entry>,
     table_log: u32,
@@ -49,6 +48,20 @@ impl Table {
     ///
     /// Returns the table and the number of bytes the description occupied.
     pub fn parse(input: &[u8]) -> Result<(Self, usize)> {
+        let mut table = Self::default();
+        let consumed = table.parse_into(input)?;
+        Ok((table, consumed))
+    }
+
+    /// [`Table::parse`] in place, reusing this table's allocation.
+    ///
+    /// The decoder holds one Huffman table for the frame in progress, and used
+    /// to drop it at every frame boundary — so each frame allocated and zeroed
+    /// a fresh `Vec` of up to 2048 entries. On the 3–12 KB documents this
+    /// decoder targets that is one `malloc` and one `memset` per document,
+    /// against a few kilobytes of output, and `_platform_memset` was 5% of the
+    /// profile with `malloc`/`free` another 2.5%.
+    pub fn parse_into(&mut self, input: &[u8]) -> Result<usize> {
         let header = *input.first().ok_or(Error::Truncated)?;
 
         let (weights, consumed) = if header >= 128 {
@@ -70,7 +83,8 @@ impl Table {
             (decode_fse_weights(body)?, 1 + size)
         };
 
-        Ok((Self::from_weights(&weights)?, consumed))
+        self.build_into(&weights)?;
+        Ok(consumed)
     }
 
     /// Build a table from explicit weights, deriving the final symbol's weight.
@@ -80,6 +94,18 @@ impl Table {
     /// guarantees the tree is complete, and checking it is a real validation
     /// step rather than a formality.
     pub fn from_weights(weights: &[u8]) -> Result<Self> {
+        let mut table = Self::default();
+        table.build_into(weights)?;
+        Ok(table)
+    }
+
+    /// [`Table::from_weights`] in place. See [`Table::parse_into`].
+    ///
+    /// `table_log` is zeroed on entry so a table left half-built by an error
+    /// cannot be mistaken for a usable one: a `Treeless` block arriving later
+    /// must find no table rather than a plausible one.
+    pub fn build_into(&mut self, weights: &[u8]) -> Result<()> {
+        self.table_log = 0;
         if weights.is_empty() || weights.len() > 255 {
             return Err(Error::Malformed);
         }
@@ -155,7 +181,14 @@ impl Table {
             return Err(Error::Malformed);
         }
 
-        let mut entries = vec![Entry::default(); table_size];
+        // Grow to fit, never shrink. A later frame with the same or a smaller
+        // `table_log` then reuses the allocation and re-zeroes nothing — the
+        // fill below writes every slot in `0..table_size` regardless, because a
+        // complete prefix code covers the table exactly.
+        if self.entries.len() < table_size {
+            self.entries.resize(table_size, Entry::default());
+        }
+        let entries = &mut self.entries;
         for (symbol, &w) in all.iter().enumerate() {
             if w == 0 {
                 continue;
@@ -176,7 +209,31 @@ impl Table {
             rank_start[w as usize] += span as u32;
         }
 
-        Ok(Self { entries, table_log })
+        self.table_log = table_log;
+        Ok(())
+    }
+
+    /// Number of states this table actually uses.
+    ///
+    /// Not `entries.len()`: the allocation is grown to fit and never shrunk, so
+    /// it may be larger than the current table. Everything that indexes the
+    /// table must bound itself by this.
+    #[inline]
+    pub fn size(&self) -> usize {
+        1usize << self.table_log
+    }
+
+    /// Whether a table has been built. `table_log` is at least 1 for any real
+    /// table, so zero is unambiguous.
+    #[inline]
+    pub fn is_built(&self) -> bool {
+        self.table_log != 0
+    }
+
+    /// Mark unbuilt, keeping the allocation.
+    #[inline]
+    pub fn invalidate(&mut self) {
+        self.table_log = 0;
     }
 
     /// The table's `tableLog` — the width of a decoding window.
@@ -280,25 +337,18 @@ impl Table {
         let mut b2 = BackwardBits::new(streams[2])?;
         let mut b3 = BackwardBits::new(streams[3])?;
 
-        let entries = &self.entries[..];
-        let log = self.table_log;
-        // `peek(log)` yields fewer than `1 << log` values and the table is
-        // built with exactly that many entries, so the index is in range by
-        // construction. Masking says so to the compiler instead of leaving a
-        // bounds check that can never fire in the middle of the hot loop.
-        debug_assert_eq!(entries.len(), 1usize << log);
-        // The emptiness guard is not defensive — a built table always has
-        // entries — it is what makes the masking argument above *provable*.
-        // `mask` is `len - 1`, which underflows to `usize::MAX` when `len` is
-        // zero, and a mask of `usize::MAX` is the identity. So without knowing
-        // `len > 0` the compiler cannot conclude `i & mask < len`, and it kept
-        // a bounds check on every one of the four streams despite the comment
-        // above claiming otherwise. Establishing `len > 0` once, out of the
-        // loop, is what the comment always meant.
-        if entries.is_empty() {
+        // Bound by the *logical* table, not the allocation: `entries` is grown
+        // to fit and never shrunk, so a frame with a smaller `table_log` leaves
+        // a longer Vec behind. Slicing to `size` restores the property the mask
+        // argument below depends on — `i & (size - 1) < size == entries.len()`
+        // — so the bounds check folds away exactly as it did before.
+        if !self.is_built() {
             return Err(Error::Malformed);
         }
-        let mask = entries.len() - 1;
+        let log = self.table_log;
+        let size = self.size();
+        let entries = self.entries.get(..size).ok_or(Error::Malformed)?;
+        let mask = size - 1;
 
         macro_rules! step {
             ($bits:expr, $dst:expr, $i:expr) => {{
