@@ -23,6 +23,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just,nextest
+      # The conformance tests read derived fixtures, and deriving them needs the
+      # reference binary. Guarded because the runner image usually ships it.
+      - name: ensure zstd
+        run: command -v zstd || brew install zstd
       # One command, and it is the same one run locally before pushing. CI and
       # the developer loop cannot drift apart if they share the recipe.
       - run: just gate
@@ -40,6 +44,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just,nextest
+      - name: ensure zstd
+        run: command -v zstd || (sudo apt-get update && sudo apt-get install -y zstd)
       - run: just fast-test
       - run: just no-std
 
@@ -76,4 +82,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just,nextest
+      - name: ensure zstd
+        run: command -v zstd || (sudo apt-get update && sudo apt-get install -y zstd)
       - run: just miri
