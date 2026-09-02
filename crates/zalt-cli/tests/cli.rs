@@ -56,12 +56,31 @@ fn zalt_stdin(args: &[&str], input: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn");
-    child
+    // A child that rejects its arguments exits *without reading stdin*, and the
+    // write then lands on a pipe with no reader. That is the behaviour under
+    // test for every usage-error case here, not a failure of the harness.
+    //
+    // It passed locally by luck: these payloads are far smaller than a pipe
+    // buffer, so the write usually completes before the child gets round to
+    // exiting. CI lost that race and the test panicked with `BrokenPipe`, which
+    // is a flaky test rather than a real one — the outcome depended on
+    // scheduling.
+    //
+    // Only `BrokenPipe` is tolerated. Any other write error is still a genuine
+    // harness failure and still panics.
+    if let Err(e) = child
         .stdin
         .as_mut()
         .expect("stdin was piped")
         .write_all(input)
-        .expect("write");
+    {
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "writing to the child's stdin failed for a reason other than an \
+             early exit: {e}"
+        );
+    }
     child.wait_with_output().expect("wait")
 }
 

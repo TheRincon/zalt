@@ -61,6 +61,14 @@ jobs:
   # notices until someone tries to fuzz.
   fuzz-build:
     runs-on: macos-14
+    # `-D warnings` is deliberately not inherited here. It is right for the
+    # stable jobs, whose toolchain `rust-toolchain.toml` pins and whose warning
+    # set is therefore reproducible. This job floats on the latest nightly, so
+    # denying warnings makes any newly-landed lint fail a build that is only
+    # asking "do the fuzz targets still compile" — a red CI caused by a calendar
+    # rather than by a commit.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -74,6 +82,9 @@ jobs:
   # get UB detection over this code at all.
   miri:
     runs-on: ubuntu-latest
+    # Floating nightly; see the note on `fuzz-build`.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

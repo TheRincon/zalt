@@ -167,7 +167,7 @@ pub struct Decoder<B: Backend = Scalar> {
     sequence_buf: Vec<Sequence>,
 
     /// Huffman table carried across blocks, for treeless literals.
-    huffman: Option<huf::Table>,
+    huffman: huf::Table,
     /// FSE tables carried across blocks, for `Repeat` mode.
     tables: Tables,
     /// Repeat offsets, carried across blocks within a frame.
@@ -198,7 +198,7 @@ impl<B: Backend> Decoder<B> {
             block: Vec::new(),
             literals: Vec::new(),
             sequence_buf: Vec::new(),
-            huffman: None,
+            huffman: huf::Table::default(),
             tables: Tables::default(),
             repeats: REP_INITIAL,
             window: Window::new(0),
@@ -230,7 +230,7 @@ impl<B: Backend> Decoder<B> {
     /// frame's first block has nothing to inherit, and silently reusing the
     /// previous frame's tables would decode garbage instead of erroring.
     fn reset_frame_state(&mut self) {
-        self.huffman = None;
+        self.huffman.invalidate();
         self.tables.invalidate();
         self.repeats = REP_INITIAL;
     }
