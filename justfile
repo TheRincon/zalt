@@ -9,7 +9,10 @@
 set shell := ["bash", "-uc"]
 
 # Reference zstd for baselines and differential testing.
-zstd := env_var_or_default("ZSTD", "/opt/homebrew/bin/zstd")
+# Found on PATH so this works on the Linux CI runners too; `ZSTD=/path/to/zstd`
+# overrides. It was an absolute Homebrew path, which does not exist on Linux and
+# made every fixture-generating recipe macOS-only.
+zstd := env_var_or_default("ZSTD", "zstd")
 # no_std target used to prove zalt-codec stays portable and allocation-light.
 nostd_target := "thumbv7em-none-eabi"
 fixtures := "crates/zalt-codec/tests/fixtures"
@@ -38,7 +41,7 @@ build-release:
 #
 # Does NOT run doctests — nextest cannot. `just test` covers those.
 [doc("Fast inner-loop tests: nextest, parallel, one process per test.")]
-fast-test:
+fast-test: _fixtures
     cargo nextest run --workspace
 
 alias t := fast-test
@@ -54,7 +57,7 @@ test: fast-test
 # the raw pointers are on their own. A backend bug can pass in debug and fail
 # here.
 [doc("Release-mode tests — where debug_assert is compiled out.")]
-test-release:
+test-release: _fixtures
     cargo nextest run --workspace --release
 
 # Run one test by substring, with output shown.
@@ -163,7 +166,7 @@ no-std:
 # from disk. Isolation governs determinism (filesystem, clock, randomness), not
 # undefined-behaviour detection, so nothing Miri is here for is weakened.
 [doc("Miri UB detection over the scalar path (nightly).")]
-miri:
+miri: _fixtures
     rustup +nightly component add miri 2>/dev/null || true
     MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri nextest run -p zalt-codec
 
@@ -629,6 +632,9 @@ zstd-fixtures:
     set -euo pipefail
     root=zstd-fixtures
     [ -d "$root" ] || { echo "$root not present"; exit 1; }
+    command -v {{zstd}} >/dev/null 2>&1 || {
+        echo "need the zstd binary on PATH (or ZSTD=/path/to/zstd) to derive fixtures" >&2
+        exit 1; }
     mkdir -p "$root/generated"
     for f in "$root"/golden-decompression/*.zst; do
         [ -e "$f" ] || continue
@@ -643,6 +649,28 @@ zstd-fixtures:
         done
     done
     echo "generated $(ls "$root/generated" | wc -l | tr -d ' ') files"
+
+# Ensure the derived fixtures exist, cheaply.
+#
+# The conformance tests read `zstd-fixtures/generated`, which is derived and so
+# deliberately not committed. They *skip* when `zstd-fixtures/` is absent
+# entirely and **fail** when it is present without the derived files — which is
+# exactly the state of a fresh clone, and is what broke CI: the golden corpora
+# are committed, the artifacts derived from them are not, and nothing generated
+# them before the tests ran.
+#
+# Depending on this from the test recipes rather than adding a step to the
+# workflow is deliberate. CI runs the same recipes as the laptop precisely so
+# the two cannot drift, and a CI-only step is drift by construction. Costs one
+# `ls` when the files are already there, and 0.6s when they are not.
+[private]
+_fixtures:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root=zstd-fixtures
+    [ -d "$root" ] || exit 0
+    [ -n "$(ls -A "$root/generated" 2>/dev/null)" ] && exit 0
+    just zstd-fixtures
 
 # Seed the fuzz corpora from the fixtures and the reference corpus.
 [doc("Seed fuzz corpora from fixtures and the reference corpus.")]
