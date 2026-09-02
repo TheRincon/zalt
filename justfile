@@ -285,13 +285,136 @@ measure DIR="corpus" ROUNDS="5":
     [ -d "{{DIR}}" ] && [ -n "$(ls -A {{DIR}} 2>/dev/null | grep -v README)" ] || {
         echo "{{DIR}} is empty — run 'just bench-corpus' first"; exit 1; }
     cargo build --release -q -p zalt-bench
+    before=$(just _canary-run)
     out=$(./target/release/zalt-bench decode "{{DIR}}" 3 2>/dev/null)
     printf '%s\n' "$out" | sed -n '1,/^-----/p'
+    [ -n "$before" ] && echo "canary before: $before MB/s"
     echo "running {{ROUNDS}} rounds; the best of them is the estimate..."
-    for i in $(seq 1 {{ROUNDS}}); do
+    rounds=$(for i in $(seq 1 {{ROUNDS}}); do
         ./target/release/zalt-bench decode "{{DIR}}" 3 2>/dev/null | grep '^SUMMARY'
-    done | sed 's/[a-z]*=//g' | awk '{if($2>s)s=$2; if($3>n)n=$3; if($4>k)k=$4}
+    done | sed 's/[a-z]*=//g')
+    printf '%s\n' "$rounds" | awk '{if($2>s)s=$2; if($3>n)n=$3; if($4>k)k=$4}
         END{printf "\nBEST OF {{ROUNDS}}:  scalar %.1f   neon %.1f   sink %.1f  MB/s\n",s,n,k}'
+    sink=$(printf '%s\n' "$rounds" | awk '{if($4>k)k=$4} END{printf "%.1f",k}')
+    after=$(just _canary-run)
+    if [ -n "$before" ] && [ -n "$after" ]; then
+        echo
+        awk -v b="$before" -v a="$after" 'BEGIN{
+            d = (a>b ? a-b : b-a) / (b>a ? b : a) * 100
+            printf "canary: %.0f -> %.0f MB/s (%.1f%% drift)\n", b, a, d
+            if (d > 10) {
+                print ""
+                print "  WARNING: the machine changed *during* the measurement. The reference"
+                print "  decoder does not get faster when zalt changes, so this drift is"
+                print "  thermal or contention, and the rounds above straddle two different"
+                print "  machines. Re-run; do not compare these numbers with any others."
+            }
+        }'
+    fi
+    just _gap "{{DIR}}" "$sink"
+
+# The number to actually quote: the gap against zstd on the *same* corpus,
+# measured in the same window.
+#
+#   just gap corpus/ztml
+#
+# An absolute MB/s figure from this machine means very little. The same binary
+# has measured 457 and 750 on the same input, and the reference has read 1905
+# and 3058, from thermal state alone. A *ratio* cancels all of it, because
+# whatever slows zalt slows zstd in the same breath: measured this way the gap
+# repeats to about 1% while the figures behind it spread by ten.
+#
+# So never quote a raw number as evidence of an improvement. Take three
+# readings per round — before, after, and zstd on the same files — and compare
+# the two ratios.
+[doc("Gap against zstd on the same corpus, measured in the same window.")]
+gap DIR="corpus":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cargo build --release -q -p zalt-bench
+    # Best of three, matching the estimator `measure` uses. Both sides of a
+    # ratio must be estimated the same way or the ratio is not one.
+    sink=$(for i in 1 2 3; do
+        ./target/release/zalt-bench decode "{{DIR}}" 3 2>/dev/null | grep '^SUMMARY' | sed 's/.*sink=//'
+    done | sort -g | tail -1)
+    just _gap "{{DIR}}" "$sink"
+
+# Print the zstd reference for a corpus and the resulting gap.
+[private]
+_gap DIR SINK:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    [ -n "{{SINK}}" ] || exit 0
+    files=$(find "{{DIR}}" -type f ! -name 'README*' 2>/dev/null)
+    [ -n "$files" ] || exit 0
+    # `-b3` decompression is the second MB/s figure on the line, and its frames
+    # carry no checksum — which is why the corpus is built with `--no-check`.
+    z=$(printf '%s\n' $files | xargs {{zstd}} -b3 -i3 2>&1 | tr '\r' '\n' \
+        | grep -o '[0-9.]* MB/s' | tail -1 | cut -d' ' -f1)
+    [ -n "${z:-}" ] || exit 0
+    echo
+    awk -v a="{{SINK}}" -v z="$z" 'BEGIN{
+        printf "zalt %.1f   zstd %.1f   GAP %.2fx   (same corpus, same window)\n", a, z, z/a
+    }'
+
+# The machine-state control: reference throughput on a fixed frame.
+#
+# `just measure` already prints load and swap, and both were clean through a
+# session in which the *same binary* measured 457 and then 750 MB/s. Load
+# average cannot see thermal and frequency state on a fanless laptop, so it
+# reported a quiet machine twice — quiet and slow, then quiet and fast.
+#
+# The reference decoder is the control, because its speed does not change when
+# zalt changes. If this number moved, the machine moved, and nothing measured
+# either side of it is comparable. It caught a 55% swing that would otherwise
+# have been read as an optimisation.
+#
+# Needs the zstd headers (`brew install zstd`); degrades to silence without them
+# rather than failing a measurement over a missing control.
+[doc("Reference throughput on a fixed frame — a control for machine state.")]
+canary:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    v=$(just _canary-run)
+    if [ -z "$v" ]; then
+        echo "canary unavailable (needs zstd headers: brew install zstd)"
+        exit 0
+    fi
+    echo "canary: $v MB/s"
+
+# Print the canary throughput, or nothing if it cannot be built.
+#
+# Best of three, for the reason the decode estimator is also a best-of:
+# interference is one-sided, so the fastest sample is the closest estimate and a
+# mean is an average of the machine's mood. It matters more here than elsewhere,
+# because a *drifting control is worse than no control* — it would report drift
+# that is its own. Consecutive single readings spread 35% while the CPU ramped;
+# best-of-three repeats to within about 1%, and the cold first run simply never
+# wins.
+[private]
+_canary-run:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just _canary-frame >/dev/null 2>&1 || exit 0
+    just _build-zstd-profile >/dev/null 2>&1 || exit 0
+    best=0
+    for _ in 1 2 3; do
+        v=$(./target/zstd-profile target/canary.zst 1 2>&1 | grep -o '~[0-9]* MB/s' | tr -d '~' | cut -d' ' -f1)
+        [ -n "${v:-}" ] && [ "$v" -gt "$best" ] && best=$v
+    done
+    [ "$best" -gt 0 ] && echo "$best"
+
+# Build the canary frame. Deterministic, so its value is comparable across
+# sessions and machines, and cached because regenerating it is the slow part.
+[private]
+_canary-frame:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -s target/canary.zst ] && exit 0
+    mkdir -p target
+    python3 ci/gen-canary.py > target/canary.txt
+    {{zstd}} -3 -q -f --no-check target/canary.txt -o target/canary.zst
+    rm -f target/canary.txt
 
 # Establish the zstd baseline over a corpus directory.
 #
@@ -320,6 +443,70 @@ profile BENCH="kernels":
 # distinction was worth 50% on its own. Run the same file through both
 # backends and compare — a hot function that costs the same in each is a
 # function the acceleration is not reaching.
+# Profile the *reference* decoder, in the same shape as `profile-decode`.
+#
+#   just profile-zstd /tmp/varied.zst
+#   just profile-zstd corpus/ztml/showcase.zst 14
+#
+# Answers "where is zstd faster than us", which a throughput ratio cannot: a
+# ratio says how much slower and never which part. Inference answered it wrongly
+# three times — bounds checks, double-symbol Huffman, prefetching — before this
+# harness answered it in one run. See doc/ZALT-MAC.md §10, tenth pass.
+#
+# Compare against `just profile-decode` on the *same frame*. libzstd inlines the
+# FSE state machine, bit reader and match copy into `ZSTD_decompressSequences`,
+# so compare that one symbol against the sum of zalt's `sequences::decode`,
+# `BackwardBits`, `execute` and the copy kernels.
+#
+# Needs the zstd headers and static library (`brew install zstd`).
+[doc("Leaf-weighted profile of libzstd decoding one frame, for comparison.")]
+profile-zstd FILE SECS="14":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just _build-zstd-profile || exit 1
+    out=$(mktemp -t zstd-sample)
+    ./target/zstd-profile "{{FILE}}" "{{SECS}}" &
+    pid=$!
+    sleep 2
+    sample "$pid" "$(( {{SECS}} - 3 ))" -mayDie -f "$out" >/dev/null 2>&1
+    wait "$pid"
+    echo
+    if grep -q 'Sort by top of stack' "$out"; then
+        sed -n "$(grep -n 'Sort by top of stack' "$out" | cut -d: -f1),/^$/p" "$out" \
+            | sed -E 's/\(in [^)]*\)//'
+    else
+        echo "sample produced no call graph — is it permitted to attach?"
+        echo "full output: $out"
+    fi
+    rm -f "$out"
+
+# Throughput only, no profiler. The number that must track `zstd -b3` to within
+# a few percent; if it stops doing so, the harness is wrong rather than zstd.
+[doc("Reference decode throughput through the C harness.")]
+bench-zstd FILE SECS="6":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just _build-zstd-profile || exit 1
+    ./target/zstd-profile "{{FILE}}" "{{SECS}}"
+
+# Build the reference harness against libzstd. Static, so the profiler can
+# attribute time to libzstd's internal functions rather than to one dylib stub.
+[private]
+_build-zstd-profile:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    prefix=$(brew --prefix zstd 2>/dev/null || echo /opt/homebrew)
+    if [ ! -f "$prefix/include/zstd.h" ] || [ ! -f "$prefix/lib/libzstd.a" ]; then
+        echo "need the zstd headers and static lib: brew install zstd" >&2
+        echo "  looked in $prefix" >&2
+        exit 1
+    fi
+    src=crates/zalt-bench/reference/zstd-profile.c
+    mkdir -p target
+    [ -f target/zstd-profile ] && [ target/zstd-profile -nt "$src" ] && exit 0
+    cc -O2 -Wall -Wextra -I"$prefix/include" \
+       "$src" "$prefix/lib/libzstd.a" -o target/zstd-profile
+
 [doc("Leaf-weighted profile of one decode, via macOS `sample`.")]
 profile-decode FILE SECS="12" BACKEND="":
     #!/usr/bin/env bash

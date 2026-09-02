@@ -128,6 +128,7 @@ impl Window {
     }
 
     /// Append bytes, discarding whatever falls out of the window.
+    #[inline(always)]
     pub fn write_all<B: Backend>(&mut self, src: &[u8]) {
         self.total = self.total.wrapping_add(src.len() as u64);
 
@@ -208,6 +209,7 @@ impl Window {
     ///
     /// Byte-at-a-time semantics — when `offset < len` the copy is the
     /// `offset`-periodic extension of the preceding bytes, not a `memmove`.
+    #[inline(always)]
     pub fn copy_match<B: Backend>(&mut self, offset: usize, len: usize) -> Result<()> {
         if offset == 0 || offset > self.buf.len() {
             return Err(Error::OffsetTooLarge {
