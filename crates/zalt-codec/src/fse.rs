@@ -226,7 +226,38 @@ impl Default for DecodeTable {
 
 impl DecodeTable {
     /// Build a decoding table from a normalized distribution.
+    ///
+    /// Allocates a fresh table. Prefer [`DecodeTable::build_into`] on the hot
+    /// path, which reuses the one already in the slot.
     pub fn build(distribution: &Distribution) -> Result<Self> {
+        let mut table = Self::default();
+        table.build_into(distribution)?;
+        Ok(table)
+    }
+
+    /// Build in place, writing only the entries this table will use.
+    ///
+    /// [`DecodeTable::build`] zeroes a fixed 512-entry array, fills the
+    /// `1 << accuracy_log` entries the table actually has — 64 for a
+    /// predefined literals-length table — and hands back two kilobytes for the
+    /// caller to move into the slot that carries it across blocks. Both costs
+    /// are paid per table and per block, so a 7.8 KB document pays them three
+    /// times over against 7.8 KB of output, and `_platform_memset` was 5% of
+    /// its decode profile.
+    ///
+    /// Writing into the slot's existing array removes the zeroing and the move.
+    /// Entries past `size` keep whatever the previous table left there, which
+    /// is unreachable: [`DecodeTable::entry_masked`] masks the index to
+    /// `size - 1`, and [`DecodeTable::entry`] rejects a state at or above
+    /// `size`. Stale bytes are not a correctness hazard here; they are simply
+    /// never addressed.
+    ///
+    /// `size` is zeroed on entry so a table left half-built by an error cannot
+    /// be mistaken for a usable one — a `Repeat` mode arriving later must find
+    /// no table rather than a plausible one. The caller clears the slot too;
+    /// this is the second of the two.
+    pub fn build_into(&mut self, distribution: &Distribution) -> Result<()> {
+        self.size = 0;
         let accuracy_log = distribution.accuracy_log;
         let table_size = 1usize << accuracy_log;
         let table_mask = table_size - 1;
@@ -280,8 +311,7 @@ impl DecodeTable {
             return Err(Error::Malformed);
         }
 
-        let mut entries = [Entry::default(); TABLE_SIZE_MAX];
-        for (slot, entry) in entries.iter_mut().enumerate().take(table_size) {
+        for (slot, entry) in self.entries.iter_mut().enumerate().take(table_size) {
             let symbol = symbols[slot];
             let next = symbol_next[symbol as usize];
             symbol_next[symbol as usize] += 1;
@@ -296,16 +326,32 @@ impl DecodeTable {
             };
         }
 
-        Ok(Self {
-            entries,
-            accuracy_log,
-            size: table_size,
-        })
+        self.accuracy_log = accuracy_log;
+        self.size = table_size;
+        Ok(())
     }
 
     /// Build directly from explicit counts.
     pub fn from_counts(counts: &[i16], accuracy_log: u32) -> Result<Self> {
         Self::build(&Distribution::from_counts(counts, accuracy_log)?)
+    }
+
+    /// [`DecodeTable::from_counts`] in place. See [`DecodeTable::build_into`].
+    pub fn from_counts_into(&mut self, counts: &[i16], accuracy_log: u32) -> Result<()> {
+        self.build_into(&Distribution::from_counts(counts, accuracy_log)?)
+    }
+
+    /// [`DecodeTable::rle`] in place. See [`DecodeTable::build_into`].
+    ///
+    /// One entry is the whole table, so nothing past it needs clearing.
+    pub fn rle_into(&mut self, symbol: u8) {
+        self.entries[0] = Entry {
+            symbol,
+            nb_bits: 0,
+            new_state: 0,
+        };
+        self.accuracy_log = 0;
+        self.size = 1;
     }
 
     /// A table that always emits the same symbol, for `RLE` compression mode.
@@ -321,6 +367,30 @@ impl DecodeTable {
             accuracy_log: 0,
             size: 1,
         }
+    }
+
+    /// Whether this table has been built.
+    ///
+    /// `size` is zero only before a first build and after [`Self::invalidate`];
+    /// every real table has at least one state, RLE included. That makes the
+    /// field the "is there a prior table" flag the `Repeat` mode needs, so the
+    /// slot does not have to be an `Option` — and not being an `Option` is what
+    /// lets the 512-entry array survive between frames instead of being dropped
+    /// and zeroed again.
+    #[inline]
+    pub fn is_built(&self) -> bool {
+        self.size != 0
+    }
+
+    /// Mark unbuilt, keeping the allocation.
+    ///
+    /// Frame reset used to replace the tables wholesale, which dropped three
+    /// two-kilobyte arrays and zeroed three more on the next block. Documents
+    /// in the target workload are a single block, so *every* table was the
+    /// first of its frame and paid it.
+    #[inline]
+    pub fn invalidate(&mut self) {
+        self.size = 0;
     }
 
     /// The table's accuracy log — the bit width of an initial state.

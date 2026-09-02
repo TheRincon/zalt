@@ -73,11 +73,23 @@ pub struct Sequence {
 #[derive(Debug, Clone, Default)]
 pub struct Tables {
     /// Literals-length table.
-    pub literals_length: Option<DecodeTable>,
+    pub literals_length: DecodeTable,
     /// Offset-code table.
-    pub offset: Option<DecodeTable>,
+    pub offset: DecodeTable,
     /// Match-length table.
-    pub match_length: Option<DecodeTable>,
+    pub match_length: DecodeTable,
+}
+
+impl Tables {
+    /// Mark every table unbuilt, keeping the allocations.
+    ///
+    /// What frame reset needs: a later `Repeat` must find no table, but the
+    /// arrays are worth keeping — they are the same size for every frame.
+    pub fn invalidate(&mut self) {
+        self.literals_length.invalidate();
+        self.offset.invalidate();
+        self.match_length.invalidate();
+    }
 }
 
 // ------------------------------------------------------------ code tables
@@ -197,7 +209,7 @@ fn resolve_table<'a>(
     spec: &SymbolSpec,
     input: &[u8],
     cursor: &mut usize,
-    slot: &'a mut Option<DecodeTable>,
+    slot: &'a mut DecodeTable,
 ) -> Result<&'a DecodeTable> {
     // Written into the slot that carries it across blocks, and borrowed from
     // there. It used to be built, returned by value, and then *cloned* into the
@@ -206,12 +218,21 @@ fn resolve_table<'a>(
     // is lost in the noise; on the 3–12 KB documents this decoder actually
     // targets it is a large fraction of the work, and `Repeat` mode paid it
     // again to clone a table it already had.
+    // Each arm builds *into* the slot's existing table rather than replacing it.
+    // The slot already holds a 512-entry array from the previous block, and
+    // reusing it avoids both zeroing a fresh one and moving two kilobytes in.
+    // `get_or_insert_with` pays that once, on the first table of a frame.
+    //
+    // A build that fails must leave the slot empty rather than half-written: a
+    // later `Repeat` looks for a table here, and a plausible-but-wrong one is
+    // exactly the failure this decoder is most careful about elsewhere.
     match mode {
         Mode::Predefined => {
-            *slot = Some(DecodeTable::from_counts(
-                spec.default_counts,
-                spec.default_accuracy,
-            )?);
+            let built = slot.from_counts_into(spec.default_counts, spec.default_accuracy);
+            if built.is_err() {
+                slot.invalidate();
+            }
+            built?;
         }
         Mode::Rle => {
             let symbol = *input.get(*cursor).ok_or(Error::Truncated)?;
@@ -219,20 +240,28 @@ fn resolve_table<'a>(
             if u16::from(symbol) > spec.max_symbol {
                 return Err(Error::Malformed);
             }
-            *slot = Some(DecodeTable::rle(symbol));
+            slot.rle_into(symbol);
         }
         Mode::FseCompressed => {
             let rest = input.get(*cursor..).ok_or(Error::Truncated)?;
             let (distribution, used) =
                 Distribution::parse(rest, spec.max_accuracy, spec.max_symbol)?;
             *cursor += used;
-            *slot = Some(DecodeTable::build(&distribution)?);
+            let built = slot.build_into(&distribution);
+            if built.is_err() {
+                slot.invalidate();
+            }
+            built?;
         }
         // Keeps whatever the previous block left, which is the whole point of
         // the mode. Reusing it in place is also what makes it free.
         Mode::Repeat => {}
     }
-    slot.as_ref().ok_or(Error::NoPriorTable)
+    if slot.is_built() {
+        Ok(slot)
+    } else {
+        Err(Error::NoPriorTable)
+    }
 }
 
 /// Decode the sequences section of a compressed block.
@@ -292,6 +321,8 @@ pub fn decode(
     let of_table = resolve_table(of_mode, &OF_SPEC, input, &mut cursor, offset)?;
     let ml_table = resolve_table(ml_mode, &ML_SPEC, input, &mut cursor, match_length)?;
 
+    out.reserve(count as usize);
+
     let payload = input.get(cursor..).ok_or(Error::Truncated)?;
     let mut bits = BackwardBits::new(payload)?;
 
@@ -300,7 +331,6 @@ pub fn decode(
     let mut of_state = State::new(of_table, &mut bits)?;
     let mut ml_state = State::new(ml_table, &mut bits)?;
 
-    out.reserve(count as usize);
     for decoded in 1..=count as usize {
         // One lookup per state, used for both the symbol now and the advance
         // below. The state does not change in between, so the second lookup

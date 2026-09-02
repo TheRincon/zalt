@@ -1025,7 +1025,10 @@ the host the allocator seam was built for, and it currently cannot reach it.
       match what the library emits, and the quiet-machine check given an
       absolute swap floor. **Both change reported figures without changing the
       decoder** — see the seventh pass before comparing across them.
-- [~] Fuse sequence decode with execution — tried, ~4% slower, reverted.
+- [~] Fuse sequence decode with execution — tried twice, reverted twice. The
+      re-run owed by the tenth pass is done (twelfth pass): **6.4% slower** on
+      real `.zdoc`, gap 2.88x -> 3.09x, alternating binaries with zstd in every
+      round. Settled; do not try a third time without a new argument.
 - [~] FSE 3-state interleaving — largely already in place.
 - [~] Double-symbol Huffman tables — implemented, 8.4% slower on real `.zdoc`,
       reverted. Conflicts with the four-stream interleave.
@@ -1185,6 +1188,15 @@ entries, a bit-reader and the window's cursor at once; the separate loops each
 fit. Sequential bulk traffic is cheap and register pressure is not — which is
 the **third** time in this section that an estimate of memory-traffic cost was
 too high, after the drain copy and the xxh64 stripe.
+
+> **Re-run this one.** The tenth pass profiles libzstd and finds it does exactly
+> the fused thing, in a single function that is 87% of its code-corpus time and
+> 52% on a real `.zdoc`. The 4% above is, by this section's own admission, its
+> weakest measurement — two builds at different times rather than alternating
+> binaries — so it is the reverted change whose verdict is least safe to trust.
+> Register pressure may still turn out to be the answer; the point is that it
+> has not been measured against the current decoder, and the reference's profile
+> says this is where its advantage lives.
 
 **Flattening the code tables.** `literals_length_code` reads as a range
 `match` that should obviously be an array index. As a `match`, the low codes —
@@ -1482,7 +1494,10 @@ cost that large ones amortise away.
 
 So M4 and the unsafe seam are **complementary, not competing**, and the earlier
 framing of them as alternatives was an artefact of reading one number without
-its complement. Two further cautions on the 48%: bounds checks are only a
+its complement. (The ninth pass then found that most of that 48% carries no
+bounds check at all, and the tenth that table setup is the area where zalt is
+*closest* to the reference — so neither of these two paragraphs survives intact.
+Read them as the reasoning, and the two passes that follow as the result.) Two further cautions on the 48%: bounds checks are only a
 fraction of what those loops cost, so the realisable gain is a fraction of 48%,
 not 48%; and the largest category on both workloads — match and literal copy —
 already runs through `zalt-neon`'s kernels and is *already* unsafe, so it is not
@@ -1500,6 +1515,296 @@ independently revertible:
    four independent bounds checks per step.
 3. **`BackwardBits`** — 11.8% / 19.8%, though this reader is already
    word-at-a-time, so what remains is the cursor check rather than a per-bit one.
+
+#### Ninth pass: the unsafe seam's premise, tested — and unsupported
+
+This section has said for some time that the remaining gap is bounds checks:
+*"libzstd's inner loops use raw pointers with no bounds checks... ours
+compare-and-branch on every slice access, several times per sequence"*, and
+therefore **"parity is not reachable without it."** That claim was never
+checked. It was tested on a branch before any `unsafe` was written, and it does
+not hold.
+
+The method was to disassemble the release binary and count bounds-check call
+sites (`panic_bounds_check` and friends) per function, then remove some and
+measure.
+
+| function | profile share (`.zdoc`/corpus) | instrs | panic sites |
+|---|---|---:|---:|
+| `sequences::decode` | 22.6% / 26.1% | 422 | **0** |
+| `BackwardBits::read` | part of 11.8% / 19.8% | 42 | **0** |
+| `BackwardBits::read_wide` | ” | 41 | **0** |
+| `huf::Table::decode_four` | 13.9% / 2.6% | 913 | 9 |
+| `Decoder::execute` | part of 29.5% / 45.2% | 350 | 5 |
+
+**Two of the three planned targets have no checks to remove.** `entry_masked`
+indexes a fixed `[Entry; 512]` with a masked index, and LLVM already proves it
+in range. Confirmed by trying the safe version of the optimisation first —
+masking additionally by the constant `TABLE_SIZE_MAX - 1`, which gives the
+optimiser a static bound without any `unsafe`. Alternating binaries, best of
+four: **455.8 before, 453.9 after.** Nothing, because there was nothing there.
+
+**The third target had checks, and removing them was free.** `decode_four`
+carries a comment claiming its mask already removes the bounds check. It does
+not: `mask` is `entries.len() - 1`, which underflows to `usize::MAX` on an empty
+`Vec`, so the compiler cannot conclude `i & mask < len` and kept a check on
+every one of the four streams. Establishing `len > 0` once, outside the loop —
+again with no `unsafe` — removed **4 of the 9 sites and 32 instructions**.
+Measured, alternating, best of five: **458.1 before, 458.4 after.** Dead even.
+
+So on the ~48% of decode time the eighth pass identified as "bounds-checked
+inner loops", either there is no check or removing it is free. These are
+perfectly predicted branches on an eight-wide out-of-order core, and the loops
+are limited by the serial dependency chain through the bit reader, not by
+instruction count. **The premise that bounds checks are the gap is unsupported,
+and spending `forbid(unsafe_code)` to remove them would buy nothing measurable.**
+
+What this does *not* establish: a full raw-pointer rewrite was not tried, and
+§10's other claim — libzstd's "unaligned 64-bit loads throughout" — is a
+structural difference rather than a check, untouched by this experiment.
+`Decoder::execute`'s five sites were not isolated. The narrow finding is that
+*bounds-check removal specifically* is not where the time is.
+
+#### Tenth pass: where the reference's advantage actually is
+
+Rather than infer it again, libzstd was profiled directly. The harness is
+`crates/zalt-bench/reference/zstd-profile.c` (`just profile-zstd`), which links
+`libzstd.a` and mirrors `zalt-bench profile` exactly — context reused across
+iterations, input already in memory, output into a preallocated buffer, no I/O
+and no allocation inside the loop. It reproduces `zstd -b3` to within 3% on both
+corpora, which is what makes it trustworthy.
+
+| category | zstd % | zalt % | zstd | zalt | **ratio** |
+|---|---:|---:|---:|---:|---:|
+| **61 MB code corpus** | | | 32.3 ms | 95.9 ms | **2.97x** |
+| sequence decode + execute | 87.0% | 91.1% | 28.1 ms | 87.4 ms | **3.11x** |
+| Huffman decode | 3.4% | 2.6% | 1.10 ms | 2.49 ms | 2.27x |
+| entropy table setup | 9.6% | 6.3% | 3.08 ms | 6.04 ms | 1.96x |
+| **7.8 KB `.zdoc`** | | | 15.5 µs | 38.9 µs | **2.50x** |
+| sequence decode + execute | 52.0% | 63.9% | 8.08 µs | 24.86 µs | **3.08x** |
+| Huffman decode | 19.8% | 13.9% | 3.07 µs | 5.41 µs | 1.76x |
+| entropy table setup | 28.2% | 18.7% | 4.38 µs | 7.28 µs | 1.66x |
+
+**The gap is one path.** Sequence decode and execution is 3.1x on *both*
+workloads — the same figure on a 61 MB file and a 7.8 KB one — and it is 64–91%
+of zalt's time. Everything else is 1.7–2.3x. Bring that one path to parity and
+zalt lands near 1.3x overall.
+
+**Entropy table setup is zalt's best area, not its worst**, at 1.66x, and
+libzstd spends a *larger share* of its time there than zalt does (28.2% against
+18.7%). This weakens the eighth pass's argument for M4 as a gap-closer: a
+dictionary still removes ~18.7% of small-document time, worth a real 1.23x on
+latency, but it attacks the one place zalt is already competitive and libzstd
+would gain proportionally more from the same change. **M4 is a latency
+improvement, not an answer to the 3x.**
+
+Two struck items are independently confirmed by the reference's own profile.
+`HUF_decompress4X2` — double-symbol Huffman, §5 item #5 — is 0.5% of libzstd's
+code-corpus profile and *absent* on the `.zdoc`, where it uses the
+single-symbol `4X1`. And `ZSTD_decompressSequencesLong`, the prefetching
+variant, is 25 samples of 9182. Both were reverted here after measuring worse;
+the reference barely uses either.
+
+**What is structurally different.** `ZSTD_decompressSequences` is one fused
+function: FSE state machine, bit reader and `ZSTD_execSequence` all inlined into
+a single loop with everything in registers. zalt splits the same work into
+`sequences::decode` filling a `Vec<Sequence>`, `execute` walking it, and the
+copy kernels — three passes over a materialised intermediate. That is precisely
+the fusion tried and reverted in the third pass at "~4% slower", **the number
+this section already identifies as its weakest**, because it was taken across
+two builds at different times rather than by alternating binaries. Re-running it
+under the eighth pass's baseline is the highest-value experiment available, and
+it requires no `unsafe`.
+
+A second candidate inside the same path: libzstd's `execSequence` wildcopies 16
+bytes at a time, overrunning into output slack, and falls back to
+`ZSTD_safecopy` only near the buffer end — which appears at 17 samples,
+confirming the overrunning path is the common one. zalt copies exact lengths.
+§5 anticipated this ("overrunning into padded output slack"); whether that slack
+exists in the window is worth checking.
+
+**Caveat on resolution.** libzstd's fusion is also a measurement limit: because
+one symbol contains FSE decode, bit reads and match copy together, a leaf
+profile cannot decompose the 3.1x among them. "The sequence and execute path is
+3.1x" is supported; attributing it further is not, and would need
+instruction-level sampling.
+
+#### Eleventh pass: acting on the structure, and a control that caught a 55% swing
+
+The tenth pass found libzstd doing the whole sequence loop in one function while
+zalt spreads it over five. This is the first change made on that finding, and
+the first thing in three passes to actually move the number.
+
+**`#[inline(always)]` on `Window::write_all` and `Window::copy_match`.** Both
+live in the same crate as `execute`, so LLVM could always see their bodies and
+was *choosing* not to inline them on cost heuristics. The profiler is what
+proved they were real calls rather than a reading artefact: `sample` attributed
+separate leaf time to each one, which it cannot do to something that was
+inlined.
+
+The disassembly confirms the intended effect. `Window::write_all` disappears as
+a symbol entirely, `Decoder::execute` grows from 350 to 584 instructions, and
+`Backend::copy_match` stops being called from `execute` — the whole per-sequence
+chain collapses into one function, which is the shape the reference has.
+
+| | before | after | |
+|---|---:|---:|---:|
+| real `.zdoc` | 457.6 | 467.3 | **+2.1%** |
+| 61 MB corpus | 697.3 | 709.3 | **+1.7%** |
+| real `.zdoc` (re-confirmed, different machine state) | 750.8 | 763.2 | +1.7% |
+| 61 MB corpus (re-confirmed) | 1118.7 | 1153.3 | **+3.1%** |
+
+Alternating binaries, best of five and best of four. In the first pair the two
+distributions did not overlap at all — every "after" round beat every "before"
+round — which is worth more than the point estimate.
+
+**One change measured worse and was reverted.** `Window::write_all`'s fast path
+is guarded by `is_full()`, so a frame smaller than its declared window — every
+real `.zdoc` — fell through to the general loop and reached
+`Vec::extend_from_slice`, bypassing the inline small-copy path in
+`B::copy_literals` on exactly the workload with the most literal runs per byte.
+That looked like a clear miss. Adding a non-full fast path that `resize`s and
+then copies measured **5.4% slower**, consistently, across six rounds with no
+overlap: the `resize` zero-fills bytes that are immediately overwritten, and the
+doubled write costs more than the `memcpy` call it removed. `extend_from_slice`
+was already the better answer. Reverted.
+
+That is the **fourth** memory-traffic estimate in this section to come out
+backwards, after the drain copy, the xxh64 stripe and the fusion attempt.
+
+#### A canary is worth more than a clean-machine check
+
+The most useful thing to come out of this pass is a measurement technique.
+
+`just bench-zstd` has a **known value** — the reference decoder's throughput on
+a given frame does not change when zalt changes. So running it before and after
+an A/B turns it into a control: if the canary reads what it read last time, the
+machine is in the same state; if it moved, nothing measured across that window
+can be compared with anything measured outside it.
+
+It earned its place immediately. Mid-session the canary went from **1905 MB/s to
+3058 MB/s — a 55% swing with no code involved**, on a fanless laptop whose
+sustained clocks depend on how hot the last ten minutes were. In the same window
+the *same* zalt binary read 457 and then 750. Without a control, that 64% would
+have been read as a spectacular optimisation; with one, it was visibly the
+machine. An A/B taken while the canary drifted (the `before` column moved 534 →
+728 *within one run*) was correctly thrown away and re-taken.
+
+The load-average and swap check in `just measure` does not catch this, because
+the machine genuinely *was* quiet in both states — it was quiet and slow, then
+quiet and fast. **Thermal and frequency state is a third axis, invisible to
+`uptime`, and a known-value canary is the only cheap way to see it.**
+
+**It is now wired in.** `just measure` runs the canary before and after the
+rounds and prints the drift; above 10% it says the rounds straddle two different
+machines and should be re-run. `just canary` reads it on its own.
+
+Three things had to be right for it to be worth having.
+
+**The input is generated, not borrowed.** `ci/gen-canary.py` emits ~8 MB of
+seeded markup, seeded for the same reason `gen-text-fixture.py` is: a control
+whose input drifts cannot separate "the laptop got slower" from "the input got
+harder", which is the only question it exists to answer. It is shaped like
+markup so `zstd -3` emits compressed blocks — a canary decoding raw blocks would
+measure `memcpy` and would not move when the interesting things move.
+
+**It is a best-of-three, not a single reading.** Consecutive single readings
+spread **35%** while the CPU ramped, which would have made the control the
+noisiest thing in the room. Best-of-three repeats to a few percent and the cold
+first run never wins. The reasoning is the estimator's, one level up:
+interference is one-sided, so the fastest sample is the closest estimate — and a
+*drifting control is worse than no control*, because it reports its own drift as
+the machine's.
+
+**It degrades to silence.** The canary needs the zstd headers; without them
+`just measure` prints no canary line rather than failing a measurement over a
+missing control.
+
+#### What the canary found within an hour of existing
+
+Two contention sources that `uptime` had not yet reflected, both started by an
+editor rather than by anything anyone ran:
+
+- **`cpptools-srv`**, five processes at ~78% of a core each, from the C/C++
+  extension indexing `zstd-profile.c` — a *file being added*.
+- **`clippy-driver`, seven processes at 24–40% each**, from rust-analyzer
+  checking the workspace after a justfile edit. That one matters more, because
+  this is a Rust repository and every contributor's editor will do it, on every
+  save, forever.
+
+The canary read 481 against a settled 860 while clippy ran — a 44% error, and
+the load average had not caught up. Twenty minutes later, quiet, it read 1400:
+**the same control, the same input, 1.6x apart**, which is the measurement this
+section spent an entire milestone not knowing it needed.
+
+#### Twelfth pass: fusion, re-tried properly, and settled
+
+The tenth pass named this the highest-value experiment available: libzstd
+decodes and executes a sequence in one loop, zalt fills a `Vec<Sequence>` and
+walks it afterwards, and the −4% that had condemned fusion was the weakest
+measurement in this section — two builds at different times rather than
+alternating binaries. It was also worth re-trying because the diagnosis then was
+register pressure, and the eleventh pass has since inlined `Window::write_all`
+and `Window::copy_match` *into* the executor, changing the register situation
+the diagnosis rested on.
+
+`sequences::decode` grew a callback form, `decode_with`, and the block path
+executed each sequence as it was read. All 294 tests passed in both profiles.
+
+**It is slower, and now by a number worth trusting.**
+
+| | zalt | zstd | gap |
+|---|---:|---:|---:|
+| two-pass (kept) | 724–730 | 2086–2104 | **2.85–2.92x** |
+| fused | 674–684 | ” | **3.05–3.10x** |
+
+Best of eight, alternating, with zstd interleaved in every round. Every single
+round favoured the two-pass version and the distributions did not overlap:
+**−6.4%**, and the gap against the reference widened from 2.88x to 3.09x. On the
+code corpus it was −0.9%, marginal but the same direction. Reverted.
+
+So the original verdict was right, and re-running it was still correct: it was
+right for a reason nobody had established, and it is now measured rather than
+believed. **The register-pressure explanation survives** — inlining the window
+operations into the executor did not free enough room to make the merged loop
+fit, and may have made it tighter.
+
+The uncomfortable part is what this does to the tenth pass's conclusion. That
+pass found libzstd doing in one function what zalt does in five, and inferred
+that the single function was *why* it is faster. Fusing ours makes it slower, so
+the inference does not hold: **libzstd is not fast because it is fused; it is
+fused and fast.** What the eleventh pass banked (+2–3%) came from removing call
+boundaries *within* execution, which is a different thing from merging the two
+halves. The structural difference is real and visible in the disassembly; the
+causal story attached to it was one step too far.
+
+#### Never quote a raw MB/s — quote the gap
+
+The rule this section has been circling for two milestones, now enforced by
+`just gap` and printed by `just measure`.
+
+An absolute figure from this laptop means very little. The same binary has
+measured 457 and 750 on the same input; the reference has read 1905 and 3058.
+Both swings were thermal, invisible to `uptime`, and larger than every
+optimisation in this document put together.
+
+A **ratio measured in the same window** cancels all of it, because whatever
+slows zalt slows zstd in the same breath. The difference is stark: across four
+consecutive runs the gap repeated as **2.90, 2.88, 2.92, 2.86** — about 1% —
+while the figures behind it moved by three times that.
+
+```sh
+just gap corpus/ztml     # zalt, zstd, and the ratio, on the same files
+```
+
+Both sides must use the same estimator or the ratio is not one: `gap` takes the
+best of three from zalt and gives `zstd -b3` matching iterations. A first version
+compared a single zalt run against `-i1` and reported 2.43x where the honest
+figure was 2.88x.
+
+For an A/B, take **three** readings per round — before, after, and zstd on the
+same corpus — and compare the two ratios. That is how the fusion verdict above
+was taken, and it is why it is trustworthy where the original was not.
 
 #### The measurement protocol — read this before quoting a number
 
@@ -1533,6 +1838,16 @@ ps -Ao %cpu,comm -r | head -5
 It resolves on its own; nothing needs killing. Spend the wait on the builds —
 `cargo build --release -p zalt-bench`, compressing reference frames — so that
 the quiet window, once it arrives, holds only measurements.
+
+**An editor with the repo open is a build tool.** Adding
+`crates/zalt-bench/reference/zstd-profile.c` woke VS Code's C/C++ extension,
+which put **three `cpptools-srv` processes at ~76% each** — later 423% of a core
+in total, load 21 — into the middle of a measurement, and depressed the
+reference harness from 1905 MB/s to 686. That is a 2.8x error, larger than the
+entire gap this section is trying to explain, and it appeared because a *file
+was added*, not because anything was run. `just measure` would have caught it;
+`bench-zstd` prints no machine state and did not. Check `ps` when a number moves
+by more than the change could explain.
 
 **The corpus is `corpus/varied.txt`**, about 60 MB of *distinct* Rust sources.
 Distinct matters: an earlier corpus was one file repeated, which at level 3
@@ -1705,6 +2020,16 @@ allows audited unsafe in kernels, so moving the entropy inner loops behind the
 backend seam is within the stated design rather than a breach of it — but it is
 a decision to take deliberately, with the numbers in hand, not a tuning step.
 **Parity is not reachable without it.**
+
+> **Corrected by the ninth and tenth passes.** The last sentence was an
+> inference, not a measurement, and the measurement contradicts it. Two of the
+> three hot loops contain **no bounds checks at all**, and removing four of them
+> from the third changed the number by nothing. Meanwhile a profile of libzstd
+> itself puts the gap in one place: the fused sequence-decode-and-execute loop,
+> 3.1x on both workloads. The route to parity that the evidence supports is
+> **structural — fusing that loop, which needs no `unsafe`** — not unchecked
+> indexing. The `forbid(unsafe_code)` claim stands, and nothing measured so far
+> asks us to spend it.
 
 The bit reader was the cheapest and the largest. `read(n)` was an `n`-iteration
 loop with a bounds-checked byte load *per bit*; this reader's bit string is the

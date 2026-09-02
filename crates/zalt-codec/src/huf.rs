@@ -287,6 +287,17 @@ impl Table {
         // construction. Masking says so to the compiler instead of leaving a
         // bounds check that can never fire in the middle of the hot loop.
         debug_assert_eq!(entries.len(), 1usize << log);
+        // The emptiness guard is not defensive — a built table always has
+        // entries — it is what makes the masking argument above *provable*.
+        // `mask` is `len - 1`, which underflows to `usize::MAX` when `len` is
+        // zero, and a mask of `usize::MAX` is the identity. So without knowing
+        // `len > 0` the compiler cannot conclude `i & mask < len`, and it kept
+        // a bounds check on every one of the four streams despite the comment
+        // above claiming otherwise. Establishing `len > 0` once, out of the
+        // loop, is what the comment always meant.
+        if entries.is_empty() {
+            return Err(Error::Malformed);
+        }
         let mask = entries.len() - 1;
 
         macro_rules! step {

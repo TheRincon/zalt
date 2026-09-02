@@ -231,7 +231,7 @@ impl<B: Backend> Decoder<B> {
     /// previous frame's tables would decode garbage instead of erroring.
     fn reset_frame_state(&mut self) {
         self.huffman = None;
-        self.tables = Tables::default();
+        self.tables.invalidate();
         self.repeats = REP_INITIAL;
     }
 
