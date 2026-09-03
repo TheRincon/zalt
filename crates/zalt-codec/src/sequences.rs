@@ -428,6 +428,7 @@ pub fn decode(
 /// botched rule in the format, because a decoder that ignores it still produces
 /// output, just wrong output, and only on blocks that happen to contain a
 /// zero-literal sequence.
+#[inline(always)]
 fn resolve_offset(offset_value: u32, ll_zero: bool, repeats: &mut [u32; REP_COUNT]) -> Result<u32> {
     if offset_value > REP_COUNT as u32 {
         let offset = offset_value - REP_COUNT as u32;
