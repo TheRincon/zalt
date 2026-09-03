@@ -206,6 +206,48 @@ impl Distribution {
     }
 }
 
+/// Working buffers for [`DecodeTable::build_into`].
+///
+/// **Unproven — more testing needed.** Kept because it does strictly less work,
+/// not because it was shown to be worth anything.
+///
+/// These were two zeroed stack arrays inside the build — about a kilobyte — and
+/// a block builds *three* tables, so a 7.8 KB document zeroed ~3 KB before
+/// decoding a byte. Hoisting them measured about +2% across ten of twelve clean
+/// rounds, but the machine was in a poor state (the canary had dropped from
+/// ~1420 to 1230) and **the profile did not corroborate it**: `_platform_memset`
+/// was 6.1% before and 6.4% after.
+///
+/// So the stated motivation is wrong, or at least unconfirmed. `memset` in that
+/// profile has now been attributed by inference to the FSE entry array, the
+/// Huffman `Vec` and this scratch; only the Huffman one was real. The likeliest
+/// remaining source is `Window::copy_match`'s growth path, which `resize`s with
+/// zeroes over bytes it immediately overwrites — once per match — and §10
+/// records one failed attempt to remove that already.
+///
+/// Re-measure on a quiet machine before treating the +2% as real.
+///
+/// Reusing the buffers needs no clearing between builds: every byte read is
+/// written first. The spread covers `0..table_size` exactly and the "less than
+/// one" pass fills the rest downward, so `symbols` is wholly written;
+/// `symbol_next` is set for every symbol up to `max_symbol` before any of it is
+/// read. They are zeroed once, at construction, and only because Rust requires
+/// it.
+#[derive(Debug, Clone)]
+pub struct BuildScratch {
+    symbols: [u8; TABLE_SIZE_MAX],
+    symbol_next: [u16; 256],
+}
+
+impl Default for BuildScratch {
+    fn default() -> Self {
+        Self {
+            symbols: [0u8; TABLE_SIZE_MAX],
+            symbol_next: [0u16; 256],
+        }
+    }
+}
+
 /// An FSE decoding table.
 #[derive(Debug, Clone)]
 pub struct DecodeTable {
@@ -231,7 +273,8 @@ impl DecodeTable {
     /// path, which reuses the one already in the slot.
     pub fn build(distribution: &Distribution) -> Result<Self> {
         let mut table = Self::default();
-        table.build_into(distribution)?;
+        let mut scratch = BuildScratch::default();
+        table.build_into(distribution, &mut scratch)?;
         Ok(table)
     }
 
@@ -256,7 +299,11 @@ impl DecodeTable {
     /// be mistaken for a usable one — a `Repeat` mode arriving later must find
     /// no table rather than a plausible one. The caller clears the slot too;
     /// this is the second of the two.
-    pub fn build_into(&mut self, distribution: &Distribution) -> Result<()> {
+    pub fn build_into(
+        &mut self,
+        distribution: &Distribution,
+        scratch: &mut BuildScratch,
+    ) -> Result<()> {
         self.size = 0;
         let accuracy_log = distribution.accuracy_log;
         let table_size = 1usize << accuracy_log;
@@ -265,8 +312,8 @@ impl DecodeTable {
         // coprime with the table size for every legal accuracy log.
         let step = (table_size >> 1) + (table_size >> 3) + 3;
 
-        let mut symbols = [0u8; TABLE_SIZE_MAX];
-        let mut symbol_next = [0u16; 256];
+        let symbols = &mut scratch.symbols;
+        let symbol_next = &mut scratch.symbol_next;
         // Slots above `high_threshold` are reserved for "less than one"
         // symbols, filled downward from the top of the table.
         let mut high_threshold = table_size;
@@ -337,8 +384,13 @@ impl DecodeTable {
     }
 
     /// [`DecodeTable::from_counts`] in place. See [`DecodeTable::build_into`].
-    pub fn from_counts_into(&mut self, counts: &[i16], accuracy_log: u32) -> Result<()> {
-        self.build_into(&Distribution::from_counts(counts, accuracy_log)?)
+    pub fn from_counts_into(
+        &mut self,
+        counts: &[i16],
+        accuracy_log: u32,
+        scratch: &mut BuildScratch,
+    ) -> Result<()> {
+        self.build_into(&Distribution::from_counts(counts, accuracy_log)?, scratch)
     }
 
     /// [`DecodeTable::rle`] in place. See [`DecodeTable::build_into`].

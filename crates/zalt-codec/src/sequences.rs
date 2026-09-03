@@ -78,6 +78,10 @@ pub struct Tables {
     pub offset: DecodeTable,
     /// Match-length table.
     pub match_length: DecodeTable,
+    /// Working buffers shared by all three builds. One per decoder, not one
+    /// per table: they are live only during a build, and the three builds in a
+    /// block are sequential.
+    pub scratch: fse::BuildScratch,
 }
 
 impl Tables {
@@ -210,6 +214,7 @@ fn resolve_table<'a>(
     input: &[u8],
     cursor: &mut usize,
     slot: &'a mut DecodeTable,
+    scratch: &mut fse::BuildScratch,
 ) -> Result<&'a DecodeTable> {
     // Written into the slot that carries it across blocks, and borrowed from
     // there. It used to be built, returned by value, and then *cloned* into the
@@ -228,7 +233,7 @@ fn resolve_table<'a>(
     // exactly the failure this decoder is most careful about elsewhere.
     match mode {
         Mode::Predefined => {
-            let built = slot.from_counts_into(spec.default_counts, spec.default_accuracy);
+            let built = slot.from_counts_into(spec.default_counts, spec.default_accuracy, scratch);
             if built.is_err() {
                 slot.invalidate();
             }
@@ -247,7 +252,7 @@ fn resolve_table<'a>(
             let (distribution, used) =
                 Distribution::parse(rest, spec.max_accuracy, spec.max_symbol)?;
             *cursor += used;
-            let built = slot.build_into(&distribution);
+            let built = slot.build_into(&distribution, scratch);
             if built.is_err() {
                 slot.invalidate();
             }
@@ -316,10 +321,18 @@ pub fn decode(
         literals_length,
         offset,
         match_length,
+        scratch,
     } = tables;
-    let ll_table = resolve_table(ll_mode, &LL_SPEC, input, &mut cursor, literals_length)?;
-    let of_table = resolve_table(of_mode, &OF_SPEC, input, &mut cursor, offset)?;
-    let ml_table = resolve_table(ml_mode, &ML_SPEC, input, &mut cursor, match_length)?;
+    let ll_table = resolve_table(
+        ll_mode,
+        &LL_SPEC,
+        input,
+        &mut cursor,
+        literals_length,
+        scratch,
+    )?;
+    let of_table = resolve_table(of_mode, &OF_SPEC, input, &mut cursor, offset, scratch)?;
+    let ml_table = resolve_table(ml_mode, &ML_SPEC, input, &mut cursor, match_length, scratch)?;
 
     out.reserve(count as usize);
 
