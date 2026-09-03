@@ -1917,6 +1917,41 @@ have found this: `sample` attributes leaf time to `word_at`, which is a real cos
 correctly reported, and says nothing about the spill around it. Counting calls
 in the disassembly and comparing against the reference is what found it, twice.
 
+#### Fifteenth pass: the memset that keeps not being where it is looked for
+
+Recorded as an open item rather than a result. **`_platform_memset` has been
+6% of the `.zdoc` profile all session, three changes have been aimed at it, and
+it has not moved.**
+
+| aimed at | outcome |
+|---|---|
+| `DecodeTable`'s 512-entry array (twelfth pass) | build 24% cheaper, `memset` 446 → 438, end-to-end **0%** |
+| `huf::Table`'s per-block `Vec` (thirteenth pass) | **+4.6% / +7.0%** — real, but `memset` share still rose |
+| `DecodeTable`'s build scratch (this pass) | ~+2% unconfirmed, `memset` 6.1% → **6.4%** |
+
+Only the middle one paid, and even that did not reduce the symbol it was
+chosen to reduce — it removed a `malloc` per *block*, which the allocator
+samples showed and the `memset` attribution did not.
+
+The scratch hoist is **kept and marked unproven**: it does strictly less work,
+and the +2% was ten of twelve clean rounds — but on a machine whose canary had
+fallen from ~1420 to 1230, and with a profile that declines to confirm it. It
+should be re-measured on a quiet machine before anyone believes the figure, and
+it should not be cited as evidence that the scratch was the cost.
+
+**The likeliest remaining source is `Window::copy_match`'s growth path**, which
+`resize`s with zeroes over bytes it overwrites immediately afterwards — once per
+match, and a frame smaller than its window is *entirely* growth path, which is
+every real `.zdoc`. §10 already records one failed attempt to remove it
+(`extend_from_within`, 133 against 140 MB/s), so it is known ground and known
+hard, and it is the one candidate left that is per-match rather than per-block.
+
+The lesson is narrow and worth stating plainly: **a profiler names the function
+that runs, not the code that caused it to run.** `memset` is called from
+everywhere, and three of four guesses about which caller were wrong. Attribution
+by inference has now cost more than it has returned; the next attempt should
+find the call site rather than reason about which one it must be.
+
 #### Never quote a raw MB/s — quote the gap
 
 The rule this section has been circling for two milestones, now enforced by
