@@ -1848,6 +1848,52 @@ first thing it was attributed to was innocent. The sharper one is that "per
 frame" and "per block" are an order of magnitude apart on a 553-block frame, and
 the estimate that made this look like a small `.zdoc`-only win had the wrong one.
 
+#### Fourteenth pass: the bit reader was a function call
+
+The largest single win recorded in this section, and it was sitting in plain
+sight behind an `#[inline]` that LLVM declined to honour.
+
+The tenth pass compared zalt's decode path with libzstd's and found one fused
+function against five. The eleventh acted on that inside execution and got
+2–3%. This pass asked the same question of the *literals* path, and the answer
+was blunter:
+
+| | instrs | calls | in the loop |
+|---|---:|---:|---|
+| `huf::Table::decode_four` | 512 | 19 | **11** |
+| `HUF_decompress4X1_usingDTable_internal` | 1307 | 2 | **0** — both setup |
+
+Nine of those eleven were calls to **`BackwardBits::word_at`** — the
+eight-byte load the entire word-at-a-time reader is built around, and the
+change the twelfth-pass table credits with the largest win of M3's first half.
+It carried `#[inline]`; the hint was not taken, and it stayed a real call. Every
+symbol decoded therefore spilled the bit accumulator and cursor and reloaded
+them, which is precisely the state the design exists to keep in registers.
+
+`#[inline(always)]` on `word_at`, and on `BackwardBits::{read, peek, read_wide,
+skip, check}`, takes `decode_four` to 899 instructions with five non-cold calls
+and `sequences::decode` to 1049 — the same shape as the reference rather than a
+third of its size.
+
+| | before | after | | gap |
+|---|---:|---:|---:|---|
+| real `.zdoc` | 727.3 | **810.3** | **+11.4%** | 2.85x → **2.56x** |
+| 61 MB corpus | 1187.8 | **1225.1** | **+3.1%** | 2.65x → **2.56x** |
+
+Best of six and best of four, alternating, zstd interleaved in every round;
+every round improved on both figures, and the within-binary spread was about 1%.
+`.zdoc` gains four times what the code corpus does because Huffman literals are
+13.9% of its profile against 2.6% — that is where `word_at` was being called
+nine times.
+
+**`#[inline]` is a hint, and on the hottest function in the decoder it was
+ignored.** Three of this milestone's four wins are now the same mechanism —
+removing a call boundary the compiler chose to keep — and in every case the
+disassembly said so plainly while the source looked fine. The profile could not
+have found this: `sample` attributes leaf time to `word_at`, which is a real cost
+correctly reported, and says nothing about the spill around it. Counting calls
+in the disassembly and comparing against the reference is what found it, twice.
+
 #### Never quote a raw MB/s — quote the gap
 
 The rule this section has been circling for two milestones, now enforced by

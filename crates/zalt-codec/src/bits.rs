@@ -206,7 +206,14 @@ impl<'a> BackwardBits<'a> {
     ///
     /// That turns `read(n)` from an `n`-iteration loop with a bounds-checked
     /// byte load per bit into one load, one shift and one mask.
-    #[inline]
+    /// `#[inline(always)]`, not `#[inline]`.
+    ///
+    /// This is the load the whole word-at-a-time reader is built around, and
+    /// the hint was not taken: it stayed a real call, nine of them inside
+    /// `huf::Table::decode_four` alone. Every one spilled the cursor and
+    /// reloaded it, which is precisely the state the design exists to keep in
+    /// registers — the reference's equivalent loop makes no calls at all.
+    #[inline(always)]
     fn word_at(&self, bit_index: usize) -> u64 {
         let len = self.data.len();
         let k = bit_index / 8;
@@ -238,6 +245,16 @@ impl<'a> BackwardBits<'a> {
     ///
     /// Reading zero bits yields zero without touching the stream — which the
     /// sequence decoder relies on, since many symbols carry no extra bits.
+    /// `#[inline(always)]` because these are the innermost operations in the
+    /// decoder and LLVM would not inline them on its own.
+    ///
+    /// `huf::Table::decode_four` was making **two calls per symbol decoded** —
+    /// eleven call sites to this type in one 512-instruction function — where
+    /// the reference's equivalent loop has none at all and is 1307 instructions
+    /// of inlined, unrolled code. The same applied to `sequences::decode`. A
+    /// call here costs the spill and reload of the bit accumulator and cursor
+    /// that the whole word-at-a-time design exists to keep in registers.
+    #[inline(always)]
     pub fn read(&mut self, n: u32) -> u32 {
         let value = self.peek(n);
         self.bit_pos += n as usize;
@@ -248,6 +265,7 @@ impl<'a> BackwardBits<'a> {
     ///
     /// Huffman decoding needs this: the table is indexed by a full `tableLog`
     /// window, but only the decoded symbol's own bit count is consumed.
+    #[inline(always)]
     pub fn peek(&mut self, n: u32) -> u32 {
         debug_assert!(n <= 32);
         if n == 0 {
@@ -275,6 +293,7 @@ impl<'a> BackwardBits<'a> {
     ///
     /// The ceiling is [`WIDE_MAX`] rather than 64 because the cursor can sit up
     /// to seven bits into the cached word, and `off + n` must stay within it.
+    #[inline(always)]
     pub fn read_wide(&mut self, n: u32) -> u64 {
         debug_assert!(n <= WIDE_MAX);
         if n == 0 {
@@ -291,11 +310,13 @@ impl<'a> BackwardBits<'a> {
     }
 
     /// Discard `n` bits.
+    #[inline(always)]
     pub fn skip(&mut self, n: u32) {
         self.bit_pos += n as usize;
     }
 
     /// Fail if the reader ran past the end of its data.
+    #[inline(always)]
     pub fn check(&self) -> Result<()> {
         if self.exhausted() {
             return Err(Error::Malformed);
