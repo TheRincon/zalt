@@ -1886,6 +1886,29 @@ every round improved on both figures, and the within-binary spread was about 1%.
 13.9% of its profile against 2.6% — that is where `word_at` was being called
 nine times.
 
+**The rest of the sweep, and where it ran out.** With the mechanism established,
+every non-cold call in the hot path was inventoried from the disassembly and
+sorted by how often it runs. Three were per-sequence — `sequences::resolve_offset`
+and two kernel calls out of the executor — and were closed, the kernels by
+hoisting the short non-overlapping match into `Neon::copy_match` so a
+handful-of-bytes copy never calls out at all. The rest are per *block*
+(`resolve_table`, `fse::State::new`, `BackwardBits::new`, everything in
+`literals::decode`) and were left, because a call amortised over a whole block
+is not worth inlining a large function for.
+
+That sweep is worth **1–3%**, and it is the first result this section has had to
+report with two estimators disagreeing. By round count it is clear: the changed
+binary won 12 of 14 rounds on `.zdoc` and 5 of 5 on the code corpus, and the
+gap ratio improved in almost every one (`.zdoc` 2.75x → 2.65x, corpus 2.63x →
+2.58x). By *best-of* — this document's usual estimator — it is roughly neutral,
+because the unchanged binary produced occasional outliers as fast as the changed
+one while typically running 3% slower.
+
+Best-of assumes interference is one-sided, and a bimodal run like that is a
+signal the assumption has stopped holding — the outliers look like code layout
+rather than the machine. Kept, on the round count and the ratio, and recorded
+here as a smaller and less certain result than the two before it.
+
 **`#[inline]` is a hint, and on the hottest function in the decoder it was
 ignored.** Three of this milestone's four wins are now the same mechanism —
 removing a call boundary the compiler chose to keep — and in every case the

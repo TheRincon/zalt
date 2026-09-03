@@ -16,7 +16,10 @@ const VEC: usize = 16;
 impl Backend for Neon {
     const NAME: &'static str = "neon";
 
-    #[inline]
+    // `always`, not a hint: these are reached once per sequence from the
+    // executor, and `#[inline]` was declined there exactly as it was on the bit
+    // reader. A call here re-spills the window cursor the caller just computed.
+    #[inline(always)]
     fn copy_literals(dst: &mut [u8], src: &[u8]) {
         debug_assert_eq!(dst.len(), src.len());
         // Bulk copy is still Apple's `memcpy`: it is NEON-optimised, tuned per
@@ -42,7 +45,7 @@ impl Backend for Neon {
         dst.copy_from_slice(src);
     }
 
-    #[inline]
+    #[inline(always)]
     fn copy_match(buf: &mut [u8], pos: usize, offset: usize, len: usize) {
         debug_assert!(offset >= 1);
         debug_assert!(offset <= pos);
@@ -57,6 +60,19 @@ impl Backend for Neon {
         // both kernels is in bounds. Each kernel documents the specific
         // property it relies on.
         unsafe {
+            // The short non-overlapping match, handled here rather than three
+            // frames down. `copy_match_wide` already has this fast path, but
+            // reaching it costs a call, and the disassembly showed two such
+            // calls per sequence in the executor — for matches that are
+            // typically a handful of bytes, so the call is most of the work.
+            //
+            // The condition is the wide kernel's own: `offset >= len` means the
+            // source cannot overlap the destination, and `len <= 2 * VEC` is
+            // what head-and-tail covers in two fixed-width moves.
+            if offset >= len && len <= 2 * VEC {
+                copy_small(buf.as_mut_ptr(), pos, pos - offset, len);
+                return;
+            }
             if offset >= VEC {
                 copy_match_wide(buf, pos, offset, len);
             } else {
