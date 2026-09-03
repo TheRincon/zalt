@@ -15,6 +15,14 @@ set shell := ["bash", "-uc"]
 zstd := env_var_or_default("ZSTD", "zstd")
 # no_std target used to prove zalt-codec stays portable and allocation-light.
 nostd_target := "thumbv7em-none-eabi"
+# Host triple, passed explicitly to `cargo fuzz`.
+#
+# cargo-fuzz picks its own default target, and on the Apple Silicon CI runner it
+# chose `x86_64-apple-darwin` — for which no standard library is installed, so
+# every target failed with "can't find crate for `std`". It builds fine locally
+# without this, which is exactly why it went unnoticed: the default is only
+# wrong on some hosts. Asking rustc what it is removes the guess.
+fuzz_target_triple := `rustc +nightly -vV 2>/dev/null | awk '/^host:/{print $2}'`
 fixtures := "crates/zalt-codec/tests/fixtures"
 
 # List available recipes.
@@ -576,7 +584,7 @@ fuzz-build:
         # /dev/null, so a CI failure read `backend_equivalence FAILED` and
         # nothing else — a red build with the diagnosis thrown away, which cost
         # a round trip to even start guessing at.
-        if out=$(cargo +nightly fuzz build "$t" 2>&1); then
+        if out=$(cargo +nightly fuzz build --target {{fuzz_target_triple}} "$t" 2>&1); then
             echo ok
         else
             echo FAILED
@@ -592,7 +600,7 @@ fuzz-build:
 #
 #   just fuzz decode_roundtrip 60
 fuzz TARGET TIME="60":
-    cd fuzz && cargo +nightly fuzz run {{TARGET}} -- \
+    cd fuzz && cargo +nightly fuzz run --target {{fuzz_target_triple}} {{TARGET}} -- \
         -max_total_time={{TIME}} -rss_limit_mb=2048 -timeout=15
 
 # Run every fuzz target briefly. A smoke test, not a campaign.
@@ -603,7 +611,7 @@ fuzz-all TIME="60":
     cd fuzz
     for t in $(cargo +nightly fuzz list); do
         echo "=== $t ==="
-        cargo +nightly fuzz run "$t" -- \
+        cargo +nightly fuzz run --target {{fuzz_target_triple}} "$t" -- \
             -max_total_time={{TIME}} -rss_limit_mb=2048 -timeout=15 2>&1 \
             | grep -E 'Done [0-9]+ runs|panicked at|ERROR: libFuzzer' || true
     done
