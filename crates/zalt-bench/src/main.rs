@@ -527,12 +527,12 @@ fn bench_decode(dir: &Path, level: Option<u32>) {
         state.report();
     }
     println!();
-    println!("{:-<92}", "");
+    println!("{:-<104}", "");
     println!(
-        "{:<24} {:>9} {:>9} {:>11} {:>11} {:>10} {:>8}",
-        "file", "raw", "comp", "scalar MB/s", "neon MB/s", "sink MB/s", "speedup"
+        "{:<24} {:>9} {:>9} {:>11} {:>11} {:>10} {:>9} {:>8}",
+        "file", "raw", "comp", "scalar MB/s", "neon MB/s", "sink MB/s", "ruzstd", "speedup"
     );
-    println!("{:-<92}", "");
+    println!("{:-<104}", "");
 
     let mut cases = Vec::new();
     for path in &files {
@@ -574,6 +574,7 @@ fn bench_decode(dir: &Path, level: Option<u32>) {
     let (mut total_raw, mut total_comp) = (0u64, 0u64);
     let (mut sum_scalar_time, mut sum_neon_time) = (0f64, 0f64);
     let mut sum_sink_time = 0f64;
+    let mut sum_ruzstd_time = 0f64;
 
     let mut any_noisy = false;
 
@@ -604,6 +605,10 @@ fn bench_decode(dir: &Path, level: Option<u32>) {
         if sink.best.is_finite() {
             sum_sink_time += *raw_len as f64 / (sink.best * 1e6);
         }
+        let rz = time_decode_ruzstd(compressed, *raw_len);
+        if rz.best.is_finite() {
+            sum_ruzstd_time += *raw_len as f64 / (rz.best * 1e6);
+        }
 
         // A ratio between two noisy samples is a rumour. Say so in the row
         // rather than printing two decimal places of it and letting a reader
@@ -616,23 +621,25 @@ fn bench_decode(dir: &Path, level: Option<u32>) {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         println!(
-            "{:<24} {raw_len:>9} {:>9} {:>11.1} {:>11.1} {:>10.1} {:>7.2}x{}",
+            "{:<24} {raw_len:>9} {:>9} {:>11.1} {:>11.1} {:>10.1} {:>9.1} {:>7.2}x{}",
             truncate(&name, 24),
             compressed.len(),
             scalar.best,
             accel.best,
             sink.best,
+            rz.best,
             accel.best / scalar.best,
             if noisy { "  ~noisy" } else { "" }
         );
     }
 
-    println!("{:-<92}", "");
+    println!("{:-<104}", "");
     let overall_scalar = total_raw as f64 / sum_scalar_time / 1e6;
     let overall_neon = total_raw as f64 / sum_neon_time / 1e6;
     let overall_sink = total_raw as f64 / sum_sink_time / 1e6;
+    let overall_ruzstd = total_raw as f64 / sum_ruzstd_time / 1e6;
     println!(
-        "{:<24} {total_raw:>9} {total_comp:>9} {overall_scalar:>11.1} {overall_neon:>11.1} {overall_sink:>10.1} {:>7.2}x",
+        "{:<24} {total_raw:>9} {total_comp:>9} {overall_scalar:>11.1} {overall_neon:>11.1} {overall_sink:>10.1} {overall_ruzstd:>9.1} {:>7.2}x",
         format!("TOTAL ({} files)", cases.len()),
         overall_neon / overall_scalar
     );
@@ -653,7 +660,9 @@ fn bench_decode(dir: &Path, level: Option<u32>) {
     println!("A speedup without the number it improved on is not a measurement.");
     // A stable, machine-readable line so a driver script never has to guess at
     // column positions in a table meant for humans.
-    println!("SUMMARY scalar={overall_scalar:.1} neon={overall_neon:.1} sink={overall_sink:.1}");
+    println!(
+        "SUMMARY scalar={overall_scalar:.1} neon={overall_neon:.1} sink={overall_sink:.1} ruzstd={overall_ruzstd:.1}"
+    );
 }
 
 /// Time one whole-frame decode, reported in MB/s of decoded output.
@@ -700,6 +709,30 @@ fn time_decode_sink<B: Backend>(compressed: &[u8], decoded_len: usize) -> Sample
             }
         }
         std::hint::black_box(total);
+    });
+    Sample {
+        best: s.best * 1000.0,
+        median: s.median * 1000.0,
+        spread: s.spread,
+    }
+}
+
+/// Time the independent Rust decoder on the same frame.
+///
+/// Allocates its output per iteration, so this is comparable with the
+/// `scalar`/`neon` columns — which do the same — and *not* with `sink`, which
+/// reuses a decoder and writes nowhere. Reading it against `sink` flatters us
+/// by exactly the allocator.
+fn time_decode_ruzstd(compressed: &[u8], decoded_len: usize) -> Sample {
+    use std::io::Read;
+    let s = measure(decoded_len, || {
+        let mut decoder =
+            ruzstd::StreamingDecoder::new(compressed).expect("verified decodable before timing");
+        let mut out = Vec::with_capacity(decoded_len);
+        decoder
+            .read_to_end(&mut out)
+            .expect("verified before timing");
+        std::hint::black_box(&out);
     });
     Sample {
         best: s.best * 1000.0,

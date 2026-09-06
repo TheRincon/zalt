@@ -11,6 +11,15 @@ publish = false
 [dependencies]
 zalt-codec.workspace = true
 zalt-embed.workspace = true
+# An independent pure-Rust decoder, measured alongside zalt in the same run.
+#
+# The reference answers "how far from the C implementation are we". This
+# answers a question the reference cannot: how far from *another Rust decoder*,
+# measured on the same corpus, in the same window, on the same machine. A gap
+# against libzstd that is mostly the cost of being written in safe Rust looks
+# very different from one that is not, and only a second Rust implementation
+# distinguishes them.
+ruzstd = "0.7"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 zalt-neon.workspace = true

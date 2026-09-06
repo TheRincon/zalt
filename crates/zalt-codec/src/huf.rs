@@ -36,10 +36,28 @@ struct Entry {
     nb_bits: u8,
 }
 
+/// Two symbols decoded from one table lookup.
+///
+/// RE-TEST (§5 item #5, §10 sixth pass). For a `table_log`-bit window `w`, the
+/// first symbol is the single-symbol entry; the second is real exactly when
+/// `a.nb_bits + b.nb_bits <= table_log`, because only then are the bits it
+/// consumes all present in the window rather than implied zeroes. That
+/// condition is both the pairing rule and its validity test.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Pair {
+    sym0: u8,
+    sym1: u8,
+    /// 1 or 2 — how many of the symbols above are real.
+    count: u8,
+    /// Bits consumed by the symbols this pair actually emits.
+    nb_bits: u8,
+}
+
 /// A Huffman decoding table for literals.
 #[derive(Debug, Clone, Default)]
 pub struct Table {
     entries: Vec<Entry>,
+    pairs: Vec<Pair>,
     table_log: u32,
 }
 
@@ -209,6 +227,36 @@ impl Table {
             rank_start[w as usize] += span as u32;
         }
 
+        // Derive the paired table. This is the cost §10 predicted would sink
+        // the idea: `1 << table_log` iterations per table build, which for a
+        // small document lands on the workload least able to afford per-frame
+        // work.
+        if self.pairs.len() < table_size {
+            self.pairs.resize(table_size, Pair::default());
+        }
+        let mask = table_size - 1;
+        for w in 0..table_size {
+            let a = self.entries[w];
+            let mut pair = Pair {
+                sym0: a.symbol,
+                sym1: 0,
+                count: 1,
+                nb_bits: a.nb_bits,
+            };
+            if u32::from(a.nb_bits) < table_log {
+                // The window after consuming `a`, refilled with zeroes. Those
+                // zeroes are only harmless if `b`'s code fits in the bits that
+                // are genuinely present, which is the test below.
+                let b = self.entries[(w << a.nb_bits) & mask];
+                if u32::from(a.nb_bits) + u32::from(b.nb_bits) <= table_log {
+                    pair.sym1 = b.symbol;
+                    pair.count = 2;
+                    pair.nb_bits = a.nb_bits + b.nb_bits;
+                }
+            }
+            self.pairs[w] = pair;
+        }
+
         self.table_log = table_log;
         Ok(())
     }
@@ -350,11 +398,27 @@ impl Table {
         let entries = self.entries.get(..size).ok_or(Error::Malformed)?;
         let mask = size - 1;
 
+        let pairs = self.pairs.get(..size).ok_or(Error::Malformed)?;
+
         macro_rules! step {
             ($bits:expr, $dst:expr, $i:expr) => {{
                 let entry = entries[$bits.peek(log) as usize & mask];
                 $dst[$i] = entry.symbol;
                 $bits.skip(u32::from(entry.nb_bits));
+            }};
+        }
+
+        // Two symbols per lookup. Only run where two will fit: a pair whose
+        // second symbol has nowhere to go cannot be split, because the entry
+        // records the *combined* bit count and skipping it would consume bits
+        // belonging to a symbol never written.
+        macro_rules! step2 {
+            ($bits:expr, $dst:expr, $c:expr) => {{
+                let pair = pairs[$bits.peek(log) as usize & mask];
+                $dst[$c] = pair.sym0;
+                $dst[$c + 1] = pair.sym1;
+                $bits.skip(u32::from(pair.nb_bits));
+                $c += usize::from(pair.count);
             }};
         }
 
@@ -366,20 +430,36 @@ impl Table {
         // such chains at once, and Firestorm is ~8-wide with a deep reorder
         // buffer — it rewards exposing independent work far more than it
         // rewards vectorising a serial loop. No SIMD is involved.
-        for i in 0..last {
-            step!(b0, d0, i);
-            step!(b1, d1, i);
-            step!(b2, d2, i);
-            step!(b3, d3, i);
+        // Four independent cursors, because streams emitting one or two
+        // symbols per step no longer advance together. §10 predicted this is
+        // what pairing costs: the shared index that made the interleave free
+        // becomes four cursors and four bounds tests.
+        let (mut c0, mut c1, mut c2, mut c3) = (0usize, 0usize, 0usize, 0usize);
+
+        while c0 + 2 <= segment && c1 + 2 <= segment && c2 + 2 <= segment && c3 + 2 <= last {
+            step2!(b0, d0, c0);
+            step2!(b1, d1, c1);
+            step2!(b2, d2, c2);
+            step2!(b3, d3, c3);
         }
 
-        // The fourth segment is the short one — `regenerated` need not divide
-        // by four — so the first three finish alone.
-        for i in last..segment {
-            step!(b0, d0, i);
-            step!(b1, d1, i);
-            step!(b2, d2, i);
+        // Each stream finishes alone: pairs while two still fit, then the
+        // single-symbol table for the last byte.
+        macro_rules! finish {
+            ($bits:expr, $dst:expr, $c:expr, $limit:expr) => {{
+                while $c + 2 <= $limit {
+                    step2!($bits, $dst, $c);
+                }
+                while $c < $limit {
+                    step!($bits, $dst, $c);
+                    $c += 1;
+                }
+            }};
         }
+        finish!(b0, d0, c0, segment);
+        finish!(b1, d1, c1, segment);
+        finish!(b2, d2, c2, segment);
+        finish!(b3, d3, c3, last);
 
         // Checked once per stream rather than once per symbol: reading past the
         // end yields zero bits rather than failing, so an overrunning stream

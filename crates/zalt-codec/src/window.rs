@@ -229,8 +229,24 @@ impl Window {
         if !self.is_full() {
             let take = (self.capacity - self.buf.len()).min(remaining);
             let pos = self.buf.len();
-            self.buf.resize(pos + take, 0);
-            lz::copy_match::<B>(&mut self.buf, pos, offset, take, 0)?;
+            // RE-TEST (§10): `extend_from_within` doubling instead of
+            // `resize(.., 0)` + kernel copy, so no byte is written twice.
+            if offset == 0 || offset > pos {
+                return Err(Error::OffsetTooLarge {
+                    offset: offset as u64,
+                    available: pos as u64,
+                });
+            }
+            let start = pos - offset;
+            let mut left = take;
+            while left > 0 {
+                // Source grows as we append, so this is the periodic extension:
+                // each round may copy from bytes this same match just wrote.
+                let avail = self.buf.len() - start;
+                let chunk = left.min(avail);
+                self.buf.extend_from_within(start..start + chunk);
+                left -= chunk;
+            }
             self.pos = if self.is_full() { 0 } else { self.buf.len() };
             remaining -= take;
             if remaining == 0 {

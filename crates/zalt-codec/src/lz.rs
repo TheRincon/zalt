@@ -118,4 +118,68 @@ mod tests {
             Err(Error::TooLarge)
         ));
     }
+
+    /// The dictionary rejection, which no other test reaches.
+    ///
+    /// Both callers pass `dict_size == 0`, so `available == pos` and the first
+    /// bound catches everything — this branch is unreachable in the shipped
+    /// decoder and coverage correctly showed it as dead. It stops being dead
+    /// the moment M4 loads a dictionary, and what it must do then is refuse
+    /// rather than quietly copy the wrong bytes, so the behaviour is worth
+    /// pinning now rather than discovering later.
+    #[test]
+    fn an_offset_reaching_into_a_dictionary_is_refused_until_m4() {
+        let mut buf = [0u8; 64];
+        // Sixteen bytes of history, a dictionary notionally behind it, and an
+        // offset that reaches past the history into that dictionary.
+        assert!(matches!(
+            copy_match::<Scalar>(&mut buf, 16, 20, 4, 32),
+            Err(Error::OffsetTooLarge {
+                offset: 20,
+                available: 16
+            })
+        ));
+        // Past the dictionary's start as well: the outer bound, already tested
+        // elsewhere, still applies and reports the larger availability.
+        assert!(matches!(
+            copy_match::<Scalar>(&mut buf, 16, 100, 4, 32),
+            Err(Error::OffsetTooLarge {
+                offset: 100,
+                available: 48
+            })
+        ));
+    }
+
+    /// `copy_literals` is public and, at present, called by nothing.
+    ///
+    /// `Window::write_all` reaches `Backend::copy_literals` directly and takes
+    /// its bounds safety from slicing, so this wrapper — which exists to
+    /// validate before dispatching — had no caller and no test. Untested public
+    /// API on the security boundary is worse than unused public API: a
+    /// downstream user of this crate can call it, and nothing said whether its
+    /// bound holds.
+    #[test]
+    fn copy_literals_validates_its_bound() {
+        let mut buf = [0u8; 8];
+        assert!(copy_literals::<Scalar>(&mut buf, 2, &[1, 2, 3]).is_ok());
+        assert_eq!(&buf[2..5], &[1, 2, 3]);
+
+        // Exactly filling the buffer is legal.
+        let mut buf = [0u8; 4];
+        assert!(copy_literals::<Scalar>(&mut buf, 0, &[9, 9, 9, 9]).is_ok());
+
+        // One past the end is not.
+        let mut buf = [0u8; 4];
+        assert!(matches!(
+            copy_literals::<Scalar>(&mut buf, 2, &[1, 2, 3]),
+            Err(Error::TooLarge)
+        ));
+
+        // And the offset arithmetic cannot be made to wrap.
+        let mut buf = [0u8; 4];
+        assert!(matches!(
+            copy_literals::<Scalar>(&mut buf, usize::MAX, &[1]),
+            Err(Error::TooLarge)
+        ));
+    }
 }

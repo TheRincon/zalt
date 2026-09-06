@@ -707,6 +707,174 @@ _fixtures:
     [ -n "$(ls -A "$root/generated" 2>/dev/null)" ] && exit 0
     just zstd-fixtures
 
+# Build facebook/zstd's own valid-frame generator and decode what it emits.
+#
+#   just decodecorpus           # 200 frames
+#   just decodecorpus 1000 42   # count, seed
+#
+# # Why this reaches frames nothing else does
+#
+# `roundtrip_valid` fuzzes by handing bytes to libzstd's *encoder*, so it can
+# only ever produce encodings libzstd chooses to emit. Large parts of the legal
+# format are unreachable that way — §9 notices the symptom without naming it,
+# calling `rle-first-block` "a block type encoders almost never emit" and
+# keeping exactly one example of it by hand.
+#
+# `decodecorpus` generates random *valid* frames across the legal space on
+# purpose: every literals mode, every block type, unusual window sizes, the
+# offset-code paths an optimising encoder never picks. Each frame is checkable
+# against libzstd, so a disagreement is unambiguous.
+#
+# # Why it has to be fetched
+#
+# `zstd-fixtures/decodecorpus.c` is vendored, but it `#include`s zstd's internal
+# headers and `compress/zstd_compress.c` outright, so it only builds inside the
+# zstd source tree. The vendored copy has therefore never compiled here — it is
+# the source to read, not to build. This fetches the tree at the version the
+# reference binary reports, so the generator matches the oracle.
+[doc("Generate valid frames with zstd's decodecorpus and decode them all.")]
+decodecorpus COUNT="200" SEED="0":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    ver=$({{zstd}} --version 2>/dev/null | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+    [ -n "$ver" ] || { echo "no reference zstd on PATH" >&2; exit 1; }
+    src="target/zstd-$ver"
+    gen="$src/tests/decodecorpus"
+    if [ ! -x "$gen" ]; then
+        if [ ! -d "$src" ]; then
+            echo "fetching zstd $ver source (needed to build decodecorpus)..."
+            mkdir -p target
+            url="https://github.com/facebook/zstd/archive/refs/tags/v$ver.tar.gz"
+            curl -sSfL "$url" | tar -xz -C target || {
+                echo "fetch failed — needs network. Source would go in $src" >&2
+                exit 1; }
+        fi
+        echo "building decodecorpus..."
+        make -C "$src/tests" decodecorpus >/dev/null 2>&1 || {
+            echo "build failed; try: make -C $src/tests decodecorpus" >&2; exit 1; }
+    fi
+    out=target/decodecorpus
+    rm -rf "$out"; mkdir -p "$out/frames" "$out/orig"
+    # `-o` is not optional. Without it the generator writes frames and no
+    # expected output, and a comparison guarded on the expected file existing
+    # then silently checks nothing — which is how the first version of this
+    # recipe reported "2500 frames match the reference" having compared none of
+    # them. A missing expected file is a failure here, not a skip.
+    "$gen" -p"$out/frames/" -o"$out/orig/" -n{{COUNT}} -s{{SEED}} >/dev/null 2>&1 || {
+        echo "generator failed" >&2; exit 1; }
+    n=$(ls "$out"/frames/*.zst 2>/dev/null | wc -l | tr -d ' ')
+    echo "generated $n frames in $out/frames"
+    [ "$n" -gt 0 ] || exit 1
+    cargo build --release -q -p zalt-cli
+    fail=0
+    checked=0
+    for f in "$out"/frames/*.zst; do
+        base=$(basename "${f%.zst}")
+        exp="$out/orig/$base"
+        if [ ! -f "$exp" ]; then
+            echo "NO EXPECTED OUTPUT for $base — comparison would be vacuous"
+            fail=1; continue
+        fi
+        if ! ./target/release/zalt d -q -c --trusted "$f" > "$f.out" 2>/dev/null; then
+            echo "REFUSED: $base"; fail=1; continue
+        fi
+        if ! cmp -s "$f.out" "$exp"; then
+            echo "MISMATCH: $base"; fail=1; continue
+        fi
+        checked=$((checked+1))
+    done
+    echo "$checked/$n frames decoded byte-exactly against the reference"
+    [ "$checked" -eq "$n" ] || exit 1
+    exit $fail
+
+# Mutation testing: does the suite actually *notice* a bug?
+#
+#   just mutants                       # the whole codec (slow)
+#   just mutants crates/zalt-codec/src/fse.rs
+#
+# Coverage answers "was this line run". Mutation testing answers the question
+# that matters — "if this line were wrong, would anything fail?" — by changing
+# the code and checking a test goes red.
+#
+# It targets this project's actual failure history exactly. The `ML_DEFAULT`
+# distribution was a *wrong constant that still summed to 64*, so the table
+# built, every internal consistency check passed, and only a checksum
+# eventually objected. A mutant that changes a constant and sees the suite stay
+# green is that bug, reported before it is written.
+#
+# Slow by nature: each mutant is a rebuild and a test run. Scope it to one file
+# while iterating; run the codec overnight.
+[doc("Mutation testing over zalt-codec — do the tests catch injected bugs?")]
+mutants FILE="":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    command -v cargo-mutants >/dev/null 2>&1 || {
+        echo "cargo-mutants is not installed:  cargo install cargo-mutants --locked" >&2
+        exit 1; }
+    just _fixtures
+    args=(--package zalt-codec --no-shuffle --timeout 120)
+    # `just t` is the inner loop; running the release suite per mutant would
+    # multiply an already slow process by the cost of LTO.
+    if [ -n "{{FILE}}" ]; then
+        args+=(--file "{{FILE}}")
+    fi
+    cargo mutants "${args[@]}"
+
+# Line and region coverage over the whole workspace.
+#
+#   just coverage            # summary table
+#   just coverage html       # browsable report
+#
+# This exists because of a specific failure §10 records. The entire fixture set
+# used `FSE_Compressed` mode, so the *predefined* FSE tables were never
+# exercised by a single test — a whole code path unverified, and nothing said
+# so. The `ML_DEFAULT` bug lived there, it summed to 64 like the correct table,
+# every internal consistency check passed, and only a checksum objected.
+#
+# Coverage would have printed that path as dark on day one. It answers "which
+# tests should we write" with evidence rather than intuition, which is the
+# lesson the rest of this file keeps learning the expensive way.
+#
+# Needs `cargo-llvm-cov`; degrades to instructions rather than failing.
+[doc("Line and region coverage over the workspace.")]
+coverage MODE="summary":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+        echo "cargo-llvm-cov is not installed." >&2
+        echo "  cargo install cargo-llvm-cov --locked" >&2
+        echo "  rustup component add llvm-tools-preview" >&2
+        exit 1
+    fi
+    just _fixtures
+    case "{{MODE}}" in
+        html)
+            cargo llvm-cov --workspace --html
+            echo "report: target/llvm-cov/html/index.html"
+            ;;
+        lcov)
+            cargo llvm-cov --workspace --lcov --output-path target/lcov.info
+            echo "wrote target/lcov.info"
+            ;;
+        *)
+            cargo llvm-cov --workspace
+            ;;
+    esac
+
+# The parts of the codec that no test reaches, worst first.
+#
+# The summary is per file; this is the question actually worth asking, because
+# an 85%-covered file can still have an entire mode unexercised.
+[doc("Least-covered regions in zalt-codec, worst first.")]
+coverage-gaps:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    command -v cargo-llvm-cov >/dev/null 2>&1 || {
+        echo "cargo-llvm-cov is not installed; see 'just coverage'" >&2; exit 1; }
+    just _fixtures
+    cargo llvm-cov --workspace --json --output-path target/cov.json >/dev/null
+    python3 ci/coverage-gaps.py target/cov.json
+
 # Seed the fuzz corpora from the fixtures and the reference corpus.
 [doc("Seed fuzz corpora from fixtures and the reference corpus.")]
 fuzz-seed:
