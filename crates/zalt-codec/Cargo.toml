@@ -9,5 +9,18 @@ repository.workspace = true
 
 [dependencies]
 
+[dev-dependencies]
+# Property tests. `proptest` checks stated invariants on every `just t`, where
+# the fuzz targets check them for hours on demand — different cadence, same
+# properties, and these are the ones written down in the repo.
+proptest = "1"
+# An independent third-party zstd decoder, used as a *second* oracle.
+#
+# libzstd has been the only reference, so a shared misreading of RFC 8878 would
+# be invisible to every test here. An implementation written separately from
+# both is the cheapest defence against that, and disagreement is a strong signal
+# precisely because nothing is shared but the spec.
+ruzstd = "0.7"
+
 [features]
 default = []

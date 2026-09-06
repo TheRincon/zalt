@@ -668,6 +668,55 @@ found on `PATH`, with `ZSTD=` still overriding.
 a decoder is permissive enough; nothing in them detects a decoder that is *too*
 permissive. It found a real gap on first run — see below.
 
+### Generated valid frames — `decodecorpus`
+
+`just decodecorpus [count] [seed]`.
+
+The fuzz targets have a blind spot that is easy to miss: `roundtrip_valid`
+compresses the fuzzer's bytes with **libzstd's encoder**, so it can only ever
+reach encodings libzstd *chooses to emit*. An optimising encoder never produces
+most of the legal format. This section already noticed the symptom without
+naming the cause — `rle-first-block` is described as "a block type encoders
+almost never emit", and exactly one example is kept by hand.
+
+`decodecorpus` is facebook/zstd's generator of random **valid** frames, and it
+walks the legal space deliberately: every literals mode, every block type,
+unusual window sizes, offset-code paths no encoder picks. Each frame comes with
+its expected output, so a disagreement is unambiguous rather than a judgement
+call.
+
+**The vendored copy never compiled.** `zstd-fixtures/decodecorpus.c` has been in
+the tree unreferenced, and it cannot build there: it includes zstd's internal
+headers and `compress/zstd_compress.c` outright, so it only builds inside the
+zstd source tree. The recipe fetches that tree at the version the reference
+binary reports — so the generator always matches the oracle — and builds it in
+`target/`.
+
+**Result: 4,500 frames across three seeds decode byte-exactly.** No
+disagreement with the reference.
+
+#### The first version of this recipe tested nothing
+
+Worth recording, because it is the exact failure this section exists to guard
+against and it was self-inflicted. `decodecorpus` writes expected output only
+when given `-o`; without it there are frames and nothing to compare them to.
+The comparison was written as
+
+```sh
+if [ -f "$exp" ] && ! cmp -s "$f.zalt" "$exp"; then ...
+```
+
+so when `$exp` did not exist the check was skipped **silently**, and the recipe
+reported "all 2500 frames decode and match the reference" having compared none
+of them. It had verified only that decoding returned success — which for a
+decoder is the weakest property there is, and precisely the one §9 warns
+round-trip testing already over-supplies.
+
+A missing expected file is now a failure, and the recipe prints how many frames
+it actually compared rather than how many it generated. **A guard that skips a
+check on absent data turns a test into a formality**, and it reads as
+defensiveness while doing the opposite.
+
 ### Fuzzing
 
 Five targets in `fuzz/`, seeded from both fixture sets by `just fuzz-seed`.
@@ -701,6 +750,62 @@ survives:
 
 The unconditional output check lives in `roundtrip_valid`, where frames are
 valid by construction and none of that reasoning is needed.
+
+### Four checks that ask different questions
+
+Added together, and worth separating because each answers something the others
+cannot.
+
+| tool | question | answer here |
+|---|---|---|
+| `just coverage` | was this line *run*? | wired; needs `cargo-llvm-cov` |
+| `just mutants` | if this line were *wrong*, would anything fail? | 49/50 caught on `xxh64.rs` |
+| `tests/properties.rs` | do the stated invariants hold on generated input? | 7 properties, in `just t` |
+| `tests/third_oracle.rs` | do *two independent readings of the RFC* agree? | 403 frames, no disagreement |
+
+**Coverage** exists because §10 records the failure it would have caught: the
+entire fixture set used `FSE_Compressed` mode, so the predefined FSE tables were
+never exercised by any test, and the `ML_DEFAULT` bug lived in that gap. A dark
+region in a report is the cheap version of "what should we test next".
+
+**Mutation testing** goes further, and is the better fit for this codebase.
+Coverage would have shown the predefined-table path as *covered* once any test
+touched it; mutation testing asks whether changing it makes a test fail. The
+`ML_DEFAULT` bug was a wrong constant that still summed to 64 — precisely a
+mutant that survives. Its first run found 1 missed mutant of 50 in `xxh64.rs`:
+`buf_len > 0` → `buf_len >= 0`. That one turns out to be **equivalent** —
+entering the partial-stripe branch with an empty buffer either returns early
+having stored the same bytes, or consumes the same stripe, so no output differs
+and no test can catch it. What the guard actually protects is the extra copy
+this module's own comment says was removed to halve the checksum's memory
+traffic: a *performance* property, which mutation testing cannot see. Equivalent
+mutants are the technique's known false-positive mode and this is a textbook
+one.
+
+**Property tests** overlap the fuzz targets deliberately. The difference is
+cadence and visibility: `cargo fuzz` runs for hours on demand, this runs in
+milliseconds on every `just t`, and the properties are *written down in the
+repository* rather than living in a campaign someone has to remember to start.
+The one worth naming checks the argument `DecodeTable::entry_masked` relies on
+to skip its bounds check — that a table which passed validation can only produce
+in-range states. That argument was a comment; now it is checked.
+
+**The third oracle** closes a gap nothing else could. Every other check here
+ultimately asks libzstd, so a *shared misreading* of RFC 8878 would be invisible.
+`ruzstd` is a pure-Rust decoder sharing no code with either; the only thing all
+three have in common is the specification, so agreement is evidence about the
+spec rather than about the reference.
+
+Its asymmetry differs from §9's and is weaker. "zalt accepts what libzstd
+rejects" is always a bug; that does not transfer, because `ruzstd` is neither
+the reference nor a subset of it. The only sound assertion is conditional — **if
+`ruzstd` decodes a frame, zalt must decode it to the same bytes** — and a frame
+it declines says nothing either way.
+
+It also had to be pointed at real material. Against the golden corpus alone it
+compared **three frames**, which is ceremony rather than testing; wired to the
+`decodecorpus` output it compares 400, and prints the count so that a version
+comparing nothing cannot pass quietly.
 
 ### Other layers
 
@@ -1061,7 +1166,8 @@ the host the allocator seam was built for, and it currently cannot reach it.
       too — see §5.)
 - [x] `backend_equivalence` fuzzing clean — 26,916 runs under ASan.
 - [~] `zalt-darwin` — profiling does not justify it; M2's pool captures the
-      memory cost portably. Not built.
+      memory cost portably. Not built. **Re-checked in the sixteenth pass
+      against the current decoder: still zero.**
 
 **Where it stands.** Figures below were taken on a **busy** machine and are
 lower bounds, *except* the standing-numbers table, which was re-taken on a quiet
@@ -1951,6 +2057,113 @@ that runs, not the code that caused it to run.** `memset` is called from
 everywhere, and three of four guesses about which caller were wrong. Attribution
 by inference has now cost more than it has returned; the next attempt should
 find the call site rather than reason about which one it must be.
+
+#### Sixteenth pass: re-testing the reverted changes, and the first reversal
+
+The verdicts in this section were taken on a machine now known to swing 55%
+with no code involved, and against raw MB/s rather than a ratio. Each is being
+re-run under the current regime: two binaries alternating, **zstd measured in
+the same window as the oracle**, `ruzstd` alongside for context, and the canary
+bracketing the run.
+
+**`extend_from_within` instead of the window zero-fill — reversed.**
+
+| corpus | gap before | gap after | rounds won |
+|---|---:|---:|---|
+| real `.zdoc` | 2.61x | **2.46x** | 6 of 6 |
+| 61 MB corpus | 2.60x | **2.53x** | 4 of 4 |
+
+Recorded here as **5% slower** (133 against 140 MB/s). It now closes the gap by
+about 6% on the target workload, with the distributions not overlapping and the
+canary drifting 0.6%.
+
+The original number was not wrong when it was taken; it **expired**. The
+zero-fill was a small share of a slow decoder, and the eleventh and fourteenth
+passes made the decoder around it much faster — inlining the window operations
+into the executor and the bit reader into its callers. A cost that was 5% of the
+work becomes a different proposition when the rest of the work halves. *Every
+reverted change in this section was measured against a decoder that no longer
+exists.*
+
+**It also closes the open question from the fifteenth pass.** `_platform_memset`
+fell from **547 samples to 62**. That is the ~6% which survived three attempts
+aimed at the FSE entry array, the Huffman `Vec`, and the FSE build scratch —
+none of which was the cause. It was `Window::copy_match`'s `resize(pos + take,
+0)`, zero-filling bytes it overwrites on the next line, once per match; and
+because a frame smaller than its window never leaves that path, on a real
+`.zdoc` that is *every match in the document*. The fifteenth pass named this
+candidate and did not test it, having spent its credibility on three guesses
+already.
+
+**`zalt-darwin` re-checked, and the answer has not moved.**
+
+The crate was struck on the grounds that no OS or allocator symbol appeared in
+either profile. The decoder has roughly doubled in speed since, which raises
+every fixed cost's share, so the claim was worth re-testing rather than
+inheriting.
+
+| | real `.zdoc` | 61 MB corpus |
+|---|---:|---:|
+| allocator | 2.66% | 0.00% |
+| virtual memory (`mach_vm`, `madvise`, `mmap`) | **0.00%** | **0.00%** |
+| dispatch / threads | **0.00%** | **0.00%** |
+
+All three of the crate's premises are absent. The only OS cost is 2.66% of the
+allocator on small documents, and that is the case M2's `Recycler` and
+`DecoderPool` already answer *portably* — which §10 argued is a better outcome
+than a `mach_vm` dependency, and remains one.
+
+One caveat stated rather than buried: this profiles the `sink` path, a reused
+decoder that allocates nothing per frame, because that is the deployed shape.
+§8's push model — many small resources decoded concurrently — would exercise
+allocation harder than any of this shows. That is an argument for measuring the
+pool under concurrency, not for a Darwin VM layer.
+
+*(A false start worth recording: the first attempt attributed 35% to the OS,
+because the symbol filter matched "kernel" and `zalt::kernels` is the
+accelerated copy module. The figure was nonsense and looked entirely
+plausible.)*
+
+**The rest of the re-runs so far.**
+
+| change | recorded verdict | re-tested verdict |
+|---|---|---|
+| `extend_from_within` for the window zero-fill | 5% slower | **reversed** — gap 2.61x → 2.46x |
+| Flatten LL/ML code tables | 9% slower | **confirmed slower**, but only ~1% (gap 2.46x → 2.49x) |
+| Match-source prefetch | 3.5% slower | **confirmed no gain** — gap ~2.50x vs ~2.53x, 3 rounds each way |
+| Fuse sequence decode with execution | ~4% slower | **confirmed**, and worse: 6.4% (twelfth pass) |
+| Hoist the xxh64 accumulators | no change | **not measurable** — see below |
+
+Two of these are worth a note beyond the verdict.
+
+**The flattened code tables lost by 1%, not 9%.** The direction held, so the
+original decision stands and the range `match` stays. But an 9x shrink in the
+margin is itself information: the low codes resolving in a compare with no
+memory access mattered far more when the loop around them was slower. A verdict
+recorded as decisive is now marginal, and would flip if the surrounding code
+changed again.
+
+**The prefetch re-test agrees with the reference's own profile.** §5 struck it
+on the argument that a 2 MiB window sits inside the M1's 12 MiB shared L2, so
+the load is already fast and the hint only adds instructions. The tenth pass
+then found `ZSTD_decompressSequencesLong` — libzstd's *prefetching* variant — at
+25 samples of 9182. Three independent lines now agree, which is as settled as
+anything in this section gets. Note the implementation had to reach `prfm`
+through `asm!`: `core::arch::aarch64::_prefetch` is still unstable, and §2 pins
+stable deliberately.
+
+**The xxh64 accumulator hoist cannot be re-tested on this corpus**, and saying
+so is the honest result. The corpus is built with `--no-check` since the twelfth
+pass, because that is what the library emits and therefore what the wire
+carries — so the checksum never runs and the measurement would be of nothing at
+all. Re-testing it needs a checksummed corpus built for the purpose, and the
+original figure was "no change" measured against a decoder where the optimiser
+was already promoting the accumulators out of `&mut self`.
+
+For context, the third column is now measured in the same runs: zalt against
+`ruzstd`, the independent Rust decoder, is **1.26x faster on `.zdoc` and 1.4x on
+the code corpus** — while sitting 2.5x from the C reference. That is the number
+that says how much of the remaining gap is "safe Rust" and how much is ours.
 
 #### Never quote a raw MB/s — quote the gap
 
