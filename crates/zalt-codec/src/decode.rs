@@ -172,6 +172,8 @@ pub struct Decoder<B: Backend = Scalar> {
     tables: Tables,
     /// Repeat offsets, carried across blocks within a frame.
     repeats: [u32; REP_COUNT],
+    /// Dictionary to decode with, if the host has loaded one.
+    dictionary: Option<crate::dict::Dictionary>,
     /// Bounded match history. Owning this is what lets a caller drain and
     /// discard output instead of holding an entire frame.
     window: Window,
@@ -201,6 +203,7 @@ impl<B: Backend> Decoder<B> {
             huffman: huf::Table::default(),
             tables: Tables::default(),
             repeats: REP_INITIAL,
+            dictionary: None,
             window: Window::new(0),
             backend: core::marker::PhantomData,
         }
@@ -233,6 +236,61 @@ impl<B: Backend> Decoder<B> {
         self.huffman.invalidate();
         self.tables.invalidate();
         self.repeats = REP_INITIAL;
+    }
+
+    /// Decode subsequent frames with this dictionary.
+    ///
+    /// Takes effect at the next frame boundary, not mid-frame: a dictionary
+    /// seeds history and entropy tables, both of which are frame-scoped, and
+    /// swapping either underneath a frame in progress would decode the rest of
+    /// it against state its first block never saw.
+    ///
+    /// The dictionary is not consulted unless a frame's `Dictionary_ID` matches
+    /// it or the frame names none. Silently decoding a frame against the wrong
+    /// dictionary is the one failure mode the ID exists to prevent.
+    pub fn load_dictionary(&mut self, dictionary: crate::dict::Dictionary) {
+        self.dictionary = Some(dictionary);
+    }
+
+    /// Forget any loaded dictionary, from the next frame onwards.
+    pub fn clear_dictionary(&mut self) {
+        self.dictionary = None;
+    }
+
+    /// The loaded dictionary's ID, if one is loaded.
+    pub fn dictionary_id(&self) -> Option<u32> {
+        self.dictionary.as_ref().map(|d| d.id())
+    }
+
+    /// Seed a frame from the loaded dictionary.
+    ///
+    /// Called once per frame, after `reset_frame_state` has cleared what the
+    /// previous frame left. Order matters: the reset invalidates the entropy
+    /// tables, so seeding has to follow it or the dictionary's tables are
+    /// thrown away immediately.
+    fn apply_dictionary(&mut self) {
+        let Some(dict) = self.dictionary.as_ref() else {
+            return;
+        };
+
+        self.window.set_dictionary(dict.content());
+
+        let Some(entropy) = dict.entropy() else {
+            // A raw-content dictionary is history and nothing else.
+            return;
+        };
+
+        // Cloned rather than borrowed. The tables are frame state and a block
+        // may overwrite any of them with a new description; the dictionary has
+        // to survive intact for the next frame. This is the per-frame cost the
+        // thirteenth pass removed from the *block* path, paid back once here —
+        // and it buys skipping table construction for the frame's first block,
+        // which §10 measures at ~18% of a small document's decode.
+        self.huffman = entropy.literals.clone();
+        self.tables.literals_length = entropy.literal_lengths.clone();
+        self.tables.offset = entropy.offsets.clone();
+        self.tables.match_length = entropy.match_lengths.clone();
+        self.repeats = entropy.repeats;
     }
 
     /// Bytes of output produced for the frame in progress.
@@ -364,8 +422,14 @@ impl<B: Backend> Decoder<B> {
                         FrameHeader::parse(descriptor, &self.scratch.buf[..need], &self.limits)?;
                     self.scratch.clear();
 
+                    // A frame naming a dictionary can only be decoded with
+                    // that dictionary. Decoding it against a different one, or
+                    // none, produces plausible output from the wrong history —
+                    // which is precisely what the ID is in the format to stop.
                     if let Some(id) = header.dictionary_id {
-                        return Err(Error::DictionaryRequired { id });
+                        if self.dictionary.as_ref().map(|d| d.id()) != Some(id) {
+                            return Err(Error::DictionaryRequired { id });
+                        }
                     }
 
                     // Arm the window at the declared ceiling. Nothing is
@@ -380,6 +444,7 @@ impl<B: Backend> Decoder<B> {
                     self.hasher = Xxh64::new(0);
                     self.decoded = 0;
                     self.reset_frame_state();
+                    self.apply_dictionary();
                     self.state = State::BlockHeader;
                 }
 
@@ -598,10 +663,16 @@ impl<B: Backend> Decoder<B> {
             // window enforces its own retained history too, but checking the
             // frame's declared size here distinguishes "beyond what this frame
             // may address" from "beyond what we happen to still hold".
-            if u64::from(seq.offset) > frame.window_size {
+            // Plus whatever of the dictionary is still reachable. RFC 8878 §5
+            // permits a sequence to name "parts of the dictionary with offsets
+            // larger than `Window_Size`" until the frame's output passes that
+            // size, so a bound of `window_size` alone refuses legal frames —
+            // which it did, on the first reference-compressed frame tried.
+            let addressable = frame.window_size + self.window.dict_reach() as u64;
+            if u64::from(seq.offset) > addressable {
                 return Err(Error::OffsetTooLarge {
                     offset: u64::from(seq.offset),
-                    available: frame.window_size,
+                    available: addressable,
                 });
             }
             produced += u64::from(seq.match_length);

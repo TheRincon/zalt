@@ -32,6 +32,7 @@ pub mod backend;
 pub mod bits;
 pub mod block;
 pub mod decode;
+pub mod dict;
 pub mod error;
 pub mod frame;
 pub mod fse;
