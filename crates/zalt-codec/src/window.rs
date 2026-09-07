@@ -47,6 +47,16 @@ use crate::lz;
 #[derive(Debug, Clone, Default)]
 pub struct Window {
     buf: Vec<u8>,
+    /// Dictionary content, addressable *before* this frame's own output.
+    ///
+    /// Kept separate rather than prepended into `buf`, because the two obey
+    /// different rules. A dictionary may be larger than the window and may be
+    /// referenced at offsets larger than `Window_Size` — but only until the
+    /// frame's own output reaches `Window_Size`, after which it is gone.
+    /// Prepending it would either truncate a legal reach (if the dictionary is
+    /// larger than the window) or keep it addressable long after the format
+    /// says it is not.
+    dict: Vec<u8>,
     capacity: usize,
     /// Write cursor. Meaningful only once `buf.len() == capacity`; before that
     /// it tracks `buf.len()`.
@@ -61,6 +71,7 @@ impl Window {
     pub fn new(capacity: usize) -> Self {
         Self {
             buf: Vec::new(),
+            dict: Vec::new(),
             // A zero-capacity window would make the wrap arithmetic divide by
             // zero. Frames declaring no window produce no matches, so one byte
             // of slack costs nothing and removes a special case.
@@ -77,6 +88,7 @@ impl Window {
     /// similar window costs no allocation at all.
     pub fn reset(&mut self, capacity: usize) {
         self.buf.clear();
+        self.dict.clear();
         self.capacity = capacity.max(1);
         self.pos = 0;
         self.total = 0;
@@ -85,6 +97,41 @@ impl Window {
     /// Ceiling on retained history.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Install dictionary content as history in front of this frame.
+    ///
+    /// Call after [`Window::reset`], before any output.
+    pub fn set_dictionary(&mut self, content: &[u8]) {
+        self.dict.clear();
+        self.dict.extend_from_slice(content);
+    }
+
+    /// Dictionary bytes a match may still reach.
+    ///
+    /// RFC 8878 §5: the dictionary is addressable "as long as the amount of
+    /// data decoded from this frame is less than or equal to `Window_Size`",
+    /// and unreachable afterwards. The ring expresses that exactly: it is still
+    /// growing precisely while the frame has produced less than a window's
+    /// worth, so a full buffer *is* the moment the dictionary drops out.
+    ///
+    /// The consequence is worth stating, because it is a rule a decoder can
+    /// only get wrong in one of two directions: forgetting it accepts matches
+    /// the reference refuses, and applying it too early refuses frames the
+    /// reference accepts.
+    #[inline]
+    pub fn dict_reach(&self) -> usize {
+        // `total > capacity`, not `is_full()`. The rule is written "less than
+        // or equal to `Window_Size`", so at exactly a window's worth of output
+        // the dictionary is still reachable — and `is_full()` is already true
+        // one byte before that. Not hypothetical: a reference-compressed frame
+        // reaches 1320 bytes back at exactly this boundary, and the stricter
+        // reading refuses it.
+        if self.total > self.capacity as u64 {
+            0
+        } else {
+            self.dict.len()
+        }
     }
 
     /// Bytes of history currently addressable by a match.
@@ -211,14 +258,38 @@ impl Window {
     /// `offset`-periodic extension of the preceding bytes, not a `memmove`.
     #[inline(always)]
     pub fn copy_match<B: Backend>(&mut self, offset: usize, len: usize) -> Result<()> {
-        if offset == 0 || offset > self.buf.len() {
+        let reach = self.dict_reach();
+        if offset == 0 || offset > self.buf.len() + reach {
             return Err(Error::OffsetTooLarge {
                 offset: offset as u64,
-                available: self.buf.len() as u64,
+                available: (self.buf.len() + reach) as u64,
             });
         }
         if len == 0 {
             return Ok(());
+        }
+
+        // Reaching past this frame's own output and into the dictionary.
+        //
+        // Treat history as the concatenation `dict ++ output`: an offset beyond
+        // `output` starts that many bytes from the end of `dict`. The dictionary
+        // is a separate buffer, so this part cannot overlap the destination and
+        // is a plain append; whatever the match still needs after the dictionary
+        // runs out continues from `output[0]`, which by then is exactly
+        // `buf.len()` bytes behind the cursor — an ordinary in-window match.
+        if offset > self.buf.len() {
+            let behind = offset - self.buf.len();
+            let start = self.dict.len() - behind;
+            let take = behind.min(len);
+            let from_dict = self.dict[start..start + take].to_vec();
+            self.write_all::<B>(&from_dict);
+            let remaining = len - take;
+            if remaining == 0 {
+                return Ok(());
+            }
+            // `write_all` advanced `total`, and the recursive call adds the
+            // rest, so the caller's accounting stays exact.
+            return self.copy_match::<B>(self.buf.len(), remaining);
         }
 
         let mut remaining = len;

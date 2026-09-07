@@ -683,6 +683,21 @@ zstd-fixtures:
             {{zstd}} -$L -c "$f" > "$root/generated/$b.L$L.zst"
         done
     done
+    # Dictionary-compressed frames, so the dictionary path has something to
+    # decode. Without these the loader is tested and the *wiring* is not — and
+    # the wiring is where a dictionary can silently seed the wrong history.
+    for dict in "$root"/golden-dictionaries/*; do
+        [ -f "$dict" ] || continue
+        dname=$(basename "$dict")
+        for f in "$root"/golden-compression/*; do
+            [ -f "$f" ] || continue
+            b=$(basename "$f")
+            for L in 1 3 9; do
+                {{zstd}} -$L -D "$dict" -c "$f" \
+                    > "$root/generated/$b.D-$dname.L$L.zst" 2>/dev/null || true
+            done
+        done
+    done
     echo "generated $(ls "$root/generated" | wc -l | tr -d ' ') files"
 
 # Ensure the derived fixtures exist, cheaply.

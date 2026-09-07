@@ -211,6 +211,41 @@ A clean-room RFC 8878 implementation. Modern frames only.
 - **Repeat-offset update has a special case when `literals_length == 0`.** The
   single most commonly botched part of the format. Test it directly.
 
+### Where the specification and the reference disagree
+
+One case, found on the first day of M4, and recorded because a decoder cannot
+split the difference.
+
+RFC 8878 §4.2.1 says plainly: *"This specification limits the maximum code
+length to 11 bits."* So a Huffman table derives `tableLog <= 11`, and zalt
+enforced that everywhere.
+
+`zstd-fixtures/golden-dictionaries/http-dict-missing-symbols` — the reference's
+own regression fixture — carries a Huffman table whose weights sum to exactly
+2048, which derives a `tableLog` of **12** and therefore 12-bit codes. zalt
+refused it. The reference does not: `HUF_TABLELOG_MAX` is 12 in libzstd, and it
+both compresses and decompresses through that dictionary happily.
+
+The refusal was not a bug in the weight decoder, which is worth stating because
+that was the first suspicion and it cost the most time to rule out. The decoded
+weights satisfy every internal check the format offers — the remainder is
+exactly 2048, a power of two, and the derived last weight is 12, inside
+`WEIGHT_MAX`. Weights that were actually wrong would fail the rank-tiling check
+almost certainly. The weights were right; the ceiling was wrong.
+
+**zalt follows the reference, and only for dictionaries.** `huf::DICT_TABLELOG_MAX`
+is 12; a literals section still may not declare more than 11. §1 makes this call
+for us: the wire format is not ours to choose, and a browser that cannot read
+what the ecosystem emits is broken. The ecosystem here is libzstd, which ships
+this dictionary in its own test corpus.
+
+It is worth being clear about what that costs. This is a deliberate divergence
+from the specification text, in a codec whose first stated goal is to be a
+clean, general implementation of that text. The narrowness is the mitigation —
+one constant, one call site, and a literals section is unaffected — but it is a
+divergence, not a reading, and a reader of §4 who checks against the RFC should
+find it here rather than discover it in the source.
+
 ### Validation obligations
 
 Input is attacker-controlled. All of these are mandatory:
@@ -2523,11 +2558,59 @@ eighth pass measures instead is 29.5% / 45.2% in match and literal copy, which
 is the window write itself and already runs through the NEON kernels.
 
 ### M4 — Recipes and dictionaries
-- [ ] Dictionary loading in L1 (`dict.rs`).
+- [x] Dictionary loading in L1 (`dict.rs`) — formatted and raw-content, with
+      the reference's own `golden-dictionaries` corpus as the conformance test.
+- [x] Wired into the decoder: `Decoder::load_dictionary`, content seeded as
+      reachable history, entropy tables and repeat offsets seeded per frame,
+      `Dictionary_ID` matched. 12 reference-compressed frames decode
+      byte-exactly.
 - [ ] `zalt-recipe`: manifest format, loading, content-type routing.
 - [ ] `zalt-ztml`: content-prefix dictionary + manifest. No Rust logic if possible.
 - [ ] `dcz` Compression Dictionary Transport.
 - [ ] `zalt-recipe-train`: content-prefix v1, then trained dictionaries.
+
+#### Wiring the dictionary in, and the two bounds it moved
+
+Loading a dictionary is a parser. *Using* one changes what "how far back may a
+match reach" means, in two places that had been constants.
+
+**The window keeps the dictionary separate from its own history.** Prepending
+the content into the ring would be simpler and wrong in both directions: a
+dictionary larger than the window would be truncated, losing reach the format
+allows, and one smaller would stay addressable long after the format says it is
+gone. So `Window` carries a `dict` alongside `buf`, and a match whose offset
+runs past this frame's output starts that many bytes from the end of the
+dictionary — a plain append, since the two buffers cannot overlap — with
+whatever the match still needs continuing from `output[0]` as an ordinary
+in-window match.
+
+**Reach is time-limited, and the rule is easy to get one byte wrong.** RFC 8878
+§5 makes the dictionary addressable "as long as the amount of data decoded from
+this frame is less than or equal to `Window_Size`". The first implementation
+tied that to the ring being full, which is true one byte *earlier*: `is_full()`
+holds at exactly a window's worth of output, where the format still permits the
+reference. Now the condition is `total > capacity`, which is the sentence.
+
+**The bug the end-to-end test actually found was elsewhere.** The executor
+carried `if seq.offset > frame.window_size { reject }`, written when a frame
+could not have a dictionary and correct until it could. §5 says a sequence may
+name "parts of the dictionary with offsets larger than `Window_Size`", so that
+bound refuses legal frames — and did, on the very first reference-compressed
+frame tried, at offset 1320 against a 1189-byte window. The bound is now
+`window_size + dict_reach()`.
+
+Worth recording *how* that was found, because the first two guesses were both
+wrong. The error text named an offset and an available size, and both the
+dictionary loader and the window's own check were suspected before a debug print
+showed the window check never firing at all — the message was coming from a
+third place that looked nothing like the others. **A shared error variant makes
+two different rejections indistinguishable in their message**, and the minutes
+lost were spent proving which one had spoken.
+
+The tests that hold this up are `frames_compressed_with_a_dictionary_decode_byte_exactly`,
+against 12 frames the reference compressed with a dictionary at three levels,
+compared byte for byte — plus a `checked > 0` assertion, because a loop over
+fixtures nobody generated passes exactly as quietly as one that verified them.
 
 ### M5 — Encoder
 - [ ] Correctness-first encoder; `encode_decode` differential fuzzing.

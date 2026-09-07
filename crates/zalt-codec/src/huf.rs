@@ -21,7 +21,29 @@ use crate::error::{Error, Result};
 use crate::fse::{self, DecodeTable, Distribution, State};
 
 /// Largest `tableLog` a literals Huffman table may use.
+///
+/// RFC 8878 §4.2.1: "This specification limits the maximum code length to 11
+/// bits." That governs the table a *literals section* may describe.
 pub const TABLELOG_MAX: u32 = 11;
+
+/// Largest `tableLog` a **dictionary's** Huffman table may use.
+///
+/// Twelve, not eleven, and the difference is deliberate.
+///
+/// The RFC's 11-bit limit is written about the literals section. The reference
+/// enforces it there, but loads *dictionary* entropy tables against its own
+/// `HUF_TABLELOG_MAX`, which is 12 — and `golden-dictionaries/
+/// http-dict-missing-symbols` is exactly such a dictionary: its weights sum to
+/// 2048, which derives a `tableLog` of 12 and therefore 12-bit codes.
+///
+/// Refusing it would be defensible from the specification text alone and wrong
+/// in practice. §1 makes the wire format non-negotiable because a browser that
+/// cannot read what the ecosystem emits is broken, and the ecosystem is
+/// libzstd: it accepts this dictionary, round-trips through it, and ships it in
+/// its own regression corpus. So the limit is relaxed *here only* — a
+/// dictionary may carry a 12-bit table; a literals section still may not
+/// declare one.
+pub const DICT_TABLELOG_MAX: u32 = 12;
 /// Largest weight value that can appear in a tree description.
 pub const WEIGHT_MAX: u32 = TABLELOG_MAX + 1;
 /// Number of streams in the four-stream layout.
@@ -53,6 +75,14 @@ impl Table {
         Ok((table, consumed))
     }
 
+    /// [`Table::parse`] for a dictionary's table, which may reach
+    /// [`DICT_TABLELOG_MAX`]. See that constant for why the limits differ.
+    pub fn parse_dictionary(input: &[u8]) -> Result<(Self, usize)> {
+        let mut table = Self::default();
+        let consumed = table.parse_into_with(input, DICT_TABLELOG_MAX)?;
+        Ok((table, consumed))
+    }
+
     /// [`Table::parse`] in place, reusing this table's allocation.
     ///
     /// The decoder holds one Huffman table for the frame in progress, and used
@@ -62,6 +92,11 @@ impl Table {
     /// against a few kilobytes of output, and `_platform_memset` was 5% of the
     /// profile with `malloc`/`free` another 2.5%.
     pub fn parse_into(&mut self, input: &[u8]) -> Result<usize> {
+        self.parse_into_with(input, TABLELOG_MAX)
+    }
+
+    /// [`Table::parse_into`] against an explicit `tableLog` ceiling.
+    pub fn parse_into_with(&mut self, input: &[u8], max_table_log: u32) -> Result<usize> {
         let header = *input.first().ok_or(Error::Truncated)?;
 
         let (weights, consumed) = if header >= 128 {
@@ -83,7 +118,7 @@ impl Table {
             (decode_fse_weights(body)?, 1 + size)
         };
 
-        self.build_into(&weights)?;
+        self.build_into_with(&weights, max_table_log)?;
         Ok(consumed)
     }
 
@@ -105,6 +140,11 @@ impl Table {
     /// cannot be mistaken for a usable one: a `Treeless` block arriving later
     /// must find no table rather than a plausible one.
     pub fn build_into(&mut self, weights: &[u8]) -> Result<()> {
+        self.build_into_with(weights, TABLELOG_MAX)
+    }
+
+    /// [`Table::build_into`] against an explicit `tableLog` ceiling.
+    pub fn build_into_with(&mut self, weights: &[u8], max_table_log: u32) -> Result<()> {
         self.table_log = 0;
         if weights.is_empty() || weights.len() > 255 {
             return Err(Error::Malformed);
@@ -125,7 +165,7 @@ impl Table {
         }
 
         let table_log = highbit(weight_total) + 1;
-        if table_log > TABLELOG_MAX {
+        if table_log > max_table_log {
             return Err(Error::Malformed);
         }
 
