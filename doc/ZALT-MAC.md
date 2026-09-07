@@ -1157,8 +1157,10 @@ the host the allocator seam was built for, and it currently cannot reach it.
       real `.zdoc`, gap 2.88x -> 3.09x, alternating binaries with zstd in every
       round. Settled; do not try a third time without a new argument.
 - [~] FSE 3-state interleaving — largely already in place.
-- [~] Double-symbol Huffman tables — implemented, 8.4% slower on real `.zdoc`,
-      reverted. Conflicts with the four-stream interleave.
+- [~] Double-symbol Huffman tables — implemented and reverted twice. The
+      sixteenth pass re-ran it under the current regime: **worse in all twelve
+      rounds**, but by 1.7% rather than 8.4%. Conflicts with the four-stream
+      interleave, as predicted.
 - [x] Per-block FSE table clones removed (+9.6% on real `.zdoc`).
 - [x] Checksum skipped when the frame declares none (8% on a quiet machine; the
       ~26% first recorded was memory pressure — see the seventh pass).
@@ -2124,6 +2126,42 @@ because the symbol filter matched "kernel" and `zalt::kernels` is the
 accelerated copy module. The figure was nonsense and looked entirely
 plausible.)*
 
+**Double-symbol Huffman, re-implemented and re-measured.**
+
+The paired table is derived from the single-symbol one exactly as the sixth
+pass describes: for a `table_log`-bit window, the second symbol's bits are all
+present precisely when `a.nb_bits + b.nb_bits <= table_log`, which is both the
+pairing rule and its validity test. `decode_four` grew four independent cursors,
+because streams emitting one or two symbols per step no longer share an index —
+the conflict with the four-stream interleave that §10 predicted would cost more
+than pairing returns.
+
+One subtlety the earlier note does not record: a pair whose second symbol has no
+room left in the segment **cannot be split**, because the entry stores the
+*combined* bit count and skipping it would consume bits belonging to a symbol
+never written. The paired loop therefore runs only while two symbols fit, with a
+single-symbol tail — which is another branch per stream per step.
+
+Correctness first: 304 tests, and 600 `decodecorpus` frames decoded byte-exactly
+against the reference. It works; it is simply slower.
+
+| corpus | gap before | gap after | rounds |
+|---|---:|---:|---|
+| real `.zdoc` | 2.48x | **2.52x** | worse in 8 of 8 |
+| 61 MB corpus | 2.57x | **2.61x** | worse in 4 of 4 |
+
+Worse in **all twelve rounds across both corpora**, with the canary drifting
+**0.0%** — the steadiest measurement in this section, taken on a machine that
+was thermally capped at about 61% of its healthy speed. A cap is not a problem
+for a *ratio*: it slows both sides, and what a ratio needs is that conditions
+hold still, which a cap does better than a busy machine ever does.
+
+So the verdict stands and the magnitude does not: **8.4% became 1.7%**. That is
+the same shape as the flattened code tables, and for the same reason — the
+decoder around the change got much faster, so a fixed cost that used to be a
+large share of a slow loop is now a small share of a quick one. The direction
+survived; the confidence in it should not be inherited from the old number.
+
 **The rest of the re-runs so far.**
 
 | change | recorded verdict | re-tested verdict |
@@ -2133,6 +2171,8 @@ plausible.)*
 | Match-source prefetch | 3.5% slower | **confirmed no gain** — gap ~2.50x vs ~2.53x, 3 rounds each way |
 | Fuse sequence decode with execution | ~4% slower | **confirmed**, and worse: 6.4% (twelfth pass) |
 | Hoist the xxh64 accumulators | no change | **not measurable** — see below |
+| Double-symbol Huffman tables | 8.4% slower | **confirmed slower**, but ~1.7% (gap 2.48x → 2.52x) |
+| `zalt-darwin` | not justified | **confirmed** — 0.00% VM, 0.00% dispatch |
 
 Two of these are worth a note beyond the verdict.
 
