@@ -1,0 +1,22 @@
+[package]
+name = "zalt-recipe"
+description = "L3 mechanism: tuning manifests and dictionary selection, consumed as data."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# L1 only, deliberately. See the layering note in src/lib.rs: this crate
+# describes policy, it does not execute it, so it has no reason to reach L2 and
+# every reason not to drag L2's architecture-specific dependencies behind it.
+zalt-codec.workspace = true
+
+[features]
+default = ["parse", "std"]
+# The manifest text parser. A host that bakes a `Recipe` in as a Rust value
+# needs no parser at runtime, and turning this off removes it from the binary.
+parse = []
+# Filesystem loading. Off in `no_std` builds, which have no filesystem.
+std = ["parse"]

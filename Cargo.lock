@@ -390,6 +390,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zalt-recipe"
+version = "0.0.1"
+dependencies = [
+ "zalt-codec",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"

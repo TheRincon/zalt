@@ -7,6 +7,7 @@ members = [
     "crates/zalt-bench",
     "crates/zalt-ffi",
     "crates/zalt-cli",
+    "crates/zalt-recipe",
 ]
 # `fuzz` is its own workspace: fuzz targets build with sanitizers and coverage
 # instrumentation and must not perturb this workspace's lockfile or profiles.
@@ -14,8 +15,7 @@ exclude = ["fuzz"]
 
 # Crates arriving at their milestones (see doc/ZALT-MAC.md §10):
 #   zalt-darwin                   -> M3, only if profiling justifies it
-#   zalt-recipe, zalt-ztml,
-#   zalt-recipe-train             -> M4
+#   zalt-ztml, zalt-recipe-train  -> M4
 # They are deliberately absent rather than empty: an unused crate is build
 # time and review surface with nothing behind it.
 
@@ -30,6 +30,7 @@ repository = "https://github.com/TheRincon/zalt"
 zalt-codec = { path = "crates/zalt-codec", version = "0.0.1" }
 zalt-neon = { path = "crates/zalt-neon", version = "0.0.1" }
 zalt-embed = { path = "crates/zalt-embed", version = "0.0.1" }
+zalt-recipe = { path = "crates/zalt-recipe", version = "0.0.1" }
 
 [profile.release]
 opt-level = 3

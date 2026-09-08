@@ -17,6 +17,14 @@ set -uo pipefail
 
 fail=0
 
+# Only `src/` is searched, never `tests/` or fixtures. The rule is about
+# behaviour that branches on a content class, and test *data* that looks like
+# one proves nothing about the code: `zalt-codec/tests/fixtures/text.bin` is
+# WEFT-shaped markup because that is the workload being compressed, and
+# `zalt-recipe/tests/manifests.rs` copies §7's sketch verbatim so the document
+# and the parser cannot drift apart. Widening this to `tests/` would fail the
+# build on both, and would be enforcing the letter against the purpose.
+#
 # Comments are documentation, not dependencies. A doc comment in zalt-codec
 # saying "this crate must not know about browsers" is the contract being
 # stated, not broken — and the first version of this script failed the build
@@ -80,6 +88,18 @@ check "zalt-ffi" \
       '\b(ztml|zdoc|weft|zss)\b' \
       "The C ABI must stay content-agnostic."
 
+# L3 splits in two, and this is the half that matters most for the split to
+# mean anything. `zalt-recipe` is the *mechanism*: manifests, routing,
+# dictionary selection. A content type is a string that arrives in a manifest
+# and leaves in a routing decision; this crate never spells one. Only
+# `zalt-ztml`, the instance, may — and it is mostly data.
+#
+# If this fires, the fix is the same as everywhere else: widen a generic seam
+# here so the instance can express what it needs as manifest data.
+check "zalt-recipe" \
+      '\b(ztml|zdoc|weft|zss|browser)\b' \
+      "L3's mechanism must not name a content class. That is zalt-ztml's job, as data."
+
 # The CLI drives L2 and knows about files and flags, not about content. When
 # recipes arrive in M4 it gains `--recipe`, which is the *mechanism* and stays
 # generic; the content class named inside a recipe is data it never spells.
@@ -101,7 +121,7 @@ fi
 # A binary crate's root is main.rs, a library's is lib.rs. Check whichever the
 # crate actually has rather than assuming, or the check passes vacuously on a
 # grep error for a file that was never going to exist.
-for crate in zalt-embed zalt-cli; do
+for crate in zalt-embed zalt-cli zalt-recipe; do
     [ -d "crates/${crate}/src" ] || continue
     root=""
     for candidate in lib.rs main.rs; do

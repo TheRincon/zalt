@@ -2564,7 +2564,9 @@ is the window write itself and already runs through the NEON kernels.
       reachable history, entropy tables and repeat offsets seeded per frame,
       `Dictionary_ID` matched. 12 reference-compressed frames decode
       byte-exactly.
-- [ ] `zalt-recipe`: manifest format, loading, content-type routing.
+- [x] `zalt-recipe`: manifest format, loading, content-type routing. `no_std`,
+      no dependencies, parser optional. 31 tests, of which the rejection table
+      is the half that matters.
 - [ ] `zalt-ztml`: content-prefix dictionary + manifest. No Rust logic if possible.
 - [ ] `dcz` Compression Dictionary Transport.
 - [ ] `zalt-recipe-train`: content-prefix v1, then trained dictionaries.
@@ -2611,6 +2613,71 @@ The tests that hold this up are `frames_compressed_with_a_dictionary_decode_byte
 against 12 frames the reference compressed with a dictionary at three levels,
 compared byte for byte — plus a `checked > 0` assertion, because a loop over
 fixtures nobody generated passes exactly as quietly as one that verified them.
+
+#### The recipe crate, and the direction a limit is allowed to move
+
+`zalt-recipe` is the mechanism from §7 with no instance in it. Four decisions
+the sketch left open, and one of them is load-bearing.
+
+**A recipe may narrow a host's decode policy. It may never widen it.** Every
+ceiling folds by minimum: `Decode::narrow` against an 8 MiB host cap returns
+8 MiB whatever the manifest asked for. This is the reason the crate exists in
+the shape it does. A manifest is configuration, and configuration travels — it
+arrives from a scanned directory, from a path on a command line, from whatever
+shipped beside a dictionary. If a recipe could *raise* a window ceiling, every
+one of those paths would become a way to talk a host out of the bound it set
+for untrusted input, which is §6's amplification primitive re-introduced one
+layer up where the decoder that checks it cannot see. Refusing the load instead
+would be no better: it would let a recipe deny service to a host whose policy is
+merely stricter than the recipe expected. So it narrows silently, and two tests
+pin both directions.
+
+**No dependencies, so the manifest parser is hand-written.** `serde` + `toml`
+would have been the largest dependency event in the project, for a six-table
+config file, in a crate on the layering diagram's untrusted side. `zalt-cli`
+had already taken this position for the command line. The parser implements
+exactly the subset §7's sketch uses and **refuses everything else by name** —
+floats, datetimes, dotted keys, inline tables, literal and multi-line strings,
+nested arrays, unknown tables, unknown keys, duplicate keys. That last group is
+the point. A partial parser that quietly mis-reads syntax it does not support
+produces a manifest that loads cleanly and tunes nothing, and *a tuning
+parameter that silently fails to apply is invisible*, because the only symptom
+is a ratio nobody measured against the alternative. `[encoder]` when the table
+is `[encode]` now fails at load with a line number instead of at a benchmark
+three weeks later.
+
+**The manifest's `Dictionary_ID` is checked, not trusted.** §7's caveat is that
+a frame can only be decoded with the dictionary that compressed it, so a
+manifest whose declared id disagrees with the dictionary on disk does not
+produce an error later — it produces wrong bytes. One comparison at load time
+closes it.
+
+**Two recipes claiming one content type is an error, not a precedence rule.**
+Declaration order, filename, specificity are all defensible tie-breaks and none
+is guessable from reading the manifests; a directory load would resolve to
+whichever file the filesystem enumerated first, which is an outcome rather than
+a rule. `RecipeSet::insert` refuses the second claim, and `load_directory` sorts
+before loading so the failure is identical on every machine. Within one recipe,
+`[[rule]]` order *is* the tie-break — those were written together by one author
+who can see all of them at once, and two manifests in a directory were not.
+
+**The layering grep caught its own author inside the hour.** A unit test in
+`recipe.rs` used `.zdoc` as a sample extension — in the crate whose entire
+purpose is to be the content-blind mechanism. The fix was a different string,
+per the script's own instruction that the answer is essentially never to add the
+word to the allowlist. Worth recording is what the failure clarified: the check
+greps `src/` and not `tests/` **on purpose**, because the rule is about
+behaviour that branches on a content class, and `zalt-codec`'s `text.bin` has
+been WEFT-shaped corpus data since M1 on the same reasoning. That scoping was
+implicit until something made it load-bearing; it is now written down in the
+script.
+
+The crate builds three ways, and `just no-std` now checks all of them:
+`default`, `--no-default-features --features parse`, and bare
+`--no-default-features` — the last being the browser's path, a `Recipe` baked in
+as a Rust value with no parser in the binary at all. That third build is what
+keeps the split honest, since a `String` drifting into the data types would
+still compile with `parse` on.
 
 ### M5 — Encoder
 - [ ] Correctness-first encoder; `encode_decode` differential fuzzing.
