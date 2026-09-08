@@ -159,9 +159,18 @@ cli-corpus:
     [ "$good" -eq 0 ] && [ "$bad" -eq 0 ]
 
 # Prove zalt-codec is still a general no_std crate rather than an Apple-only one.
+#
+# zalt-recipe is built twice, because it has two shapes and only one of them is
+# the interesting one. With `parse` it is a manifest reader; without it, it is
+# the bare `Recipe` struct a host bakes in as a Rust value with no parser in the
+# binary at all. That second build is what keeps the split honest — a `String`
+# or a `format!` that drifts into the data types would still compile with
+# `parse` on and would silently make the embedded path impossible.
 no-std:
     rustup target add {{nostd_target}} 2>/dev/null || true
     cargo build -p zalt-codec --target {{nostd_target}}
+    cargo build -p zalt-recipe --target {{nostd_target}} --no-default-features
+    cargo build -p zalt-recipe --target {{nostd_target}} --no-default-features --features parse
 
 # Miri over the scalar path.
 #
