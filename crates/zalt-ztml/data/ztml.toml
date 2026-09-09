@@ -1,0 +1,69 @@
+# The ZTML recipe — doc/ZALT-MAC.md §8, made real.
+#
+# This file is DATA. It is the whole reason zalt-recipe exists as a separate
+# mechanism: everything ZTML-specific about zalt lives in this directory, and
+# no layer below has heard of it.
+#
+# There is a second copy of this in src/lib.rs as a Rust value, because a host
+# that bakes the recipe into a binary has no parser. `manifest_matches_the_rust_value`
+# asserts the two agree, so neither can drift.
+
+[recipe]
+name = "ztml-0.3"
+
+[match]
+content_type = ["application/ztml"]
+extension = [".zdoc"]
+
+[dictionary]
+path = "ztml-0.3.dict"
+# No `id`, deliberately.
+#
+# v1 is a content-prefix dictionary: a concatenation of representative samples
+# (§7). A raw-content dictionary carries no Dictionary_ID — the format has
+# nowhere to put one, since an ID requires the formatted header, which requires
+# pre-built entropy tables this build cannot yet produce.
+#
+# The consequence is real and belongs here rather than in a commit message: a
+# frame compressed against this dictionary declares Dictionary_ID 0, so a
+# decoder handed the WRONG content-prefix dictionary cannot tell. It produces
+# wrong bytes, caught only by the frame checksum if one is present.
+#
+# On the `dcz` path that hole is already closed, and closed better: RFC 9842 §5
+# specifies a *raw* dictionary and carries its SHA-256 ahead of the frame, so
+# the identity arrives out of band and is stronger than the 32-bit ID it
+# replaces. This dictionary is exactly the shape that transport wants.
+# Elsewhere — a dictionary negotiated without `dcz` — the missing ID still
+# means both ends must be versioned together.
+
+[encode]
+# Measured, not chosen. `just ztml-sweep` searches level against dictionary
+# size, held out, and `just ztml-ratio` prints the per-document table.
+#
+# Level 9 rather than §7's sketched 6: at full dictionary size the held-out
+# mean gain is 27.2% at L6 and 29.0% at L9, for 1.7x L3 encode cost against
+# 1.5x — 1.8 points for 13% more encode time. L12 then costs 3x more than L9
+# and buys 0.5 points, and L19 costs 9x more for 1.8. The knee is here.
+#
+# Encode cost is paid once per resource by whoever publishes it; ratio is paid
+# by every reader. That asymmetry is why this is not L3.
+level = 9
+window_log = 17
+
+[decode]
+max_window = "8MiB"
+
+# Already-compressed payloads (§8). zstd over these yields about 1.0x while
+# costing a full encode, so do not attempt it. This is the rule that keeps the
+# encoder from wasting cycles on the media half of a page's subresources.
+[[rule]]
+match_content_type = [
+    "image/webp",
+    "image/png",
+    "image/avif",
+    "image/jpeg",
+    "video/av1",
+    "font/woff2",
+]
+match_extension = [".webp", ".png", ".avif", ".jpg", ".jpeg", ".woff2"]
+strategy = "stored"

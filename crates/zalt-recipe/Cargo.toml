@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+sha2 = { version = "0.10", default-features = false }
 # L1 only, deliberately. See the layering note in src/lib.rs: this crate
 # describes policy, it does not execute it, so it has no reason to reach L2 and
 # every reason not to drag L2's architecture-specific dependencies behind it.

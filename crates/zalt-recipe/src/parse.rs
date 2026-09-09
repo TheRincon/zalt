@@ -2,7 +2,9 @@
 //!
 //! ## Why this is hand-written
 //!
-//! The workspace has no third-party runtime dependencies, and `serde` + `toml`
+//! The workspace takes a third-party runtime dependency only where being wrong
+//! would be silent — `sha2` is the one, and `src/sha256.rs` says why. A manifest
+//! is the opposite case: a misparse fails at load with a line number. `serde` + `toml`
 //! to read a six-table configuration file would be the largest dependency event
 //! in the project by an order of magnitude. `zalt-cli/src/args.rs` already took
 //! this position for the command line; a manifest is the same shape of problem.
