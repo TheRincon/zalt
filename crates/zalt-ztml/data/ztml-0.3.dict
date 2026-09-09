@@ -1,0 +1,1201 @@
+</wbr><wbr><wbr </col><col><col </fingerprint><fingerprint><fingerprint </chart><chart><chart </usermedia><usermedia><usermedia </input><input><input </textarea><textarea><textarea </progress><progress><progress </meter><meter><meter </nav><nav><nav </h4><h4><h4 </h5><h5><h5 </h6><h6><h6 </span><span><span </div><div><div </aside><aside><aside </var><var><var </sub><sub><sub </sup><sup><sup </q><q><q </ruby><ruby><ruby </rt><rt><rt </bdi><bdi><bdi </bdo><bdo><bdo </pre><pre><pre </verse><verse><verse </colgroup><colgroup><colgroup </tfoot><tfoot><tfoot </zapp><zapp><zapp </picture><picture><picture </dialog><dialog><dialog </form><form><form </fieldset><fieldset><fieldset </legend><legend><legend </datalist><datalist><datalist </select><select><select </optgroup><optgroup><optgroup </button><button><button </output><output><output </footer><footer><footer </img><img><img </figure><figure><figure </figcaption><figcaption><figcaption </del><del><del </ins><ins><ins </dfn><dfn><dfn </kbd><kbd><kbd </label><label><label </option><option><option </table><table><table </caption><caption><caption </thead><thead><thead </tbody><tbody><tbody </dl><dl><dl </time><time><time </ol><ol><ol </details><details><details </summary><summary><summary </head><head><head </header><header><header </main><main><main </ztml><ztml><ztml </weft><weft><weft </body><body><body </h1><h1><h1 </samp><samp><samp </dt><dt><dt </dd><dd><dd </e><e><e </tr><tr><tr </th><th><th </td><td><td </blockquote><blockquote><blockquote </ul><ul><ul </article><article><article </claim><claim><claim </h2><h2><h2 </cite><cite><cite </abbr><abbr><abbr </mark><mark><mark </strong><strong><strong </em><em><em </code><code><code </a><a><a </li><li><li </h3><h3><h3 </section><section><section </p><p><p  dir=" start=" reversed=" colspan=" render=" of=" grants=" from=" x=" y=" into=" open=" step=" list=" selected=" placeholder=" low=" high=" optimum=" span=" kind=" for=" type=" min=" label=" lang=" alt=" size=" max=" src=" hash=" at=" name=" via=" version=" version-id=" signature=" key=" doc-id=" zs=" cite=" value=" title=" scope=" id=" ref=" href="@context {entity <claim subject: predicate: object: @warrant: @type @substrate: name: "description: "confidence: sources: [definitionempiricalconjectureaxiomattestationconsensusderivedschema:hist:weft:urn:uuid:urn:concept:urn:artifact:zdoc://sha256:ed25519:ed25519-pk:https://<https://schema.org/> as schema<https://vocab.weft.org/core/> as weft
+  
+    
+      
+        
+          
+            
+              
+                
+<!-- A deliberately multilingual fixture, added before E4 begins.
+     The rest of the corpus contains exactly three non-ASCII characters
+     between all seven documents, so nothing in it reaches a right-to-left
+     run, a complex-shaping face, or a font the system has to fall back to.
+     Everything E4 builds - shaping, fallback, bidi, line breaking - would
+     otherwise land with no coverage at all. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" signature="ed25519:QEUVKPb5hVelGDNkk+Ox0N2HjqucmjFH2K/guCpbT6faJdwliouB83uRmpxlZhQCUDeEcEfmXE/53BkgrWEhDw==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+  <head doc-id="urn:uuid:5146a576-ab37-4c75-8505-4fde973bcf06" zs="/style.zss" title="One mechanism, many scripts"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+    }
+
+    entity <zdoc://grazer.local/scripts.zdoc> &doc {
+      @type schema:TextDigitalDocument
+      @substrate: digital
+      name: "One mechanism, many scripts"
+    }
+
+    entity <urn:artifact:antikythera> &mechanism {
+      @type schema:Thing
+      @substrate: physical
+      name: "the Antikythera mechanism"
+    }
+
+    entity <urn:topic:writing-systems> &scripts {
+      @type schema:Thing
+      @substrate: abstract
+      name: "writing systems"
+    }
+
+    claim c_about {
+      subject: <zdoc://grazer.local/scripts.zdoc>
+      predicate: schema:about
+      object: <urn:topic:writing-systems>
+      @warrant: axiom
+    }
+
+    claim c_named {
+      subject: <urn:artifact:antikythera>
+      predicate: schema:name
+      object: "the Antikythera mechanism"
+      @warrant: definition
+    }
+
+    claim c_shaping {
+      subject: <urn:topic:writing-systems>
+      predicate: schema:description
+      object: "Some scripts cannot be rendered by mapping characters to glyphs in order."
+      @warrant: consensus { support: 0.99 }
+    }
+  </weft>
+
+  <body>
+    <h1>One mechanism, many scripts</h1>
+
+    <p>The <e ref="mechanism">Antikythera mechanism</e> is named after the
+       island it sank beside. Written out, that name reaches most of the
+       problems a text engine has:</p>
+
+    <p>Greek, where it was found: to μηχανισμό των Αντικυθήρων.</p>
+
+    <p>Arabic, which runs right to left and joins its letters:
+       <em>آلة أنتيكيثيرا</em> — and a Latin word, Antikythera, set inside
+       the same paragraph so the two directions have to be ordered against
+       each other.</p>
+
+    <p>Thai, which is written without spaces between words, so a line can
+       only be broken by knowing the language: เครื่องกลอันติคีเทรา.</p>
+
+    <p>Devanagari, where vowel signs are reordered and consonants combine:
+       एंटीकाइथेरा यंत्र.</p>
+
+    <p>Chinese, where every character is a possible line break:
+       安提基特拉機械.</p>
+
+    <p>And a sequence that is one thing to a reader and several codepoints
+       to a program: 🇬🇷 ⚙️ 👩‍🔬 — a flag, a gear, and a scientist assembled
+       from a woman, a joiner, and a microscope.</p>
+
+    <p><claim ref="c_shaping">Some scripts cannot be rendered by mapping
+       characters to glyphs in order.</claim> That is why shaping is a
+       separate step from layout, and why it happens before line breaking
+       rather than after.</p>
+  </body>
+</ztml>
+<!-- painted.zdoc — the fixture E5 needed and the corpus did not have.
+     Backgrounds, borders, radii, opacity and nested clip ports, on purpose.
+
+     Every other document here is prose: `showcase.zdoc` emits 82 glyph runs
+     and exactly TWO rects, one of which is the page background painted on an
+     identical canvas and therefore invisible. So the whole rect half of the
+     display list was exercised by one 3px border strip, 1553px down a page.
+
+     `position.rs` already recorded this shape for positioning — "the corpus
+     has nothing positioned, so every unit test would pass for a pass that
+     never ran" — and E5.5 hit it again for backgrounds. This is the standing
+     answer rather than a per-test sheet. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" signature="ed25519:eErELZkX6+T4Ig0lO1BhhQoxkLBqLr27Z6iWT/B4S3Y2jw2V6+wK8PQAv7cCb1IbWK6GXGCb7x7VMik8ppz7CQ==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+  <head doc-id="urn:uuid:7c1f3a54-9b2e-4d61-8a03-5e2f7c9d1b48" zs="/painted.zss" title="painted surfaces"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+    }
+
+    entity <zdoc://grazer.local/painted.zdoc> &doc {
+      @type schema:TextDigitalDocument
+      @substrate: digital
+      name: "painted surfaces"
+    }
+
+    entity <urn:topic:paint> &topic {
+      @type schema:Thing
+      @substrate: abstract
+      name: "the display list's rect half"
+    }
+
+    claim c1 {
+      subject: <zdoc://grazer.local/painted.zdoc>
+      predicate: schema:about
+      object: <urn:topic:paint>
+      @warrant: axiom
+    }
+  </weft>
+
+  <body>
+    <h1>Painted surfaces</h1>
+
+    <p>Every block below carries a background, a border, or both, so the
+       rect half of the display list has something to be wrong about.</p>
+
+    <!-- Plain background, no border. -->
+    <section id="plain">
+      <p>A filled block with no border at all.</p>
+    </section>
+
+    <!-- Background plus a wide border, to catch the two overlapping. -->
+    <section id="bordered">
+      <p>A filled block with a wide inline-start border. The border draws
+         over the background, which is why they are emitted in that order.</p>
+    </section>
+
+    <!-- Radius, which cascaded into nothing until E5.5. -->
+    <section id="rounded">
+      <p>Rounded corners. <code>border-radius</code> parsed and cascaded from
+         the beginning and reached no consumer until the display list.</p>
+    </section>
+
+    <!-- Opacity, which is a per-command alpha multiply and not CSS's group
+         composite. Two children so the difference is visible. -->
+    <section id="faded">
+      <p>Half-transparent. The engine scales this command's alpha; CSS would
+         composite the whole subtree as one group.</p>
+      <p>A sibling, at full strength, because opacity does not inherit.</p>
+    </section>
+
+    <!-- Nested clip ports: the case a flat sweep cannot express, and the
+         reason paint became a tree walk in E5.7. -->
+    <section id="outer-port">
+      <p>Outer clip.</p>
+      <section id="inner-port">
+        <p>An inner clip inside the outer one. Both must find their own pop.</p>
+      </section>
+    </section>
+
+    <!-- Inline backgrounds, which sit on `observed-box` rather than
+         `world-box` — E4.27's third column. -->
+    <p>Inline elements can be painted too:
+       <mark>a highlighted run</mark>, and
+       <code>a monospaced one</code>, inside ordinary prose.</p>
+  </body>
+</ztml>
+<!-- A ZTML showcase. Read the source alongside the rendering: there is not one
+     styling instruction anywhere in this file. No class, no style, no b, no i,
+     no font, no align, no width — those attributes and elements do not exist
+     in the language, so a document cannot express appearance even by accident.
+     Everything you see is grazer's default rendering of the semantics. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" lang="en" signature="ed25519:/AHxHTLs1lilU6B18CGOZ63Z8ZuKPt1P1gBW9rZkb6Igg3uFP5QKRCpNxmqdZIWjcmm39aKzVUafJq2/r+jwDQ==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+
+  <head doc-id="urn:uuid:f284c639-3d4f-4f38-ac20-9982d9905edf" zs="/style.zss" title="What ZTML Removes"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+      <https://vocab.example.org/history/> as hist
+    }
+
+    entity <zdoc://grazer.local/showcase.zdoc> &doc {
+      @type schema:TechArticle
+      @substrate: digital
+      name: "What ZTML Removes"
+    }
+
+    entity <urn:concept:ztml> &ztml {
+      @type schema:ComputerLanguage
+      @substrate: abstract
+      name: "ZTML"
+      description: "Markup carrying structure and semantics, and nothing else."
+    }
+
+    entity <urn:artifact:antikythera> &mechanism {
+      @type schema:Thing
+      @substrate: physical
+      name: "Antikythera Mechanism"
+    }
+
+    claim c_about {
+      subject: <zdoc://grazer.local/showcase.zdoc>
+      predicate: schema:about
+      object: <urn:concept:ztml>
+      @warrant: definition
+    }
+
+    claim c_separation {
+      subject: <urn:concept:ztml>
+      predicate: hist:enforces
+      object: "structure and presentation are different documents"
+      @warrant: axiom
+    }
+
+    claim c_failclosed {
+      subject: <urn:concept:ztml>
+      predicate: hist:parseStrategy
+      object: "fail closed on the first violation"
+      @warrant: definition
+    }
+
+    claim c_gears {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:gearCount
+      object: "at least 30 meshing gears"
+      @warrant: empirical { confidence: 0.94, sources: [c_separation] }
+    }
+
+    claim c_adoption {
+      subject: <urn:concept:ztml>
+      predicate: hist:adoptionOutlook
+      object: "authors will accept a closed vocabulary"
+      @warrant: conjecture { confidence: 0.4 }
+    }
+  </weft>
+
+  <body>
+    <main>
+      <header>
+        <h1>What ZTML Removes</h1>
+        <p>
+          <claim ref="c_separation">Structure and presentation are separate
+          documents</claim>, and this file is the demonstration: it contains no
+          styling instruction of any kind, because the language has no way to
+          express one.
+        </p>
+      </header>
+
+      <section>
+        <h2>A figure, pinned by hash</h2>
+        <figure>
+          <img src="/gears.png"
+               alt="Three meshing gears of decreasing size, drawn in blue, brown and green"
+               hash="sha256:c4b2853cae028b8a54bd529bd72f15718c856c0542a4ea6f0dd0e37abf666736"
+               size="720x360"/>
+          <figcaption>
+            <claim ref="c_gears">The mechanism carries at least thirty meshing
+            gears.</claim> The image above is referenced by content hash, and
+            arrived pushed on its own stream in the same round trip as this
+            document.
+          </figcaption>
+        </figure>
+        <p>
+          The <code>hash</code> attribute is mandatory, not advisory. A
+          reference without one is a parse error, so subresource integrity is
+          how references work rather than something an author opts into.
+        </p>
+      </section>
+
+      <section>
+        <h2>What is gone, and where it went</h2>
+        <table>
+          <caption>Removed from HTML, and its replacement</caption>
+          <thead>
+            <tr>
+              <th scope="col">Removed</th>
+              <th scope="col">Why</th>
+              <th scope="col">Now lives in</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">class</th>
+              <td>a styling hook wearing a semantic costume</td>
+              <td>ZSS selectors on real structure</td>
+            </tr>
+            <tr>
+              <th scope="row">style</th>
+              <td>presentation inlined into content</td>
+              <td>ZSS</td>
+            </tr>
+            <tr>
+              <th scope="row">b, i, font</th>
+              <td>appearance with no meaning</td>
+              <td>strong, em, or ZSS</td>
+            </tr>
+            <tr>
+              <th scope="row">script, on*</th>
+              <td>ambient authority over the document</td>
+              <td>ZAPPs, with declared grants</td>
+            </tr>
+            <tr>
+              <th scope="row">div soup</th>
+              <td>structure with nothing to say</td>
+              <td>section, article, nav, aside</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Semantics that survived</h2>
+        <dl>
+          <dt>abbr</dt>
+          <dd>
+            <abbr title="Zettelkasten Text Markup Language">ZTML</abbr> expands
+            on demand, because an abbreviation is a fact about the word.
+          </dd>
+          <dt>time</dt>
+          <dd>
+            The wreck was found in <time at="1901">1901</time> — the machine
+            form is the element, not an annotation bolted onto it.
+          </dd>
+          <dt>blockquote and cite</dt>
+          <dd>Attribution is structural, not a visual convention.</dd>
+        </dl>
+
+        <blockquote cite="https://example.org/ztml/rationale">
+          <p>
+            HTML's permissive parsing is how it accumulated cruft.
+            <claim ref="c_failclosed">ZTML refuses the first step</claim>.
+          </p>
+        </blockquote>
+      </section>
+
+      <section>
+        <h2>Ordered and unordered</h2>
+        <p>The parse pipeline, in order:</p>
+        <ol>
+          <li>Lex, rejecting anything outside the closed vocabulary.</li>
+          <li>Build the tree, rejecting malformed nesting.</li>
+          <li>Validate the document shape: head, weft, body, in that order.</li>
+          <li>Run the node gate over the embedded graph.</li>
+        </ol>
+        <p>Things this document deliberately cannot do:</p>
+        <ul>
+          <li>Set a colour, a font, or a width.</li>
+          <li>Run code, or register an event handler.</li>
+          <li>Reference a subresource without pinning its bytes.</li>
+          <li>
+            Claim its own authorship — <em>that</em> is rendered in the
+            browser's chrome, from a signature, never from the page.
+          </li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Progressive disclosure, without script</h2>
+        <details>
+          <summary>Why a closed vocabulary?</summary>
+          <p>
+            An open vocabulary means a parser must guess at anything it does
+            not recognise, and guessing is how quirks mode was born. A closed
+            one makes the unknown element a named error instead.
+          </p>
+        </details>
+        <p>
+          <claim ref="c_adoption">Whether authors will accept that trade is
+          genuinely open</claim> — a conjecture at 0.4, and the browser renders
+          it as one rather than letting the confident prose around it carry the
+          reader past the uncertainty.
+        </p>
+      </section>
+
+      <section>
+        <h2>Onward</h2>
+        <p>
+          <a href="/antikythera.zdoc" via="schema:about">The mechanism
+          itself</a>, or <a href="/shipwreck.zdoc" via="hist:recoveredFrom">the
+          wreck it came from</a>.
+        </p>
+      </section>
+    </main>
+  </body>
+</ztml>
+<!-- The christmas tree: every element ZTML's registry knows, in one document.
+     Its job is coverage, not realism. `christmas_covers_every_registered_element`
+     in tests/golden.rs fails when the registry grows and this does not, which is
+     what keeps it honest — a fixture that claims to cover everything and is not
+     checked is worth less than one that admits what it misses. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" signature="ed25519:jvnml3555AiJVtoeZUNOBv6dx+VXty8qlb4GYSrXF6Ns8BhwqUl0NxR95KiPXKmsAIYCYLuLMhMnTZYa5vkuAQ==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+  <head doc-id="urn:uuid:7c1f0b52-9a3e-4d61-8f24-1b6d5e0a9c73" zs="/style.zss /christmas.zss" title="christmas tree"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+      <https://vocab.example.org/orchard/> as orch
+    }
+
+    entity <zdoc://grazer.local/christmas.zdoc> &doc {
+      @type schema:TextDigitalDocument
+      @substrate: digital
+      name: "christmas tree"
+    }
+
+    entity <urn:orchard:spruce> &spruce {
+      @type schema:Thing
+      @substrate: physical
+      name: "Picea abies"
+      height: 21.4
+      planted: 1974
+    }
+
+    entity <urn:orchard:survey> &survey {
+      @type schema:Dataset
+      @substrate: digital
+      name: "orchard survey"
+    }
+
+    claim about {
+      subject: <zdoc://grazer.local/christmas.zdoc>
+      predicate: schema:about
+      object: <urn:orchard:spruce>
+      @warrant: axiom
+    }
+
+    claim measured {
+      subject: <urn:orchard:spruce>
+      predicate: orch:heightMetres
+      object: 21.4
+      @warrant: assertion { claimant: <did:key:z6MkSurveyor>, confidence: 0.93 }
+    }
+
+    claim guessed {
+      subject: <urn:orchard:spruce>
+      predicate: orch:ageYears
+      object: 52
+      @warrant: conjecture { confidence: 0.41 }
+    }
+  </weft>
+
+  <body>
+    <header>
+      <h1>Every element, once</h1>
+      <nav>
+        <ul>
+          <li><a href="zdoc://grazer.local/index.zdoc">Index</a></li>
+          <li><a href="zdoc://grazer.local/showcase.zdoc" via="schema:relatedLink">Showcase</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main>
+      <article>
+        <h2>Sectioning and headings</h2>
+        <h3>Third</h3>
+        <h4>Fourth</h4>
+        <h5>Fifth</h5>
+        <h6>Sixth</h6>
+        <p>A paragraph with <span id="inline-span">a span that declares a
+           purpose</span> and <div id="inline-div">a div that declares
+           one</div>.</p>
+
+        <section id="clipped-port">
+          <h3>A clip port</h3>
+          <p>This section sets <code>overflow: hidden</code> and a fixed
+             block size, so its content overflows and E4.16's
+             <code>clipped</code> column has something true to report. Nothing
+             else in the corpus establishes a scroll or clip port at all, so
+             without this the column is all-false everywhere.</p>
+          <p>A second paragraph, to be sure the port is overrun.</p>
+          <p id="escapes-the-port">Inset past the port's own height, so an
+             ancestor with a clip port genuinely does not contain it.</p>
+        </section>
+
+        <section id="stacking">
+          <h3>Stacking</h3>
+          <p id="beneath">Beneath, in flow.</p>
+          <p id="floats-over">Out of flow, painted over.</p>
+          <!-- A static wrapper between the positioned ancestor and the
+               positioned box, so `containing-block` differs from `parent`
+               and E4.23's walk has something to walk. Without this every
+               out-of-flow box's containing block is simply its parent, and
+               the column looks identical to `parent`. -->
+          <section id="static-wrapper">
+            <p id="pinned">Pinned to the containing block, not to the wrapper.</p>
+          </section>
+        </section>
+
+        <aside id="an-aside">
+          <p>An aside, which no other fixture has.</p>
+        </aside>
+      </article>
+
+      <article>
+        <h2>Text semantics</h2>
+        <p><em>emphasis</em>, <strong>strong</strong>, <mark>marked</mark>,
+           <code>code</code>, <kbd>Ctrl</kbd>, <samp>output</samp>,
+           <var>x</var>, <cite>A Citation</cite>, H<sub>2</sub>O,
+           2<sup>16</sup>, <abbr title="Zed Text Markup Language">ZTML</abbr>,
+           <dfn>a definition</dfn>.</p>
+        <p><del cite="zdoc://grazer.local/index.zdoc" at="2026-01-02">struck</del>
+           <ins cite="zdoc://grazer.local/index.zdoc" at="2026-01-03">inserted</ins>
+           <q cite="zdoc://grazer.local/index.zdoc">an inline quotation</q></p>
+        <p><ruby>漢<rt>kan</rt></ruby> and
+           <bdi>עברית</bdi> and
+           <bdo dir="rtl">reversed</bdo> and a break<wbr/>opportunity.</p>
+        <pre>  preformatted
+  two lines</pre>
+        <blockquote cite="zdoc://grazer.local/shipwreck.zdoc">
+          <p>A block quotation.</p>
+        </blockquote>
+        <verse>A verse block,
+line broken as written.</verse>
+      </article>
+
+      <article>
+        <h2>Lists and tables</h2>
+        <ol start="3" reversed="true">
+          <li value="3">Third</li>
+          <li>Second</li>
+        </ol>
+        <dl>
+          <dt>Term</dt>
+          <dd>Definition</dd>
+        </dl>
+        <table>
+          <caption>A table with every part</caption>
+          <colgroup><col span="2"/></colgroup>
+          <thead>
+            <tr><th scope="col">Axis</th><th scope="col">Value</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>height</td><td>21.4</td></tr>
+          </tbody>
+          <tfoot>
+            <tr><td colspan="2">One row measured</td></tr>
+          </tfoot>
+        </table>
+      </article>
+
+      <article>
+        <h2>Graph-bearing and generated</h2>
+        <p>The subject is <e ref="&spruce">a spruce</e>, and
+           <claim ref="measured">its height is asserted at high
+           confidence</claim>, while
+           <claim ref="guessed">its age is only conjectured</claim>.</p>
+        <p>Surveyed <time at="2026-03-14" render="relative"/>, over
+           <time span="P3M"/>.</p>
+        <p>Integrity: <fingerprint of="&doc"/></p>
+
+        <!-- §5.4/§5.5/§5.6: `into=` and `from=` name a <zapp>, never a weft
+             alias. The parser enforces it, which is how this document learned
+             it needs a component before it can have a chart. -->
+        <zapp src="/orchard.wasm"
+              hash="sha256:1b3d5f7a9c1e3b5d7f0a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d"
+              name="orchard"
+              grants="none"
+              title="Orchard survey viewer"/>
+        <chart from="orchard" kind="line" x="planted" y="height"
+               title="Growth"/>
+        <usermedia kind="camera" into="orchard" title="Field camera"/>
+        <figure>
+          <img src="/gears.png" alt="Bronze gearing"
+               hash="sha256:9f2c1e7a4b6d8f03a5c9e1b7d4f6082a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d"
+               size="480x320"/>
+          <figcaption>A figure with a caption.</figcaption>
+        </figure>
+        <picture>
+          <!-- Sized, so E4.29 has something with a real height to lose: a
+               block inside an inline used to be dropped entirely, and an
+               unsized image would give it a zero box either way. -->
+          <img src="/gears.png" alt="Bronze gearing again"
+               hash="sha256:9f2c1e7a4b6d8f03a5c9e1b7d4f6082a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d"
+               size="600x200"/>
+        </picture>
+      </article>
+
+      <article>
+        <h2>Declarative interaction</h2>
+        <details open="true">
+          <summary>A disclosure</summary>
+          <p>Its content.</p>
+        </details>
+        <dialog>
+          <p>A dialog, closed.</p>
+        </dialog>
+        <form>
+          <fieldset>
+            <legend>Measurements</legend>
+            <label for="h">Height</label>
+            <input type="number" id="h" name="height" min="0" max="100" step="0.1"
+                   value="21.4" list="common"/>
+            <datalist id="common">
+              <option value="21.4">measured</option>
+            </datalist>
+            <select name="species" label="Species, genus and epithet">
+              <optgroup label="Picea">
+                <option value="abies" selected="true">abies</option>
+              </optgroup>
+            </select>
+            <label>Care notes
+              <textarea name="notes" placeholder="Notes"/>
+            </label>
+            <button type="submit" name="save" value="1">Save</button>
+            <output for="h">21.4</output>
+            <progress value="7" max="10"/>
+            <meter value="21.4" min="0" max="30" low="5" high="25"
+                   optimum="20"/>
+          </fieldset>
+        </form>
+      </article>
+    </main>
+
+    <footer>
+      <p>The end of the tree.</p>
+    </footer>
+  </body>
+</ztml>
+<!-- A demonstration ZDOC. The subject is chosen because its scholarship has
+     genuine epistemic texture: hard physical facts, dated estimates carrying
+     real uncertainty, named scholarly positions, and open conjecture — all in
+     one document. On the legacy web these render identically. Here they do
+     not, because the warrant is part of the data. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" lang="en" signature="ed25519:gSsN4b+KD1G2eSzPeoQPgJed7JDXADC707oBCUjj4xsfyS5IvdgyFjiNfZ6BRzst2N40hulIQu8qNWYODaZ3DA==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+
+  <head doc-id="urn:uuid:c8dfafae-46c7-4d16-b30c-4e0af1ca5cdc" zs="/style.zss" title="The Antikythera Mechanism"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+      <https://vocab.example.org/history/> as hist
+    }
+
+    // The page as a node in the graph (PROFILE.md §8.2.1).
+    entity <zdoc://grazer.local/antikythera.zdoc> &doc {
+      @type schema:ScholarlyArticle
+      @substrate: digital
+      name: "The Antikythera Mechanism"
+    }
+
+    entity <urn:artifact:antikythera> &mechanism {
+      @type schema:Thing
+      @substrate: physical
+      name: "Antikythera Mechanism"
+      description: "A geared bronze device recovered from a Roman-era shipwreck."
+    }
+
+    entity <urn:place:antikythera> &wreck {
+      @type schema:Place
+      @substrate: physical
+      name: "Antikythera wreck site"
+    }
+
+    entity <did:key:z6MkPriceDerek> &price {
+      @type schema:Person
+      @substrate: physical
+      name: "Derek J. de Solla Price"
+    }
+
+    entity <did:key:z6MkFreethAlex> &freeth {
+      @type schema:Person
+      @substrate: physical
+      name: "Tony Freeth"
+    }
+
+    entity <urn:concept:lunar-anomaly> &anomaly {
+      @type schema:Thing
+      @substrate: abstract
+      name: "First lunar anomaly"
+    }
+
+    // --- The page's connecting claim: what this document is about.
+    claim c_about {
+      subject: <zdoc://grazer.local/antikythera.zdoc>
+      predicate: schema:about
+      object: <urn:artifact:antikythera>
+      @warrant: definition
+    }
+
+    // --- Axiom: a physical fact, not a confident belief. No number attaches.
+    claim c_recovered {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:recoveredFrom
+      object: <urn:place:antikythera>
+      @warrant: axiom
+    }
+
+    // --- Definition: true by what the words mean.
+    claim c_geared {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:mechanismClass
+      object: "geared analogue computer"
+      @warrant: definition
+    }
+
+    // --- Assertion: a named person's position, with their confidence.
+    //     The claimant travels with the claim when it is cited or extracted.
+    claim c_price_gearing {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:proposedGearTrain
+      object: <did:key:z6MkPriceDerek>
+      @warrant: assertion { claimant: <did:key:z6MkPriceDerek>, confidence: 0.90 }
+      strength: 0.8
+    }
+
+    // --- Empirical: measured, graded, and it names the claims it rests on.
+    claim c_dating {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:constructionDate
+      object: "c. 150-100 BCE"
+      @warrant: empirical { confidence: 0.82, sources: [c_recovered] }
+    }
+
+    // --- Consensus: broad agreement, tracked separately from evidence.
+    claim c_lunar {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:models
+      object: <urn:concept:lunar-anomaly>
+      @warrant: consensus { support: 0.95 }
+    }
+
+    // --- Conjecture: openly a guess. No amount of confidence promotes this
+    //     to a fact — that is the point of a typed warrant.
+    claim c_missing {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:mayHaveDisplayed
+      object: "planetary positions on the lost front dial"
+      @warrant: conjecture { confidence: 0.55 }
+    }
+
+    // --- Derived: a conclusion chained from premises, by a named rule.
+    claim c_sophistication {
+      subject: <urn:artifact:antikythera>
+      predicate: hist:impliesTradition
+      object: "an established Hellenistic gear-making practice"
+      @warrant: derived {
+        rule: "no artefact of this complexity is a first attempt",
+        premises: [c_geared, c_dating]
+      }
+    }
+
+    // --- Attestation: a claim ABOUT another claim. The subject is c_dating.
+    claim c_freeth_attests {
+      subject: c_dating
+      predicate: weft:attestedBy
+      object: <did:key:z6MkFreethAlex>
+      @warrant: assertion { claimant: <did:key:z6MkFreethAlex>, confidence: 0.88 }
+    }
+  </weft>
+
+  <body>
+    <main>
+      <header>
+        <h1>The Antikythera Mechanism</h1>
+        <p>
+          Every sentence below is bound to a claim in this document's graph.
+          The browser knows which are
+          <claim ref="c_recovered">established fact</claim>,
+          which are <claim ref="c_dating">measured estimates</claim>,
+          and which are <claim ref="c_missing">frank conjecture</claim> —
+          and it will not let this page pretend otherwise.
+        </p>
+      </header>
+
+      <section>
+        <h2>What it is</h2>
+        <p>
+          The <e ref="mechanism">Antikythera Mechanism</e> is a
+          <claim ref="c_geared">geared analogue computer</claim> of Hellenistic
+          manufacture. It was <claim ref="c_recovered">recovered from a
+          shipwreck off <e ref="wreck">the island of Antikythera</e></claim> by
+          sponge divers, and survives as 82 corroded bronze fragments.
+        </p>
+        <p>
+          Its density of engineering is startling: at least thirty meshing
+          gears, cut by hand, carrying a model of the sky.
+        </p>
+        <p>
+          <a href="/shipwreck.zdoc" via="hist:recoveredFrom">More on the wreck
+          it came from</a> — the <code>via</code> names the relation this link
+          stands for, making the hyperlink a typed edge rather than an untyped
+          jump.
+        </p>
+      </section>
+
+      <section>
+        <h2>When it was made</h2>
+        <p>
+          Dating rests on inscription letterforms and on the wreck's cargo.
+          The current estimate is
+          <claim ref="c_dating">roughly 150 to 100 BCE</claim> — an empirical
+          claim, carrying a confidence, resting on evidence this document
+          names rather than gestures at.
+        </p>
+        <p>
+          <claim ref="c_freeth_attests"><e ref="freeth">Tony Freeth</e>
+          attests to that dating.</claim> Note what this is: not a louder
+          restatement, but a separate claim <em>about</em> the first one, with
+          its own author and its own signature.
+        </p>
+      </section>
+
+      <section>
+        <h2>What it computed</h2>
+        <p>
+          <claim ref="c_lunar">It models the first lunar anomaly</claim> — the
+          Moon's variable speed through the sky — using a pin-and-slot device
+          that produces a varying rate from two gears turning at a constant
+          one. There is broad scholarly consensus on this.
+        </p>
+        <p>
+          <claim ref="c_price_gearing"><e ref="price">Derek de Solla
+          Price</e> proposed the first full gear train</claim> in 1974, an
+          assertion carried under his name.
+        </p>
+      </section>
+
+      <section>
+        <h2>What we do not know</h2>
+        <blockquote cite="https://example.org/antikythera/front-dial">
+          <p>
+            <claim ref="c_missing">The lost front dial may have displayed
+            planetary positions.</claim>
+          </p>
+        </blockquote>
+        <p>
+          This is a <strong>conjecture</strong>, and grazer renders it as one.
+          It carries a confidence of 0.55, and no threshold anywhere promotes
+          it to a fact: <code>conjecture</code> and <code>axiom</code> are
+          different kinds, not different amounts.
+        </p>
+        <p>
+          <claim ref="c_sophistication">That such a device existed at all
+          implies an established tradition of gear-making</claim> — a derived
+          claim, chained from the two premises it names.
+        </p>
+      </section>
+
+      <section>
+        <h2>Why this document is different</h2>
+        <p>
+          A conventional page asserts all of the above in the same voice. A
+          reader cannot tell the fact from the estimate from the guess without
+          leaving the page. Here the distinction is
+          <em>in the data</em>, the browser enforces it, and the badge in the
+          chrome reports what was actually checked — not "true", but
+          <em>signed, hash-verified, and confidence on record</em>.
+        </p>
+        <p>
+          Alter one character of one claim and its content hash changes
+          completely, the document hash changes with it, and the visual
+          fingerprint becomes unmistakably different. Tamper-evidence is not a
+          feature bolted on; it falls out of addressing claims by their hash.
+        </p>
+      </section>
+    </main>
+  </body>
+</ztml>
+<!-- handsome.zdoc — a document that looks like something, without containing a
+     single instruction about how it should look.
+
+     Read this source next to the rendering. There is no class, no style, no
+     colour, no font, no width anywhere in it, because ZTML has no way to
+     express any of those. Everything the page does visually comes from
+     handsome.zss selecting on structure that is here for other reasons —
+     scope=row because it is a row header, warrant=conjecture because the
+     claim really is a guess.
+
+     The paper is dark. That is the sheet's decision, and grazer's contrast
+     floor holds the sheet to it: every colour was authored against the dark
+     paper, and the one that was not gets corrected at render time. -->
+<ztml version="0.3" version-id="urn:uuid:eefc2a84-e905-4fa9-a20e-6b16d297afa1" lang="en" signature="ed25519:sMF4N5W4+eYh4tUZxc7UqDBH+3IRUArO+thTClGqg1ltaxmXtf2iKRreXhP5/ouOK/siUzqNbLBSCsikzzUZAQ==" key="ed25519-pk:W+8vntKr49EShdQ7qXNm76+jrn3OPImAOmI5USWZde8=">
+
+  <head doc-id="urn:uuid:662719a7-a596-49e9-80ea-0fe3444d9242" zs="/handsome.zss" title="The Colour of a Claim"/>
+
+  <weft>
+    @context {
+      <https://schema.org/> as schema
+      <https://vocab.weft.org/core/> as weft
+      <https://vocab.example.org/typography/> as typo
+    }
+
+    entity <zdoc://grazer.local/handsome.zdoc> &doc {
+      @type schema:TechArticle
+      @substrate: digital
+      name: "The Colour of a Claim"
+    }
+
+    entity <urn:concept:zss> &zss {
+      @type schema:ComputerLanguage
+      @substrate: abstract
+      name: "ZSS"
+      description: "A style language that selects on meaning, including how a statement is warranted."
+    }
+
+    entity <urn:person:ottosson> &ottosson {
+      @type schema:Person
+      @substrate: physical
+      name: "Björn Ottosson"
+    }
+
+    entity <urn:place:oklab> &oklab {
+      @type schema:Place
+      @substrate: abstract
+      name: "OKLab"
+    }
+
+    entity <urn:org:grazer-spec> &spec {
+      @type schema:Organization
+      @substrate: abstract
+      name: "SPEC-ZSS"
+    }
+
+    claim c_about {
+      subject: <zdoc://grazer.local/handsome.zdoc>
+      predicate: schema:about
+      object: <urn:concept:zss>
+      @warrant: definition
+    }
+
+    claim c_separation {
+      subject: <urn:concept:zss>
+      predicate: typo:enforces
+      object: "presentation is a separate document from structure"
+      @warrant: axiom
+    }
+
+    claim c_closed {
+      subject: <urn:concept:zss>
+      predicate: typo:parseStrategy
+      object: "a sheet parses entirely or it does not apply"
+      @warrant: definition
+    }
+
+    claim c_oklch {
+      subject: <urn:person:ottosson>
+      predicate: typo:published
+      object: "OKLab, a perceptual colour space with even lightness"
+      @warrant: empirical { confidence: 0.98 }
+    }
+
+    claim c_floor {
+      subject: <urn:concept:zss>
+      predicate: typo:enforces
+      object: "computed text below the contrast floor is corrected, not rejected"
+      @warrant: definition
+    }
+
+    claim c_red {
+      subject: <urn:concept:zss>
+      predicate: typo:observes
+      object: "saturated red carries too little luminance to pass on dark paper"
+      @warrant: empirical { confidence: 0.72, sources: [c_oklch] }
+    }
+
+    claim c_authors {
+      subject: <urn:concept:zss>
+      predicate: typo:adoptionOutlook
+      object: "authors will prefer selecting on meaning to inventing class names"
+      @warrant: conjecture { confidence: 0.45 }
+    }
+
+    claim c_dark {
+      subject: <urn:concept:zss>
+      predicate: typo:observes
+      object: "a document is a surface, and a surface has a colour of its own"
+      @warrant: assertion { claimant: <urn:org:grazer-spec>, confidence: 0.6 }
+    }
+  </weft>
+
+  <body>
+    <main>
+      <header>
+        <h1>The Colour of a Claim</h1>
+        <p>
+          A style sheet that can ask how a sentence is warranted, and a
+          browser that will not let it make the answer unreadable.
+        </p>
+      </header>
+
+      <section id="paper">
+        <h2>The paper is part of the argument</h2>
+        <p>
+          <claim ref="c_dark">A document is a surface, and a surface has a
+          colour of its own</claim> — so this sheet paints one. The
+          declaration is a single <code>background-color</code> on
+          <code>body</code>, and it does two jobs at once: it is what the
+          window is painted with, and it is the datum the contrast floor
+          measures every run against.
+        </p>
+        <p>
+          Those two have to be the same colour. When they are not, the floor
+          certifies text as legible on a surface nobody draws, and the reader
+          gets dark ink on a dark window together with a clean bill of health.
+        </p>
+
+        <blockquote cite="https://example.org/zss/rationale">
+          <p>
+            <claim ref="c_floor">Computed text below the floor is corrected
+            rather than rejected.</claim> A sheet with one dim rule is not a
+            malformed sheet, and refusing the document over it would make the
+            floor an obstacle authors route around instead of a guarantee
+            readers get.
+          </p>
+          <cite>SPEC-ZSS §4</cite>
+        </blockquote>
+      </section>
+
+      <section id="warrants">
+        <h2>Prose, coloured by how it is known</h2>
+        <p>
+          Each sentence below is bound to a claim in this document's graph, and
+          the sheet selects on the warrant rather than on anything the prose
+          declares about itself.
+        </p>
+
+        <dl>
+          <dt>Axiom</dt>
+          <dd>
+            <claim ref="c_separation">Presentation is a separate document from
+            structure.</claim> Taken as given; the language is built on it.
+          </dd>
+
+          <dt>Definition</dt>
+          <dd>
+            <claim ref="c_closed">A sheet parses entirely or it does not
+            apply.</claim> True because of what the words mean.
+          </dd>
+
+          <dt>Empirical</dt>
+          <dd>
+            <claim ref="c_oklch">Björn Ottosson published OKLab, a perceptual
+            colour space with even lightness.</claim> Checkable, and checked.
+          </dd>
+
+          <dt>Assertion</dt>
+          <dd>
+            Someone said it, and the browser says who rather than pretending
+            the page is a neutral narrator.
+          </dd>
+
+          <dt>Conjecture</dt>
+          <dd>
+            <claim ref="c_authors">Authors will prefer selecting on meaning to
+            inventing class names.</claim> A guess at 0.45, rendered as one —
+            faded and slanted, so the confident prose around it does not carry
+            you past the uncertainty.
+          </dd>
+        </dl>
+
+        <h3>Entities, by type and substrate</h3>
+        <p>
+          The graph also types its subjects, and the sheet can reach that too:
+          <e ref="ottosson">Björn Ottosson</e> is a person and a physical one;
+          <e ref="oklab">OKLab</e> is a place only in the sense that a colour
+          space is somewhere you can be. <e ref="zss">ZSS</e> is abstract, and
+          renders as such.
+        </p>
+      </section>
+
+      <section id="red">
+        <h2>Why the red had to move</h2>
+        <p>
+          <claim ref="c_red">Saturated red carries too little luminance to
+          clear the floor on dark paper.</claim> A red that looks vivid on
+          white lands near <samp>Lc 47</samp> here. The fix was not to abandon
+          it but to raise its lightness until the author met the floor instead
+          of the browser:
+        </p>
+
+        <table>
+          <caption>The palette, measured against this document's own paper</caption>
+          <thead>
+            <tr>
+              <th scope="col">Role</th>
+              <th scope="col">OKLCH</th>
+              <th scope="col">Lc</th>
+              <th scope="col">Verdict</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">ink</th>
+              <td><code>oklch(93% 0.015 320)</code></td>
+              <td><samp>91.9</samp></td>
+              <td>clears comfortably</td>
+            </tr>
+            <tr>
+              <th scope="row">rose</th>
+              <td><code>oklch(82% 0.14 25)</code></td>
+              <td><samp>63.8</samp></td>
+              <td>clears, after lifting</td>
+            </tr>
+            <tr>
+              <th scope="row">purple</th>
+              <td><code>oklch(82% 0.14 310)</code></td>
+              <td><samp>67.2</samp></td>
+              <td>clears</td>
+            </tr>
+            <tr>
+              <th scope="row">gold</th>
+              <td><code>oklch(84% 0.16 85)</code></td>
+              <td><samp>73.8</samp></td>
+              <td>clears easily</td>
+            </tr>
+            <tr>
+              <th scope="row">the first red</th>
+              <td><del>oklch(72% 0.20 20)</del> <ins>oklch(82% 0.14 25)</ins></td>
+              <td><samp>47.2</samp></td>
+              <td></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p>
+          The last row's verdict cell is empty on purpose — an empty cell reads
+          as deliberately empty rather than as broken, because
+          <code>td:empty</code> is a thing a sheet can say.
+        </p>
+      </section>
+
+      <section id="mechanics">
+        <h2>What the sheet is actually doing</h2>
+
+        <h3>Selecting on position</h3>
+        <ol>
+          <li>The standfirst is <code>h1 + p</code> — a paragraph is a
+              standfirst because of where it sits.</li>
+          <li>Table striping is <code>tr:nth-child(odd)</code>, so the markup
+              never learns it is being striped.</li>
+          <li>Row headers are <code>th[scope=row]</code>, styled off a fact
+              about the table.</li>
+          <li>This item is last, and knows it only via
+              <code>li:last-child</code>.</li>
+        </ol>
+
+        <h3>Selecting on the graph</h3>
+        <p>
+          <dfn>Graph-facet selection</dfn> is the part with no CSS equivalent.
+          <abbr title="Zettelkasten Style Sheets">ZSS</abbr> reaches through a
+          bound element into the claim graph, so
+          <code>claim[confidence&lt;0.5]</code> is a legal selector and
+          <code>claim[warrant&gt;=axiom]</code> is a named error rather than a
+          silently useless match.
+        </p>
+
+        <details>
+          <summary>Why hue is never the only signal</summary>
+          <p>
+            Every warrant above carries weight, slope or an underline as well
+            as a colour. A reader who does not separate these hues, or who
+            prints the page, still sees the distinction. Colour is the second
+            signal, never the first.
+          </p>
+        </details>
+
+        <p>
+          Press <kbd>Cmd</kbd> and follow <a href="/showcase.zdoc"
+          via="schema:about">what ZTML removes</a>, or read
+          <a href="/antikythera.zdoc" via="schema:about">the mechanism</a>.
+          A typed edge renders differently from a bare link because
+          <code>a[via]</code> says the relationship is declared.
+        </p>
+      </section>
+
+      <section id="colophon">
+        <h2>Colophon</h2>
+        <p id="colophon-note">
+          This paragraph is set in a purple at <samp>Lc 14.6</samp> against
+          this paper, which is far below the floor. It is here on purpose.
+          grazer lifts it along OKLCH lightness — same hue, same chroma — and
+          reports the correction in the chrome, because a floor you cannot see
+          working is indistinguishable from one that was never implemented.
+          Set on <time at="2026-07-31">31 July 2026</time>.
+        </p>
+      </section>
+    </main>
+  </body>
+</ztml>

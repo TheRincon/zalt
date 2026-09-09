@@ -16,6 +16,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 zalt-codec = { path = "../crates/zalt-codec" }
 zalt-neon = { path = "../crates/zalt-neon" }
+# The dcz header is untrusted wire input; its parser is fuzzed like any other.
+zalt-recipe = { path = "../crates/zalt-recipe", default-features = false, features = ["parse"] }
 
 # The oracle. A C dependency, which is acceptable in a dev-only crate and would
 # not be anywhere else — the layering forbids it below L3. `zstd-sys` here
@@ -58,6 +60,20 @@ bench = false
 [[bin]]
 name = "backend_equivalence"
 path = "fuzz_targets/backend_equivalence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcz_prelude"
+path = "fuzz_targets/dcz_prelude.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcz_roundtrip"
+path = "fuzz_targets/dcz_roundtrip.rs"
 test = false
 doc = false
 bench = false

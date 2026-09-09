@@ -519,6 +519,14 @@ This needs no token, no negotiation, and no server-side coordination: it is
 entirely an encoder-side decision within RFC 8878, and any decoder handles the
 output. Tracked in M5.
 
+> **Measured at M4: the premise needs checking before this is built.** The
+> paragraph assumes markup and hash regions can be separated into different
+> blocks. In a real `.zdoc` the hashes are interleaved at roughly 64-byte
+> granularity — every subresource reference carries one — rather than
+> segregated. Splitting at a 1 KB stride buys 2.4–5.1% of literal entropy while
+> each extra Huffman table costs 100–200 bytes, so it is a net loss at that
+> granularity. See M4.
+
 ### Sketch
 
 ```toml
@@ -561,6 +569,12 @@ Two very different jobs, and the split is favorable:
 Staging: v1 uses a **content-prefix dictionary**, which is just a concatenation
 of representative samples and needs no algorithm at all. It works surprisingly
 well and unblocks the whole mechanism. Upgrade to trained dictionaries later.
+
+> **Measured at M4, and the last sentence needs qualifying.** The content prefix
+> is worth 22.5–35.5% held out, and `zstd --train` over the same samples is
+> *worse* on five of six documents — COVER has too few samples to select from at
+> this corpus size. The upgrade to a formatted dictionary is therefore about
+> `Dictionary_ID` and pre-built entropy tables, not ratio. See M4.
 
 `zalt recipe train --input corpus/ --out ztml.recipe` is the ad-hoc path: point
 it at a directory of representative files, get a dictionary and a parameter set.
@@ -2565,11 +2579,19 @@ is the window write itself and already runs through the NEON kernels.
       `Dictionary_ID` matched. 12 reference-compressed frames decode
       byte-exactly.
 - [x] `zalt-recipe`: manifest format, loading, content-type routing. `no_std`,
-      no dependencies, parser optional. 31 tests, of which the rejection table
-      is the half that matters.
-- [ ] `zalt-ztml`: content-prefix dictionary + manifest. No Rust logic if possible.
-- [ ] `dcz` Compression Dictionary Transport.
-- [ ] `zalt-recipe-train`: content-prefix v1, then trained dictionaries.
+      parser optional, one dependency (`sha2`, see `dcz`). 31 tests, of which
+      the rejection table is the half that matters.
+- [x] `zalt-ztml`: content-prefix dictionary + manifest. 63 lines of Rust, both
+      of them data; 47 KB dictionary; held-out output 23–36% smaller at L9,
+      a 29.0% mean.
+- [x] `dcz` Compression Dictionary Transport (RFC 9842, saved as
+      `doc/rfc9842.txt`): header parse, `sha2`, hash-indexed dictionary store,
+      two structured fuzz targets. Verified against the reference in both
+      directions.
+- [x] `zalt-recipe-train`: content-prefix v1. `build` / `eval` / `sweep`,
+      leave-one-out throughout. Replaces `ci/gen-ztml-dict.py` and reproduces
+      its 47 KB blob byte for byte. Trained dictionaries deliberately not
+      built — see below.
 
 #### Wiring the dictionary in, and the two bounds it moved
 
@@ -2678,6 +2700,292 @@ The crate builds three ways, and `just no-std` now checks all of them:
 as a Rust value with no parser in the binary at all. That third build is what
 keeps the split honest, since a `String` drifting into the data types would
 still compile with `parse` on.
+
+#### The first recipe, and four things the corpus said
+
+`zalt-ztml` is a manifest, a 47 KB dictionary, and 63 lines of Rust — which is
+the seam in `zalt-recipe` working rather than a crate left unfinished.
+`ci/layering.sh` now counts those lines and fails above 200, because §3 states
+the property in prose and prose does not fail a build.
+
+**What it is worth, held out.** Leave-one-out — rebuild the dictionary without
+the document being measured, because measuring against a dictionary containing
+the file measures memorisation:
+
+| document | bytes | L6 plain | L6 + dict | smaller by |
+|---|---|---|---|---|
+| `showcase.zdoc` | 7 782 | 2 919 | 1 880 | **35.5%** |
+| `scripts.zdoc` | 3 441 | 1 799 | 1 267 | 29.5% |
+| `painted.zdoc` | 3 492 | 1 691 | 1 216 | 28.0% |
+| `handsome.zdoc` | 11 755 | 4 019 | 3 057 | 23.9% |
+| `antikythera.zdoc` | 9 083 | 3 258 | 2 485 | 23.7% |
+| `christmas.zdoc` | 8 890 | 3 543 | 2 744 | 22.5% |
+
+`just ztml-ratio` reproduces it. §7's "it works surprisingly well" is now a
+number.
+
+**Trained dictionaries are not currently an upgrade, and that reverses §7's
+staging.** `zstd --train` over the same held-in samples loses to plain
+concatenation on five of six documents (3.52 vs 3.69, 2.96 vs 3.16, 3.58 vs
+3.88, 2.67 vs 2.82, 3.69 vs 4.11; `painted` ties). COVER needs many samples to
+select from, and six documents totalling 37 KB is not many — the trainer
+discards material the raw prefix keeps. So the reason to move to a formatted
+dictionary is **not ratio**. It is that a formatted dictionary carries a
+`Dictionary_ID` and pre-built entropy tables, and a raw content prefix carries
+neither. A frame compressed against this dictionary declares ID 0, so a decoder
+handed the wrong content prefix cannot tell, and produces wrong bytes caught
+only by a checksum that may be absent.
+
+> **Corrected while implementing `dcz`, the next item on this list.** The
+> paragraph above ended "safe where both ends are versioned together; not safe
+> as a negotiated wire dictionary". That is wrong, and reading RFC 9842 instead
+> of summarising it is what showed why. §5: *"The dictionary used for the 'dcz'
+> content encoding is a 'raw' dictionary type."* `dcz` carries the dictionary's
+> SHA-256 in a header ahead of the frame, so on that path the identity arrives
+> out of band and is **stronger** than the 32-bit `Dictionary_ID` it replaces.
+> A content-prefix dictionary is not a second-class thing to be upgraded away
+> from for the wire; it is the shape the transport specifies. What survives is
+> narrower: the missing `Dictionary_ID` matters only where a dictionary is
+> negotiated *without* `dcz`, and pre-built entropy tables remain a real
+> per-frame win on small resources that a content prefix cannot provide.
+
+**Order is part of the artifact.** The same bytes concatenated in a different
+order measured up to 45 bytes apart on a 1 218-byte output — 3.7%. zstd matches
+backwards from the dictionary's end, so material nearest the end encodes with
+the cheapest offsets. A generator that concatenates in filesystem order
+therefore produces a different dictionary on a different machine, silently, and
+the only symptom is a ratio nobody compared. Hence `ci/gen-ztml-dict.py` rather
+than a shell loop, an explicit sort, a provenance file recording the order and
+per-input hashes, and `just ztml-dict-check` in the gate.
+
+**A dictionary is not free on large inputs.** `synthetic.zdoc` is 219 KB and is
+deliberately *excluded* from the dictionary: including it makes the held-out
+ratio slightly worse while growing the blob sevenfold. Compressing it against
+the shipped dictionary is worth −3.1% at L3 and **+6.1% at L6** — actively
+worse. A large file has enough of its own history that the dictionary adds
+nothing and can misfit the entropy tables. This is §8's small-resource claim
+confirmed from the other side, and it is an encoder-side decision: a recipe that
+applies a dictionary above some size is doing harm. Worth a size threshold in
+the manifest when M5 needs one.
+
+#### Should the dictionary carry the whole vocabulary? Yes, but not for ratio
+
+§8 says ZTML's closed vocabulary makes it an unusually good dictionary target.
+Measured, the vocabulary block earns almost nothing on ratio once real samples
+are present — five of six documents are unchanged to two decimal places, because
+the samples already contain every tag, in context, and context matches better
+than a bare fragment.
+
+The exception is the whole story. `christmas.zdoc` uses all 88 elements, and
+held out, **43 of them appear in no other sample** — and it is the one document
+the vocabulary block improves (3.16 → 3.25). The block is not a ratio win, it is
+**tail insurance**: it pays exactly when a document uses vocabulary the corpus
+lacks, which is the deployment case, not the test case. At 2.5 KB of a 47 KB
+dictionary it is cheap, and it is kept.
+
+The measurement **understates** it, unavoidably. The list was extracted from
+`doc/*.zdoc`, so by construction it cannot contain an element the samples never
+use — precisely the case it exists to cover. `data/vocabulary.txt` is therefore
+a plain, swappable list, to be replaced by the ZTML specification's own element
+and attribute set when that lands. The generator does not care where the lines
+come from.
+
+#### `dcz`, and the value of reading the RFC rather than the summary
+
+The header is forty bytes and §7 described it correctly, so this looked like an
+afternoon. Fetching RFC 9842 changed two decisions and corrected one written
+claim, which is the argument for keeping the text next to `rfc8878.txt` rather
+than working from a paraphrase.
+
+**The correction is above**, in the M4 dictionary notes: `dcz` dictionaries are
+*raw* by specification, and the SHA-256 in the header is the identity. The
+content-prefix dictionary `zalt-ztml` ships is therefore not a compromise on
+this path — it is the specified shape.
+
+**It lives in L3, not L1.** Layering permits either; `dcz` is a transport
+format, not a content class, and `magic.rs` already carries the constant. The
+deciding argument is cohesion: the whole purpose of the header is *which
+dictionary to use*, which is row one of §7's table. `zalt-codec` stays RFC 8878.
+
+**SHA-256 is not a choice.** §5 fixes the 32 bytes as a SHA-256 of the
+dictionary, and the origin computes them; a faster hash would simply never
+match. It is also not a cost — it runs once per dictionary *load*, never per
+frame.
+
+**And it is `sha2`, after being hand-written first and found wrong.** The
+argument for writing it was the workspace's zero-dependency position, plus the
+observation that SHA-256 has no key, no parameters and published vectors — the
+one primitive where rolling it looks defensible. The bug below is what settled
+it. `sha2` is now the **first third-party runtime dependency in the
+workspace**, and the rule that replaces "no dependencies" is narrower and
+better: *take one where being wrong would be silent.* A mistyped CLI flag,
+a malformed manifest and a corrupted base64 all fail loudly and stay
+hand-written; a wrong hash selects the wrong dictionary and decodes to
+plausible nonsense.
+
+**A store that cannot file a dictionary under the wrong hash.** `insert` takes
+bytes and computes the identity, so the alternative shape — insert with a
+caller-supplied hash and verify later — has no way to exist, and neither does
+its failure mode of a skipped verification silently decoding against the wrong
+dictionary.
+
+**The bug, and which test caught it.** The hand-written streaming SHA-256
+dropped buffered bytes whenever an update ended without completing a block:
+`update` fell through to a tail ending `self.buffered = rest.len()`, which is
+zero once the input is exhausted. Every one-shot NIST vector passed it, because
+a one-shot call never re-enters with a partial buffer. The 1-million-`a` vector
+passed it too, because 1 000-byte updates never leave the buffer short. It took
+the test that hashes every length from 0 to 130 one byte at a time and compares
+against the one-shot.
+
+**Standard test vectors verify the algorithm, not the implementation's
+plumbing.** The vectors are all a single call; the bug was entirely in the
+second one. That is the whole case against hand-rolling a hash: the part with a
+published conformance suite was never the risky part, and `block-buffer` exists
+because the risky part is a separate problem somebody has already solved. The
+every-length test is kept, now worth little, as a note to whoever next thinks
+the vectors are sufficient.
+
+Three end-to-end checks, because the unit tests only prove the parser agrees
+with itself: our SHA-256 against the system's `sha256sum` over 40 KB of real
+bytes (the same second-oracle reasoning that put `ruzstd` in the codec's
+dev-dependencies); the reference decoding a complete `dcz` stream **header and
+all**, which is the wire-compatibility claim the format rests on; and zalt doing
+the same, then resolving the dictionary by hash and decoding byte-exactly. A
+fourth test compresses against one dictionary and decodes against another to
+show the codec *cannot* detect the substitution — evidence for why the hash
+exists, rather than an assertion of it.
+
+#### 5.3M executions that tested almost nothing
+
+The first `dcz` fuzz target fed arbitrary bytes to the header parser, survived
+5.3M executions, and reported no findings. That number is worthless, and the
+reason is arithmetic: **the header opens with a 64-bit fixed sequence**, so raw
+bytes reach the accepting path with probability 2^-64. Essentially every
+execution took a rejection branch. The branch that extracts a hash and splits a
+frame — the one containing arithmetic — was never reached at all.
+
+`roundtrip_valid.rs` has recorded this lesson for frames since M1: *"Random
+bytes essentially never form a valid zstd frame past the magic number."* It
+applies at least as hard to a header, and the new target was written without
+noticing. A fuzzer that cannot construct the shape under test measures the
+mutator, not the code.
+
+Both `dcz` targets are now structured:
+
+- **`dcz_prelude`** takes a variant tag from the first byte, so roughly three
+  executions in eight carry a genuine header — plus a header cut short at every
+  length below 40, the right magic with a wrong length field, a `dcb` header, a
+  magic one bit off, and a fully arbitrary remainder so nothing is closed off.
+  It asserts sniffing and declared-`dcz` parsing never disagree, that the frame
+  handed back is exactly the input minus forty bytes, and that a header built
+  from known parts parses back to those parts.
+- **`dcz_roundtrip`** is the one worth having. The fuzzer's bytes become a
+  dictionary and a payload, libzstd compresses one against the other, and we
+  rebuild the stream an origin would send. Every mutation changes the dictionary
+  content, which changes which matches the encoder finds, which changes the
+  offsets reaching back past the start of the frame — the dictionary-relative
+  decode path, which arbitrary input would never construct. It checks the round
+  trip, that the store files a dictionary under the hash the wire names it by,
+  that the split is not off by one, and that decoding the whole stream *through*
+  the header matches decoding the frame alone.
+
+The difference is visible in the coverage counters rather than in the run
+counts. Seeded, the header parser reports `cov: 134` — which is most of a small
+parser — while the round trip starts at `cov: 966 ft: 1899` and climbs. 5.2M
+executions of the first and 68K of the second, no findings in either; the
+smaller number is the more informative one, because each of those executions
+built and decoded a real dictionary-compressed frame.
+
+`ci/seed-fuzz-corpus.sh` seeds both, and now documents the input shape each
+target expects alongside the three that were already there.
+
+#### Order-N, co-locality, and a caution for M5's block splitting
+
+Recorded because the question will be asked again. **Context modelling is not
+available to us.** zstd Huffman-codes literals with one table per block and no
+context at all, unlike brotli, which selects a literal context mode from the
+previous two bytes. Adding it is a bitstream change, which §7's table puts
+permanently outside what a recipe may do.
+
+The raw-byte entropy gap looks enormous — H₀ 4.60, H₁ 3.21, H₂ 1.73, H₃ 0.88
+bits/byte on `antikythera.zdoc` — and is a trap twice over. Model cost is
+excluded (order-3 has 2 318 contexts over 9 KB; that model cannot be shipped),
+and it is entropy of the *raw* bytes, while LZ77 already removes most of the
+repetition order-2 is detecting and zstd entropy-codes only the literals that
+survive matching. The gap overstates the opportunity by a wide margin.
+
+Co-locality does pay, in three wire-compatible places: dictionary ordering
+(measured above, 3.7%), pre-computed entropy tables in a formatted dictionary,
+and block splitting.
+
+**The caution.** Splitting at a fixed 1 KB stride buys 2.4–5.1% of literal
+entropy *before* paying for the extra tables, and a Huffman table is 100–200
+bytes — eight extra tables on a 9 KB document costs ~1 200 bytes against a
+~2 500 byte output. Fixed-stride splitting is a clear loss. §7 assumes markup
+and hash regions can be separated into different blocks, but in a real `.zdoc`
+the hashes are **interleaved at roughly 64-byte granularity** — every
+`<img hash="sha256:…">` — not segregated into regions. The 2.4–5.1% is an upper
+bound for any scheme at that granularity, and it sits below the table cost. M5
+should measure the region structure before building the splitter, not after.
+
+#### `zalt-recipe-train`, and a level that was sketched rather than measured
+
+The last M4 box, and the smallest, because the measurement from `zalt-ztml`
+already decided what it should not do: `zstd --train` loses to plain
+concatenation on five of six documents at this corpus size, so v1 implements
+the concatenation *properly* — ordering, size budget, held-out evaluation —
+rather than implementing COVER against a corpus too small for it to beat `cat`.
+`sweep` is the harness that would demonstrate the upgrade when a corpus large
+enough for it arrives.
+
+**It replaces `ci/gen-ztml-dict.py`, and reproduces its output byte for byte.**
+Same 46 999 bytes, same
+`698fce7d…` — a rewrite in a different language landing on the identical
+artifact, which is a better argument for the generator being deterministic than
+any assertion about it.
+
+**The sweep found the manifest's compression level was a sketch.** §7's example
+said `level = 6` and `zalt-ztml` copied it. Held out, at full dictionary size:
+
+| | L3 | L6 | L9 | L12 | L19 |
+|---|---|---|---|---|---|
+| **mean gain** | 23.5% | 27.2% | **29.0%** | 29.5% | 30.8% |
+| **encode cost** | 1.0x | 1.5x | **1.7x** | 5.1x | 15.2x |
+
+L9 is the knee: **1.8 points better than L6 for 13% more encode time**, where
+L12 costs three times L9 for a further half point and L19 nine times for 1.8.
+The manifest now says 9. The asymmetry that settles it is that encode cost is
+paid once per resource by whoever publishes it, and ratio is paid by every
+reader.
+
+**Dictionary size dominates level, and has a sharp knee of its own.** Held-out
+mean gain by size, at L9: 4 KB 7.2%, 8 KB 12.0%, **16 KB 23.8%**, 32 KB 28.0%,
+47 KB 29.0%. The step from 8 to 16 KB nearly doubles the gain, because 16 KB is
+where a whole sample document first fits; past 32 KB the last third of the
+dictionary buys one point. A host on a binary budget has the numbers to trade
+with, and `--max-size` trims **from the front**, since the tail is where the
+cheap offsets are.
+
+**A harness bug that inflated every number by a point.** The first version
+piped documents to `zstd` through stdin. That leaves the input size unknown, so
+the frame carries no `Frame_Content_Size` and the encoder cannot size its
+choices to a resource it has not seen the end of — worth 27–44 bytes, and worth
+them almost entirely to the *baseline*, because the dictionary case is dominated
+by long matches either way. Every gain came out about one percentage point too
+high, from a detail with nothing to do with dictionaries. The tool now hands
+`zstd` a path, as a server compressing a resource it holds would. The
+discrepancy was caught only because the earlier bash figures existed to
+disagree with it: **a second measurement of the same thing is worth more than a
+more careful single one.**
+
+**And the clearest demonstration of why leave-one-out is not optional.** The
+shipped dictionary contains `showcase.zdoc` verbatim, so compressing that
+document against it yields **23 bytes from 7 782** — one match covering the
+whole file. Every number in this document is leave-one-out; the dictionary is
+rebuilt without the document being measured, which is N times more expensive
+and is the difference between 29% and a figure nothing in production will ever
+reproduce.
 
 ### M5 — Encoder
 - [ ] Correctness-first encoder; `encode_decode` differential fuzzing.

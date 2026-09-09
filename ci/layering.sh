@@ -107,6 +107,31 @@ check "zalt-cli" \
       '\b(ztml|zdoc|weft|zss)\b' \
       "The CLI selects recipes by path; it must not name a content class."
 
+# zalt-ztml is the one crate allowed to name a content class, so there is no
+# vocabulary check for it. What is checked instead is that it stays DATA.
+#
+# §3: "zalt-ztml is mostly a dictionary and a manifest. If it accumulates
+# meaningful amounts of Rust, that is a signal the seam in zalt-recipe is too
+# narrow." That is a design property stated in prose, and prose does not fail a
+# build. Counting is crude, but the thing being guarded against is gradual — a
+# helper here, a special case there — and the crate is 63 code lines today, so
+# a limit of 200 is several years of honest growth and still catches a content
+# class quietly acquiring behaviour.
+#
+# If this fires, widening a seam in zalt-recipe is the fix. Raising the number
+# should be an argument, not an edit.
+if [ -d crates/zalt-ztml/src ]; then
+    ztml_code=$(cat crates/zalt-ztml/src/*.rs 2>/dev/null | grep -vcE '^[[:space:]]*(//|$)' || echo 0)
+    if [ "${ztml_code}" -gt 200 ]; then
+        echo "LAYERING VIOLATION in zalt-ztml"
+        echo "  ${ztml_code} lines of Rust (limit 200). L3's instance should be"
+        echo "  a manifest and a dictionary. Logic here means the seam in"
+        echo "  zalt-recipe is too narrow — widen it generically instead."
+        echo
+        fail=1
+    fi
+fi
+
 # unsafe is confined to the accelerated kernels.
 if [ -d crates/zalt-codec/src ]; then
     if ! grep -q 'forbid(unsafe_code)' crates/zalt-codec/src/lib.rs; then
@@ -121,7 +146,7 @@ fi
 # A binary crate's root is main.rs, a library's is lib.rs. Check whichever the
 # crate actually has rather than assuming, or the check passes vacuously on a
 # grep error for a file that was never going to exist.
-for crate in zalt-embed zalt-cli zalt-recipe; do
+for crate in zalt-embed zalt-cli zalt-recipe zalt-ztml zalt-recipe-train; do
     [ -d "crates/${crate}/src" ] || continue
     root=""
     for candidate in lib.rs main.rs; do

@@ -1,7 +1,9 @@
 //! Argument parsing.
 //!
-//! Hand-written, because the workspace has no third-party dependencies and this
-//! is not the place to acquire the first one. A CLI that takes four flags does
+//! Hand-written, because a CLI that takes four flags does not need a derive
+//! macro and a dependency tree. The workspace takes a third-party dependency
+//! only where being wrong would be *silent* — `sha2`, in `zalt-recipe`, is the
+//! one — and a mistyped flag is the opposite of silent. A CLI that takes four flags does
 //! not need a derive macro and a dependency tree; what it needs is to reject
 //! nonsense loudly, which is most of the code below.
 

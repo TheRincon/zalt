@@ -1,0 +1,22 @@
+[package]
+name = "zalt-recipe-train"
+description = "L3 dev tool: build and measure content-prefix dictionaries and recipe parameters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "zalt-recipe-train"
+path = "src/main.rs"
+
+[dependencies]
+# L3's mechanism, for the Recipe types and the dictionary hash. This tool is
+# the encode-side counterpart: it produces what zalt-recipe consumes.
+zalt-recipe.workspace = true
+zalt-codec.workspace = true
+
+[dev-dependencies]
+zalt-recipe.workspace = true

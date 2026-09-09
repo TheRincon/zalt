@@ -71,6 +71,23 @@ pub enum ErrorKind {
     BadDictionary,
     /// The manifest or dictionary could not be read from the filesystem.
     Io,
+
+    /// A `dcz` stream ended inside its 40-byte header.
+    ///
+    /// Distinct from every other rejection here because it is usually not a
+    /// rejection at all: a socket delivered a short read and the caller should
+    /// come back with more bytes. Collapsing it into a malformed-stream error
+    /// would make a decoder fail on traffic that merely arrived in two packets.
+    Truncated,
+    /// A stream declared `dcz` did not carry the header RFC 9842 §5 specifies.
+    NotDczStream,
+    /// The stream is `dcb` — dictionary-compressed Brotli, RFC 9842 §4.
+    ///
+    /// The sibling encoding, negotiated through the same headers, and a
+    /// plausible thing to be handed by mistake. Named so the answer is "this
+    /// is Brotli" rather than "this is not a zstd frame", which is true and
+    /// sends the reader nowhere.
+    BrotliDictionaryStream,
 }
 
 impl fmt::Display for ErrorKind {
@@ -93,6 +110,9 @@ impl fmt::Display for ErrorKind {
             Self::DictionaryIdMismatch => "dictionary id does not match the manifest",
             Self::BadDictionary => "not a valid dictionary",
             Self::Io => "could not be read",
+            Self::Truncated => "stream ended inside the dcz header; more bytes needed",
+            Self::NotDczStream => "not a dcz stream: the RFC 9842 header is absent or malformed",
+            Self::BrotliDictionaryStream => "this is a dcb (Brotli) stream, not dcz",
         })
     }
 }

@@ -13,6 +13,8 @@
 #   raw frames                 -> decode_hostile, decode_differential
 #   [level][content]           -> roundtrip_valid, backend_equivalence
 #   [level][schedule][content] -> streaming_equivalence
+#   [variant][body]            -> dcz_prelude
+#   [level][split:2][material] -> dcz_roundtrip
 
 set -euo pipefail
 
@@ -30,7 +32,8 @@ seed_content() {  # seed_content <target> <prefix-bytes> <file>
 }
 
 for t in decode_hostile decode_differential roundtrip_valid \
-         streaming_equivalence backend_equivalence; do
+         streaming_equivalence backend_equivalence \
+         dcz_prelude dcz_roundtrip; do
     mkdir -p "fuzz/corpus/$t"
 done
 
@@ -51,6 +54,30 @@ for f in "$FIX"/*.bin "$REF"/golden-compression/* "$REF"/generated/*.expected; d
     seed_content roundtrip_valid '\x03' "$f"
     seed_content backend_equivalence '\x03' "$f"
     seed_content streaming_equivalence '\x03\x11' "$f"
+done
+
+# The dcz targets (RFC 9842).
+#
+# Both build their input from a leading tag, so a seed is that tag plus
+# material. `dcz_prelude` variant 0 is "a well-formed header": the 32 bytes
+# after the tag become the hash and the rest becomes the frame, so a real
+# compressed frame here seeds a realistic stream. `dcz_roundtrip` splits its
+# material into dictionary and payload, so prose seeds it best — two halves of
+# one document are exactly the shape dictionary transport is for.
+ZTML=crates/zalt-ztml/data/ztml-0.3.dict
+for f in "$FIX"/*.zst "$REF"/golden-decompression/*.zst; do
+    [ -e "$f" ] || continue
+    # \x00 selects the well-formed-header variant; 32 bytes of hash follow.
+    { printf '\x00'; head -c 32 /dev/zero | tr '\0' 'A'; cat "$f"; } \
+        > "fuzz/corpus/dcz_prelude/$(basename "$f").seed"
+done
+[ -e "$ZTML" ] && seed_content dcz_prelude '\x05' "$ZTML"   # the dcb variant
+
+for f in doc/*.zdoc "$REF"/golden-compression/*; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in .*) continue ;; esac
+    # level 3, split 2048 bytes in: enough dictionary to find matches with.
+    seed_content dcz_roundtrip '\x03\x00\x08' "$f"
 done
 
 echo "corpus seeded:"

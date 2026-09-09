@@ -48,6 +48,7 @@
 
 extern crate alloc;
 
+pub mod dcz;
 pub mod error;
 #[cfg(feature = "std")]
 pub mod load;
@@ -55,10 +56,13 @@ pub mod load;
 pub mod parse;
 pub mod recipe;
 pub mod route;
+pub mod sha256;
 
+pub use dcz::{DictionaryStore, Stream};
 pub use error::{Error, ErrorKind, Result};
 pub use recipe::{Decode, DictionaryRef, DictionarySource, Encode, Match, Recipe, Rule, Strategy};
 pub use route::{Entry, RecipeSet};
+pub use sha256::{Digest, Sha256};
 
 #[cfg(feature = "parse")]
 pub use parse::parse;

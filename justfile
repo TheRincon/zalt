@@ -171,6 +171,7 @@ no-std:
     cargo build -p zalt-codec --target {{nostd_target}}
     cargo build -p zalt-recipe --target {{nostd_target}} --no-default-features
     cargo build -p zalt-recipe --target {{nostd_target}} --no-default-features --features parse
+    cargo build -p zalt-ztml --target {{nostd_target}}
 
 # Miri over the scalar path.
 #
@@ -188,7 +189,7 @@ miri: _fixtures
     MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri nextest run -p zalt-codec
 
 # Everything CI runs, in CI order. Run before pushing.
-gate: fmt-check clippy layering abi-check test test-release
+gate: fmt-check clippy layering ztml-dict-check abi-check test test-release
     @echo
     @echo "gate passed."
 
@@ -663,6 +664,72 @@ fixtures:
     {{zstd}} -3 --no-check -c text.bin    > text_nocheck.zst
     echo "regenerated:"
     ls -la *.zst *.bin
+
+# ------------------------------------------------------- the ZTML recipe
+
+ztml_data := "crates/zalt-ztml/data"
+ztml_samples := "doc/antikythera.zdoc doc/christmas.zdoc doc/handsome.zdoc doc/painted.zdoc doc/scripts.zdoc doc/showcase.zdoc"
+
+# Rebuild the ZTML content-prefix dictionary and commit the result.
+#
+# The blob is checked in rather than built by build.rs: `cargo build` has to
+# work on a fresh clone, a browser needs the bytes via include_bytes!, and a
+# dictionary that changes with whatever is in someone's corpus directory makes
+# every ratio measured against it unreproducible.
+#
+# `doc/synthetic.zdoc` is deliberately excluded. It is 219 KB against 3-12 KB
+# for the rest, and measured it makes the held-out ratio slightly *worse* while
+# growing the dictionary sevenfold. Dictionaries pay on small resources.
+[doc("Rebuild the ZTML content-prefix dictionary from doc/*.zdoc.")]
+ztml-dict:
+    cargo run -q -p zalt-recipe-train -- build \
+        --vocabulary {{ztml_data}}/vocabulary.txt \
+        --out {{ztml_data}} --name ztml-0.3 \
+        {{ztml_samples}}
+
+# Prove the checked-in dictionary is exactly what its inputs produce.
+#
+# Part of the gate. The generator is `cat` in a fixed order, so this needs no
+# tools and is exact — and it is worth having because the order is part of the
+# artifact: the same bytes concatenated differently measured up to 3.7% apart.
+[doc("Verify the committed ZTML dictionary matches its recorded inputs.")]
+ztml-dict-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    cargo run -q -p zalt-recipe-train -- build \
+        --vocabulary {{ztml_data}}/vocabulary.txt \
+        --out "$tmp" --name ztml-0.3 {{ztml_samples}} >/dev/null
+    if ! cmp -s "$tmp/ztml-0.3.dict" {{ztml_data}}/ztml-0.3.dict; then
+        echo "ZTML dictionary does not match its inputs. Run \`just ztml-dict\`." >&2
+        exit 1
+    fi
+    if ! cmp -s "$tmp/ztml-0.3.provenance.txt" {{ztml_data}}/ztml-0.3.provenance.txt; then
+        echo "ZTML provenance is stale. Run \`just ztml-dict\`." >&2
+        exit 1
+    fi
+    echo "ZTML dictionary matches its inputs."
+
+# Measure what the dictionary is worth, held out.
+#
+# Leave-one-out: for each document the dictionary is rebuilt WITHOUT it. A
+# dictionary containing the file it is measured on reports memorisation — the
+# shipped dictionary compresses showcase.zdoc from 7 782 bytes to 23, because
+# it contains it verbatim.
+[doc("Leave-one-out ratio for the ZTML dictionary (needs zstd).")]
+ztml-ratio level="9":
+    @cargo run -q -p zalt-recipe-train -- eval \
+        --vocabulary {{ztml_data}}/vocabulary.txt --level {{level}} {{ztml_samples}}
+
+# Search dictionary size against compression level, held out.
+#
+# Where `level = 9` in the ZTML manifest came from. Slow: every cell is a full
+# leave-one-out pass, so it is a deliberate act rather than part of the gate.
+[doc("Sweep dictionary size and level for the ZTML recipe (needs zstd).")]
+ztml-sweep:
+    @cargo run -q -p zalt-recipe-train -- sweep \
+        --vocabulary {{ztml_data}}/vocabulary.txt {{ztml_samples}}
 
 # Materialise derived artifacts for the reference conformance corpus.
 #

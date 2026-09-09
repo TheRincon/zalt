@@ -396,7 +396,8 @@ struct MachineState {
 
 impl MachineState {
     fn read() -> Option<Self> {
-        // `sysctl` rather than a crate: the workspace has no dependencies, and
+        // `sysctl` rather than a crate: the workspace takes dependencies only
+        // where being wrong would be silent, and
         // this is two numbers.
         let load = sysctl("vm.loadavg")?;
         // "{ 2.11 2.45 2.60 }"
