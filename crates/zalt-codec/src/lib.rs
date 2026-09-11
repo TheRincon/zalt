@@ -33,6 +33,7 @@ pub mod bits;
 pub mod block;
 pub mod decode;
 pub mod dict;
+pub mod encode;
 pub mod error;
 pub mod frame;
 pub mod fse;
@@ -52,11 +53,11 @@ pub mod xxh64;
 //   sequences.rs  sequence section, LL/ML/OF
 //   execute.rs    sequence execution + window management
 //   dict.rs       dictionary loading (format, not training) -- M4
-//   encode/       M5
 
 pub use backend::{Backend, Scalar};
 pub use decode::{
     Buffers, Decoder, FnSink, Progress, ScalarDecoder, Sink, Status, decompress, decompress_with,
 };
+pub use encode::{EncodeParams, Strategy, compress, compress_default};
 pub use error::{Error, Feature, Result};
 pub use frame::FrameHeader;

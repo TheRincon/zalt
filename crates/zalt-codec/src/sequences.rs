@@ -100,22 +100,22 @@ impl Tables {
 
 /// Baselines for literals-length codes 16..=35. Codes below 16 are their own
 /// value with no extra bits.
-const LL_BASELINE: [u32; 20] = [
+pub(crate) const LL_BASELINE: [u32; 20] = [
     16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
     65536,
 ];
 /// Extra bits for literals-length codes 16..=35.
-const LL_EXTRA: [u32; 20] = [
+pub(crate) const LL_EXTRA: [u32; 20] = [
     1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 ];
 
 /// Baselines for match-length codes 32..=52. Codes below 32 are `code + 3`.
-const ML_BASELINE: [u32; 21] = [
+pub(crate) const ML_BASELINE: [u32; 21] = [
     35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051, 4099, 8195, 16387,
     32771, 65539,
 ];
 /// Extra bits for match-length codes 32..=52.
-const ML_EXTRA: [u32; 21] = [
+pub(crate) const ML_EXTRA: [u32; 21] = [
     1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 ];
 
@@ -442,7 +442,18 @@ pub fn decode(
 /// output, just wrong output, and only on blocks that happen to contain a
 /// zero-literal sequence.
 #[inline(always)]
-fn resolve_offset(offset_value: u32, ll_zero: bool, repeats: &mut [u32; REP_COUNT]) -> Result<u32> {
+/// Resolve an `Offset_Value` against the repeat table, updating it.
+///
+/// `pub(crate)` so the **encoder** can use it as its own oracle. §4 calls the
+/// `literals_length == 0` shift "the single most commonly botched part of the
+/// format"; rather than write an inverse of this rule and hope the two agree,
+/// `encode::sequences` asks *this function* which offset value produces the
+/// offset it wants. The two directions cannot disagree about a rule they share.
+pub(crate) fn resolve_offset(
+    offset_value: u32,
+    ll_zero: bool,
+    repeats: &mut [u32; REP_COUNT],
+) -> Result<u32> {
     if offset_value > REP_COUNT as u32 {
         let offset = offset_value - REP_COUNT as u32;
         repeats[2] = repeats[1];
