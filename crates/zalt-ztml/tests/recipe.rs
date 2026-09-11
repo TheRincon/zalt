@@ -200,3 +200,45 @@ fn documents_compressed_against_the_shipped_dictionary_decode_byte_exactly() {
     assert!(checked > 0, "no .zdoc documents were checked");
     eprintln!("checked {checked} dictionary-compressed frames");
 }
+
+#[test]
+fn the_recipe_produces_encoder_parameters_the_codec_accepts() {
+    // The M5 plumbing, end to end on the recipe that ships: routing and rules
+    // applied, then handed to the encoder as a struct it will actually take.
+    let r = zalt_ztml::recipe();
+
+    // A document: compress at the measured level, in the declared window.
+    let doc = r.codec_params(Some("application/ztml"), None);
+    assert_eq!(doc.level, 9);
+    assert_eq!(doc.window_log, 17);
+    assert_eq!(doc.strategy, zalt_codec::encode::Strategy::Compress);
+    doc.validate()
+        .expect("a recipe must not describe a malformed frame");
+
+    // Already-compressed media: the §8 rule reaches the encoder intact.
+    let media = r.codec_params(Some("image/webp"), None);
+    assert_eq!(media.strategy, zalt_codec::encode::Strategy::Stored);
+    media.validate().expect("valid");
+
+    // And stored mode actually encodes, which is the half of M5 that exists.
+    let payload = b"already compressed bytes, near enough".repeat(40);
+    let frame = zalt_codec::compress(&payload, &media).expect("stored encode");
+    let back = zalt_codec::decompress(&frame, zalt_codec::params::DecodeLimits::default())
+        .expect("round trip");
+    assert_eq!(back, payload);
+
+    // And the document path compresses, at the level the manifest asked for.
+    let compressed = zalt_codec::compress(&payload, &doc).expect("document encode");
+    assert!(
+        compressed.len() < frame.len(),
+        "the document path must beat the stored path on repetitive input: \
+         {} compressed vs {} stored",
+        compressed.len(),
+        frame.len()
+    );
+    assert_eq!(
+        zalt_codec::decompress(&compressed, zalt_codec::params::DecodeLimits::default())
+            .expect("round trip"),
+        payload
+    );
+}

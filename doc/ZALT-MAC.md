@@ -2988,11 +2988,388 @@ and is the difference between 29% and a figure nothing in production will ever
 reproduce.
 
 ### M5 — Encoder
-- [ ] Correctness-first encoder; `encode_decode` differential fuzzing.
-- [ ] Parameter plumbing from recipes; stored-block fast path.
-- [ ] Block splitting at statistical transitions (§7) — wire-compatible, no
-      negotiation required.
+
+Staged, because "the encoder" is several separable pieces. The ordering is the
+one this section asked for: correctness, then ratio. Every ratio box below was
+opened only after the differential harness against libzstd and `ruzstd` was
+already passing, so no increment could trade correctness for size without
+something saying so.
+
+- [x] **Frame layer and stored blocks.** `encode/` writes frame headers, raw and
+      RLE blocks, block splitting by size, and the content checksum. Complete,
+      wire-valid zstd at a ratio of 1.0 — which is not a placeholder but the
+      `strategy = "stored"` path §7 specifies and `zalt-ztml` already declares.
+- [x] `encode_decode` differential fuzzing. 3.4M executions, no findings.
+- [x] Parameter plumbing from recipes: `Recipe::codec_params` applies routing
+      and `[[rule]]` overrides and hands back an `EncodeParams` the codec takes.
+- [x] **Compressed blocks**: raw literals, predefined FSE tables, greedy match
+      finder. 1.9x-7.1x, which is 1.3x-1.5x larger than `zstd -1`.
+- [x] **Huffman literals**, with the FSE-compressed weight description.
+      Gap to `zstd -1` closed from 1.29x-1.50x to **1.09x-1.46x**.
+- [x] **Fitted FSE tables** for the sequence codes. zalt now **matches
+      `zstd -1`** on small documents; the gap that remains is the match finder.
+- [x] **Match finder**: hash chains, lazy matching, history across blocks.
+      zalt now sits **between `zstd -3` and `-9`** on every file measured.
+- [x] **Repeat offsets**, with the decoder's own rule as the oracle. Worth
+      0.1%-1.4%, rising with file size.
+- [ ] Encoder throughput, which has never been measured properly. The one
+      box left open, and deliberately: three separate choices in this encoder
+      build both candidates and keep the smaller, which is the right call for
+      ratio and an obvious place to look for time.
+- [x] **Block splitting** at statistical transitions (§7) — built as a
+      *detector*, after the measurement below contradicted the premise. Worth
+      1.6% on separable content and exactly nothing, at no cost, on everything
+      else.
 - [ ] Ratio work only after correctness.
+
+#### The stored encoder, and three decoders
+
+An encoder cannot be checked by reading its output; the only question worth
+asking is whether somebody else can read it. So the differential harness was
+wired up before a byte of ratio work, against three decoders with deliberately
+different standing:
+
+1. **libzstd**, through its CLI. Its refusal is our bug, with no second opinion
+   to appeal to — the reference *defines* what the ecosystem accepts.
+2. **`ruzstd`**, independent and pure Rust, so a misreading shared between
+   zalt's encoder and zalt's decoder cannot hide behind itself.
+3. **zalt's own decoder**, the weakest of the three, and there to catch the two
+   halves drifting apart rather than to establish anything.
+
+All three read every frame the encoder emits, across a matrix of content sizes
+chosen to straddle each header field boundary and six parameter sets.
+
+**The writer is the parser's inverse, and is tested as that rather than against
+the prose.** `crate::frame` has been read against the reference corpus since M1,
+so the header writer was derived from *it*; the test asserts a round trip —
+anything written must parse back to what it was written from — rather than
+asserting a byte layout that would just be the RFC transcribed a second time,
+with whatever second misreading that invites. §4 records one the prose already
+caused.
+
+**One asymmetry caught by writing the inverse.** `Frame_Content_Size_flag` 0
+means a *one-byte* field when `Single_Segment` is set and **no field at all**
+when it is not. A writer that treats the flag as size-only emits a byte the
+parser will not read, and the frame desynchronises at the first block header.
+The first draft here did exactly that; the parser's own comment is what caught
+it, which is the argument for deriving one from the other.
+
+**`Strategy::Compress` returns `Unimplemented` rather than falling back to
+stored.** Handing ratio-1.0 output to a caller who asked for compression is the
+invisible failure this document keeps recording: the bytes decode, nothing
+errors, and the only symptom is a ratio nobody compared.
+
+#### Compressed blocks, and the two oracles that made them safe
+
+The plan in the previous section held: **raw literals plus predefined FSE
+tables needs no entropy analysis at all**, so the first compressed block was a
+match finder, an FSE encoding table, and a backward bitstream writer. Measured
+with `just encode-ratio`:
+
+| file | raw | zalt | zstd -1 | gap |
+|---|---|---|---|---|
+| `showcase.zdoc` | 7 782 | 4 031 (1.93x) | 3 115 (2.50x) | 1.29x |
+| `handsome.zdoc` | 11 755 | 5 600 (2.10x) | 4 303 (2.73x) | 1.30x |
+| `rfc9842.txt` | 35 626 | 15 041 (2.37x) | 11 452 (3.11x) | 1.31x |
+| `synthetic.zdoc` | 219 355 | 30 718 (7.14x) | 20 511 (10.69x) | 1.50x |
+
+Behind the reference by about a third, which is what raw literals cost: every
+literal is a byte on the wire where libzstd Huffman-codes it, and §8 says this
+content is literal-dominated. That is the next increment and the gap is the
+argument for it.
+
+**Three deliberate simplifications, each removing a class of bug rather than
+saving work.** Matching stays *inside the block*, so there is no history buffer
+to keep in step with the decoder's. **Repeat offsets are never emitted** —
+`Offset_Value` 1-3 are simply not used — so the encoder never models the
+`literals_length == 0` update that §4 calls "the single most commonly botched
+part of the format". And a block falls back to stored whenever the compressed
+form is not smaller, without which "compress" would reliably *expand* exactly
+the incompressible data `strategy = "stored"` exists to protect.
+
+**Codes are derived from the decoder's tables, not transcribed.** libzstd
+carries `LL_Code[64]` and `ML_Code[128]` mapping a value to its code;
+transcribing those would be two more chances at the mistake §10 records against
+`ML_DEFAULT`, where a table that summed correctly still mapped states to the
+wrong symbols with every self-consistency check passing. So a value's code is
+searched out of the baseline tables the decoder already uses. The two
+directions cannot disagree about a table they share, and the tests assert the
+composition rather than the contents.
+
+**The bug the tests caught, and what kind it was.** The match finder bounded a
+match's source slice at the current position, which caps every match at its own
+offset and therefore forbids **overlapping matches entirely** — the offset-1 run
+that is §5's win #2 could never be found, because its source is one byte long.
+Every frame produced was still valid and every decoder still read it; the only
+symptom was ratio. It was caught by an assertion that a run of one byte must
+produce an offset-1 sequence, written because the case was interesting, not
+because anything suggested it was broken. **A correctness suite would not have
+found this**, and neither would the fuzzer, whose oracle is agreement rather
+than size.
+
+#### Huffman literals, and the header that nearly made them pointless
+
+| file | zalt before | zalt now | `zstd -1` | gap before | gap now |
+|---|---|---|---|---|---|
+| `showcase.zdoc` | 4 031 | **3 410** | 3 115 | 1.29x | **1.09x** |
+| `handsome.zdoc` | 5 600 | **4 876** | 4 303 | 1.30x | **1.13x** |
+| `rfc9842.txt` | 15 041 | **13 952** | 11 452 | 1.31x | **1.22x** |
+| `synthetic.zdoc` | 30 718 | **30 001** | 20 511 | 1.50x | **1.46x** |
+
+**The direct weight description is unusable on real data, and the reason is not
+the one it looks like.** A Huffman table is described by a weight per symbol,
+and the cheap form writes them four bits each behind a header byte of
+`127 + count` — so it tops out at 128 weights. That sounds generous for text
+until the count turns out to run to the largest *symbol value*, not the number
+of distinct symbols. Every file in this corpus uses fewer than a hundred
+distinct bytes and still reaches byte 194 or beyond, so not one of them can use
+it. The measurement is worth keeping because the limit reads like a
+128-distinct-symbol limit and is not:
+
+| file | distinct bytes | largest byte |
+|---|---|---|
+| `showcase.zdoc` | 87 | 226 |
+| `rfc9842.txt` | 90 | 239 |
+| `synthetic.zdoc` | 80 | 194 |
+
+So the FSE-compressed weight description had to be written too — which meant an
+FSE **table description** writer, a count normaliser, and the two-state
+interleaved coder, none of which the sequence section needed because predefined
+tables carry no description at all.
+
+**Two bugs, both found by round-tripping through our own decoder.**
+
+The first was in length limiting. zlib's repair — clamp the overlong leaves,
+then pay the surplus back two at a time — assumes the surplus is exactly
+`overflow / 2` slots, which holds when depth is limited *during* construction
+and not when a tree is built unlimited and clamped afterwards. Kraft came out
+wrong and `build` refused its own table. Replaced with direct accounting of the
+sum, which is slower, has no precondition, and can be asserted.
+
+The second is the more interesting one. The interleaved FSE coder started both
+states blank; libzstd **seeds** them from the last two symbols, which emit no
+bits. Starting blank makes the stream one symbol too long, and the decoder —
+which stops on exhaustion rather than on a count — recovers an extra weight.
+The symptom was that every literal decoded correctly *except the highest
+symbol*, which came back as its neighbour: one extra weight shifts the whole
+weight array, and so the whole table, by one. `'z'` decoded as `'|'`. A
+correctness bug that presents as a single wrong byte in a thousand is exactly
+the kind this codec's differential harness exists for, and a round trip through
+our own decoder was enough to expose it.
+
+**Where the rest of the gap is.** `synthetic.zdoc` barely moved, because at
+7.3x it is match-dominated and has few literals to code. The sequence codes are
+still on the *predefined* FSE distributions, which is what remains — fitting
+tables to each block's own statistics, with the table-description writer this
+increment already had to build.
+
+#### Fitted FSE tables, and where the encoder now stands
+
+| file | raw | zalt | `zstd -1` | `-3` | `-9` | `-19` |
+|---|---|---|---|---|---|---|
+| `showcase.zdoc` | 7 782 | **3 087** | 3 115 | 3 044 | 2 910 | 2 885 |
+| `rfc9842.txt` | 35 626 | **11 458** | 11 452 | 10 952 | 10 066 | 9 716 |
+| `rfc8878.txt` | 112 425 | 29 827 | 28 362 | 27 006 | 24 554 | 23 215 |
+| `synthetic.zdoc` | 219 355 | 22 996 | 20 511 | 18 108 | 10 766 | 8 253 |
+
+**zalt matches `zstd -1` on small documents**, and beats it on `showcase.zdoc`
+by 28 bytes. That is the level and the file size §8 says this workload is: many
+small resources, where per-frame cost dominates. It is not a claim about zstd in
+general — `-3` is 1–2% ahead on those files and much further ahead on the large
+one.
+
+The progression is worth keeping, because it says which work bought what:
+
+| | `showcase.zdoc` | gap to `-1` |
+|---|---|---|
+| raw literals, predefined tables | 4 031 | 1.29x |
+| + Huffman literals | 3 410 | 1.09x |
+| + fitted FSE tables | **3 087** | **0.99x** |
+
+**Both candidates are built and the smaller kept**, rather than choosing from an
+entropy estimate as libzstd does. An estimate must model the table
+description's cost as well as the bitstream's, and being wrong is invisible —
+it costs ratio, silently, which is the failure this encoder has now tripped over
+twice. Encoding the section twice is a plain cost for an answer that cannot be
+worse than the predefined tables it replaces. The refinement left is choosing
+*per table* rather than for all three at once: the modes byte has independent
+fields, so a block could fit its literals lengths and keep the predefined
+offsets. Eight candidates instead of two, and worth doing when a measurement
+asks for it.
+
+**What is left is the match finder, not the entropy coder.** `synthetic.zdoc` is
+where the gap is widest, and it is 219 KB — two blocks, so every match that
+would reach across the boundary is unavailable, and within a block the parse is
+greedy with no repeat offsets. Those three simplifications were taken
+deliberately in the previous increment and each removed a class of bug; they are
+now the whole remaining difference. Entropy coding is done.
+
+#### The match finder, and where the encoder ended up
+
+| file | raw | zalt | `zstd -1` | `-3` | `-9` | `-19` |
+|---|---|---|---|---|---|---|
+| `showcase.zdoc` | 7 782 | **2 922** | 3 115 | 3 044 | 2 910 | 2 885 |
+| `rfc9842.txt` | 35 626 | **10 220** | 11 452 | 10 952 | 10 066 | 9 716 |
+| `rfc8878.txt` | 112 425 | **25 448** | 28 362 | 27 006 | 24 554 | 23 215 |
+| `synthetic.zdoc` | 219 355 | **11 904** | 20 511 | 18 108 | 10 766 | 8 253 |
+
+**Better than `zstd -3` on every file, and within a few percent of `-9`.**
+`synthetic.zdoc` moved the furthest — 22 996 to 11 904, very nearly halved —
+because it is the only file large enough to have a second block, and cross-block
+history is what it had been missing.
+
+The whole progression, on the file that started this:
+
+| | `showcase.zdoc` | versus `zstd -1` |
+|---|---|---|
+| raw literals, predefined tables | 4 031 | 1.29x |
+| + Huffman literals | 3 410 | 1.09x |
+| + fitted FSE tables | 3 087 | 0.99x |
+| + chains, lazy, cross-block | **2 922** | **0.94x** |
+
+**Three changes, and the one that mattered most was not the clever one.** Hash
+chains and lazy matching are the textbook improvements; carrying the matcher
+across block boundaries is bookkeeping. On a corpus of small files the first two
+did most of the work, and on the only large file the third did nearly all of it.
+
+**The bug, which cost every match in the file.** The parse inserted each
+position into the hash chain *before* searching from it — so the search's first
+candidate was the current position, the walk stopped immediately on "not
+earlier", and no match was ever found. The failing assertion was the offset-1
+run, the same case that caught the previous match-finder bug. The fix carries a
+loop invariant now: every position below the cursor is inserted **exactly
+once**, and none at or above it. Both halves are load-bearing, and the second is
+the subtler one — inserting a position twice points its chain slot at itself,
+and the walk from there is a self-loop that only the descending-chain guard
+stops.
+
+**A test that passed for the wrong reason.** The first cross-block test
+compressed repeated prose and asserted the second block reached back into the
+first. It failed — correctly. With prose repeating every 44 bytes there is
+always a nearer match, so the matcher was right to take one and the *assertion*
+was wrong. Rewritten over content with no internal repetition, where the only
+match available is a block away, it tests what it claims to.
+
+#### Repeat offsets, and asking the decoder rather than inverting it
+
+The last simplification, and the one §4 singles out: *"the repeat-offset update
+has a special case when `literals_length == 0`. The single most commonly
+botched part of the format."*
+
+**So it was not inverted.** `crate::sequences::resolve_offset` — read against
+the reference corpus since M1 — is now `pub(crate)`, and the encoder *asks* it:
+for each sequence it tries offset values 1, 2 and 3 against a copy of the repeat
+table and takes whichever reproduces the offset it wants, falling back to a
+literal `offset + 3`. The commit goes through the same function. The two
+directions cannot disagree about a rule they share, and the case §4 warns about
+is never written down twice.
+
+| file | before | after | saved |
+|---|---|---|---|
+| `showcase.zdoc` | 2 922 | 2 920 | 0.1% |
+| `rfc9842.txt` | 10 220 | 10 188 | 0.3% |
+| `rfc8878.txt` | 25 448 | 25 172 | 1.1% |
+| `synthetic.zdoc` | 11 904 | 11 741 | 1.4% |
+
+**Smaller than expected, and the reason is instructive.** The first version only
+used a repeat when the longest match *happened* to sit at one, which is rare —
+worth 0.1% to 0.5%. Most of the value is in the match *search*: a repeat costs a
+code of 0 or 1 where a literal 128 KiB offset costs seventeen bits, so an
+equal-length match at a recent offset is strictly the better sequence. Moving
+the choice into the matcher and preferring repeats roughly doubled the saving.
+
+Only "no shorter", deliberately. Trading match length for a cheaper offset is a
+real trade and making it well needs a cost model this encoder does not have —
+which is also why libzstd, whose optimal parser prices every candidate, gets
+more from repeat offsets than this does.
+
+**One trap worth recording.** The repeat table advances during parsing, but a
+block whose compressed form does not pay is emitted **stored** — and a stored
+block advances nothing on the decoder's side. Leaving the encoder's table ahead
+of the decoder's would mistranslate every later repeat code, producing wrong
+bytes with no error anywhere. So the table is snapshotted before each block and
+rolled back on fallback, and a test asserts the restore is exact. Nothing found
+this; it was noticed while writing the fallback, which is the kind of bug that
+would otherwise have waited for a corpus with one incompressible block in the
+middle of a compressible file.
+
+#### Block splitting: the measurement changed what got built
+
+The M4 caution asked for §7's premise to be checked before a splitter was
+written. Checking it turned a splitter into a detector.
+
+**Splitting at a fixed stride is a loss on every real file.** Compressed size
+falls monotonically as blocks grow:
+
+| block size | 4 KiB | 8 KiB | 16 KiB | 32 KiB | 64 KiB | 128 KiB |
+|---|---|---|---|---|---|---|
+| `rfc9842.txt` | 10 751 | 10 483 | 10 317 | 10 258 | **10 188** | **10 188** |
+| `rfc8878.txt` | 26 584 | 25 764 | 25 303 | 25 153 | **25 150** | 25 172 |
+| `synthetic.zdoc` | 14 261 | 13 048 | 12 338 | 12 007 | 11 862 | **11 741** |
+
+Every block pays for a Huffman weight description and three FSE table
+descriptions, and smaller blocks give those tables less data to fit against.
+The 22 bytes by which 64 KiB beats 128 KiB on `rfc8878.txt` is 0.09% and not a
+finding.
+
+**The mechanism is real; the content is what is missing.** A controlled pair
+settles it — the same bytes, arranged two ways:
+
+| content | one block | split at the boundary | delta |
+|---|---|---|---|
+| 64 KiB text, then 64 KiB random | 83 656 | 82 340 | **-1.6%** |
+| the same, interleaved every 64 bytes | 87 267 | 87 173 | -0.1% |
+
+Separable content gains meaningfully. Interleaved content — which is what a
+document carrying a hash per subresource *is*, and what the M4 caution said
+`.zdoc` looks like — gains nothing. §7's paragraph assumed markup and hash
+regions could be put in different blocks; they cannot, because they alternate
+every sixty-four bytes.
+
+**So the splitter detects rather than splits.** `encode::split::transitions`
+proposes a boundary only where the byte distribution actually changes, measured
+as L1 distance between adjacent 4 KiB histograms — integer arithmetic, because
+entropy would want a logarithm and `core`, being float-free, has none. When it
+proposes nothing, which is the answer for every file in this corpus, the
+encoder does not encode anything twice and the feature costs nothing at all.
+When it does propose something, both arrangements are encoded and the smaller
+kept, so the fixed-stride result is always the floor.
+
+That is the third place in this encoder where a candidate is built and measured
+rather than chosen by estimate — after the literals section and the sequence
+tables. The pattern is deliberate: every one of those choices is invisible when
+wrong, costing only ratio, and this document has recorded enough of those to
+stop guessing at them.
+
+#### Encode cost, measured the way §10 insists
+
+Ratios are deterministic and can be quoted directly. Time cannot, and this
+machine proved it again: the same measurement of `rfc8878.txt` gave 0.37 s and
+then 0.17 s in consecutive runs. Only interleaved, best-of-three comparisons
+mean anything, and even those are held loosely.
+
+On that basis zalt's encode costs roughly **1.1x-1.4x `zstd -9`** while
+producing output between `-3` and `-9`. That is a defensible place to be and it
+is not a claim to build on: the encoder has had no throughput work at all, and
+carries at least one obvious waste — the sequences section is built twice, once
+against the predefined tables and once against fitted ones, to compare their
+sizes. Anyone acting on encoder speed should measure it properly first, against
+the discipline in §10 rather than against the numbers here.
+
+#### `ci/interop.sh`, and why it is not the same evidence as the tests
+
+`tests/encode.rs` links our encoder and our decoder into one binary and calls
+libzstd through its CLI. `just interop` runs the actual `zstd` executable over
+files on disk, in four directions — zalt to zstd, zalt to `ruzstd`, zstd to
+zalt at four levels, and zalt to zalt — across both strategies, with and
+without a checksum, including an empty file and a single byte. 112 checks.
+
+Two decoders and not one, for the reason §9 gives for `ruzstd` on the decode
+side: libzstd is the reference and its refusal is our bug, but a *shared*
+misreading between our encoder and our decoder would be invisible to a round
+trip, and `ruzstd` shares code with neither. The in-process tests assert the
+same properties; the script is what an ecosystem would actually do with our
+bytes, and if the two ever disagree the disagreement is the finding.
 
 ### M6 container header — design note
 

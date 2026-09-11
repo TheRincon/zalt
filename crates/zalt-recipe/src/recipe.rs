@@ -231,6 +231,45 @@ impl Recipe {
         encode
     }
 
+    /// Encoder parameters for this content, ready for the codec.
+    ///
+    /// The plumbing M5 calls for: routing and `[[rule]]` overrides applied,
+    /// then translated into the L1 type. A recipe describes intent in the
+    /// vocabulary a manifest author writes; the codec takes a struct with a
+    /// block size in it, and something has to be the seam between them.
+    ///
+    /// Two fields are *derived* rather than carried, because a manifest has no
+    /// business setting them:
+    ///
+    /// - **block size** is clamped to the declared window. `Block_Maximum_Size`
+    ///   is `min(128 KiB, windowSize)`, so a recipe naming a small window would
+    ///   otherwise produce parameters the encoder must refuse — a manifest that
+    ///   loads and then fails at the first encode.
+    /// - **checksum** stays at the codec's default. It is a per-deployment
+    ///   choice about what a reader pays to verify, not a property of a content
+    ///   class, and §10 measured it as a real fraction of decode time.
+    pub fn codec_params(
+        &self,
+        content_type: Option<&str>,
+        filename: Option<&str>,
+    ) -> zalt_codec::encode::EncodeParams {
+        let encode = self.encode_for(content_type, filename);
+        let defaults = zalt_codec::encode::EncodeParams::default();
+        let window_log = encode.window_log.unwrap_or(defaults.window_log);
+
+        zalt_codec::encode::EncodeParams {
+            level: encode.level.unwrap_or(defaults.level),
+            strategy: match encode.strategy {
+                Strategy::Stored => zalt_codec::encode::Strategy::Stored,
+                Strategy::Compress => zalt_codec::encode::Strategy::Compress,
+            },
+            window_log,
+            checksum: defaults.checksum,
+            dictionary_id: self.dictionary.as_ref().and_then(|d| d.id),
+            block_size: defaults.block_size.min(1u32 << window_log.min(31)),
+        }
+    }
+
     /// Whether this recipe claims the given content type or filename.
     pub fn claims(&self, content_type: Option<&str>, filename: Option<&str>) -> bool {
         rule_claims(&self.match_, content_type, filename)

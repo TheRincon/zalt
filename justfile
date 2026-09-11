@@ -665,6 +665,37 @@ fixtures:
     echo "regenerated:"
     ls -la *.zst *.bin
 
+# Interoperability against the reference and an independent decoder.
+#
+# In-process tests link our encoder and our decoder into one binary; this runs
+# the real `zstd` executable over files on disk, which is what an ecosystem
+# would actually do with our output. Both directions, both strategies, with and
+# without a checksum.
+[doc("zalt <-> zstd <-> ruzstd interop over real files.")]
+interop *FILES:
+    @bash ci/interop.sh {{FILES}}
+
+# Compressed size against the reference, per file.
+#
+# Reports the gap, not a bare ratio: our number alone says nothing about
+# whether the encoder is any good. Ratios are deterministic, so this needs no
+# quiet-machine caveat — unlike anything measuring time.
+[doc("Compression ratio against zstd -1, for the files given.")]
+encode-ratio +FILES:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v {{zstd}} >/dev/null || { echo "need zstd on PATH"; exit 1; }
+    printf "%-24s %9s %9s %8s %9s %8s %8s\n" file raw zalt ratio "zstd -1" ratio gap
+    for f in {{FILES}}; do
+        line=$(cargo run -q --release -p zalt-codec --example ratio -- "$f")
+        raw=$(echo "$line" | cut -f2); ours=$(echo "$line" | cut -f3)
+        ref=$({{zstd}} -1 -c "$f" | wc -c | tr -d ' ')
+        printf "%-24s %9s %9s %7.2fx %9s %7.2fx %7.2fx\n" "$(basename "$f")" \
+            "$raw" "$ours" "$(echo "scale=4;$raw/$ours" | bc)" \
+            "$ref" "$(echo "scale=4;$raw/$ref" | bc)" \
+            "$(echo "scale=4;$ours/$ref" | bc)"
+    done
+
 # ------------------------------------------------------- the ZTML recipe
 
 ztml_data := "crates/zalt-ztml/data"
