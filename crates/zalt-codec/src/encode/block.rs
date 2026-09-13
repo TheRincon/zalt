@@ -130,7 +130,10 @@ pub fn write_all(
     // One matcher for the whole frame, so its history, hash chains and repeat
     // table carry across block boundaries. A matcher per block would confine
     // every offset to its own block, which is what the first version did.
-    let mut matcher = compress.then(|| match_finder::Matcher::new(window_log));
+    // `input.len()` is the whole frame, not this block: the matcher indexes
+    // every position of the frame and reaches back across block boundaries, so
+    // sizing its tables to one block would alias positions that are still live.
+    let mut matcher = compress.then(|| match_finder::Matcher::new(window_log, input.len()));
 
     let mut offset = 0usize;
     for &end in boundaries.iter().chain(core::iter::once(&input.len())) {

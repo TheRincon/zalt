@@ -361,7 +361,10 @@ fn fse_weights(weights: &[u8]) -> Option<Vec<u8>> {
 /// from its end — the same reversal the sequence bitstream needs, and for the
 /// same reason.
 fn encode_segment(code: &Code, segment: &[u8]) -> Vec<u8> {
-    let mut w = BitWriter::new();
+    // A code is at most eleven bits, so the segment cannot exceed
+    // `len * 11 / 8` bytes. Huffman is only chosen when it beats raw, so in
+    // practice this reserves more than the stream needs and never less.
+    let mut w = BitWriter::with_capacity(segment.len() * 11 / 8 + 8);
     for &symbol in segment.iter().rev() {
         let s = usize::from(symbol);
         w.add_bits(u64::from(code.values[s]), u32::from(code.lengths[s]));
