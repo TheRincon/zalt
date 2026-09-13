@@ -318,7 +318,12 @@ fn predefined(norm: &'static [i16], accuracy: u32) -> Chosen {
 
 /// Encode the bitstream for one choice of the three tables.
 fn encode_bitstream(coded: &[Coded], ll: &CTable, ml: &CTable, of: &CTable) -> Vec<u8> {
-    let mut w = BitWriter::new();
+    // A sequence costs three state transitions of at most ten bits each and
+    // three value fields of at most sixteen, sixteen and thirty-one — under
+    // twelve bytes. This is a ceiling, not an estimate: the stream cannot
+    // exceed it, so the writer never reallocates, and the block's own size
+    // caps how far the over-reservation can go.
+    let mut w = BitWriter::with_capacity(coded.len() * 12 + 16);
     let last = coded.last().expect("non-empty");
 
     // The last sequence seeds the states and contributes only its value bits;

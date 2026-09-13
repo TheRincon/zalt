@@ -9,15 +9,29 @@
 //! byte and starts reading immediately below it, so a stream closed without one
 //! is unreadable and a stream closed with two is off by however many bits.
 //!
-//! ## Why the container is flushed after every field
+//! ## When the container is flushed, and the measurement that changed it
 //!
 //! libzstd flushes at carefully chosen points and reasons, in comments counting
 //! bits, about how much can accumulate between them. That is a throughput
-//! optimisation resting on an invariant a reader has to reconstruct. Here every
-//! `add_bits` is followed by a flush, so `bit_pos` never exceeds 7 + 32 and the
-//! container cannot overflow — no invariant, nothing to get wrong, and the same
-//! bytes come out. When there is a measurement asking for it, that is the
-//! change to make; §10 is emphatic that this is not the moment.
+//! optimisation resting on an invariant a reader has to reconstruct across call
+//! sites, and this module originally refused it: every `add_bits` flushed, and
+//! the comment here said the change was the right one to make *"when there is a
+//! measurement asking for it"*.
+//!
+//! §10's M5 profile is that measurement. `CState::encode` and
+//! `Coded::write_values` — which are almost entirely `add_bits` — were 11% of
+//! encode time on a large file and 14% on a small one, and nearly all of it was
+//! a flush that pushed bytes **one at a time** through a `Vec` bounds check per
+//! byte, for a field that usually completes no byte at all.
+//!
+//! **The invariant taken is local, which is the whole point.** A field is at
+//! most 32 bits — [`BitWriter::add_bits`] asserts it, and the widest field in
+//! the format is a 31-bit offset code — so flushing whenever `bit_pos` exceeds
+//! 32 leaves at most 32 bits behind, and the next field cannot push the
+//! container past 64. That is provable from the assertion three lines above it,
+//! not from a bit budget maintained by every caller. The bytes emitted are
+//! identical either way: only *when* a complete byte leaves the container
+//! changes, never the order bits enter it.
 
 use alloc::vec::Vec;
 
@@ -29,10 +43,30 @@ pub struct BitWriter {
 }
 
 impl BitWriter {
+    /// The widest field this writer accepts, in bits.
+    ///
+    /// Not a tuning constant — it is what the format actually contains. The
+    /// widest single field is an offset code, which is the position of the
+    /// highest set bit of an `Offset_Value` and so at most 31 for a window the
+    /// encoder can declare. Literals-length and match-length extra bits reach
+    /// 16, an FSE state transition `tableLog + 1` reaches 10, and a Huffman code
+    /// reaches 11.
+    const MAX_FIELD_BITS: u32 = 32;
+
     /// A writer with nothing in it.
     pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// A writer that will not reallocate for the first `bytes` of output.
+    ///
+    /// Every caller knows roughly how large its stream will be — a sequence
+    /// bitstream is bounded by its sequence count, a Huffman segment by its
+    /// literals — and growing a `Vec` from empty doubles its way there through
+    /// a chain of copies, per block, in the encoder's hot path.
+    pub fn with_capacity(bytes: usize) -> Self {
         Self {
-            out: Vec::new(),
+            out: Vec::with_capacity(bytes),
             container: 0,
             bit_pos: 0,
         }
@@ -48,23 +82,31 @@ impl BitWriter {
         if nb_bits == 0 {
             return;
         }
-        debug_assert!(nb_bits < 64);
+        debug_assert!(nb_bits <= Self::MAX_FIELD_BITS);
         let mask = (1u64 << nb_bits) - 1;
         self.container |= (value & mask) << self.bit_pos;
         self.bit_pos += nb_bits;
-        self.flush();
+        // The container now holds at most 64 bits, because `bit_pos` was at
+        // most `MAX_FIELD_BITS` on entry. Flushing back below that threshold
+        // re-establishes it for the next field, and is the only thing any
+        // caller has to be able to rely on.
+        if self.bit_pos > Self::MAX_FIELD_BITS {
+            self.flush();
+        }
     }
 
     /// Write out every complete byte the container holds.
     fn flush(&mut self) {
         let nb_bytes = (self.bit_pos >> 3) as usize;
-        for i in 0..nb_bytes {
-            self.out.push((self.container >> (8 * i)) as u8);
-        }
+        // One append of up to eight bytes, rather than a push and a capacity
+        // check per byte. `to_le_bytes` is the same little-endian order the
+        // loop this replaced produced by shifting.
+        self.out
+            .extend_from_slice(&self.container.to_le_bytes()[..nb_bytes.min(8)]);
         self.bit_pos &= 7;
-        // `>>= 64` is undefined for a u64 and panics in debug. Flushing after
-        // every field keeps `nb_bytes` well under 8, but the guard costs
-        // nothing and removes the dependency on that.
+        // `>>= 64` is undefined for a u64 and panics in debug. `nb_bytes`
+        // reaches 8 exactly when the container is full, and then nothing is
+        // left over.
         self.container = if nb_bytes >= 8 {
             0
         } else {
@@ -79,6 +121,12 @@ impl BitWriter {
     /// bit of the last byte and knows where the payload stops.
     pub fn close(mut self) -> Vec<u8> {
         self.add_bits(1, 1);
+        // Deliberate, and the one place the deferred flush is load-bearing:
+        // `add_bits` no longer empties the container, so up to four whole bytes
+        // may still be sitting in it. Writing `container as u8` straight out —
+        // which was correct when every field flushed — would keep the lowest
+        // byte and silently discard the rest of the stream.
+        self.flush();
         if self.bit_pos > 0 {
             self.out.push(self.container as u8);
         }
@@ -153,6 +201,69 @@ mod tests {
         b.add_bits(0b11, 2);
 
         assert_eq!(a.close(), b.close());
+    }
+
+    /// Whole bytes may sit in the container when `close` is called, and all of
+    /// them have to come out.
+    ///
+    /// The failure this pins is specific to deferring the flush: `close` used to
+    /// write `container as u8`, which was right when every field flushed and
+    /// silently drops up to four bytes now that they do not. It is silent
+    /// because the end marker still lands and the stream still parses — it just
+    /// parses as a shorter one. Checked by removing the flush again, which fails
+    /// this and three of the tests around it.
+    #[test]
+    fn a_container_holding_whole_bytes_is_emptied_by_close() {
+        // Every width up to the widest field, so some combination leaves whole
+        // bytes behind at close whatever the flush threshold happens to be.
+        for width in 1..=32u32 {
+            let mut w = BitWriter::new();
+            let fields = [0xDEAD_BEEFu64, 0x1234_5678, 0x0F0F_0F0F];
+            for value in fields {
+                w.add_bits(value, width);
+            }
+            let bytes = w.close();
+
+            let mut r = BackwardBits::new(&bytes).expect("a stream we just closed");
+            let mask = (1u64 << width) - 1;
+            for value in fields.iter().rev() {
+                assert_eq!(
+                    u64::from(r.read(width)),
+                    value & mask,
+                    "field of {width} bits did not survive close"
+                );
+            }
+            assert!(!r.exhausted(), "{width} bits: reader ran past the end");
+        }
+    }
+
+    /// The widest field the format contains must not overflow the container.
+    ///
+    /// `MAX_FIELD_BITS` is the whole of the deferred flush's correctness
+    /// argument: `bit_pos` is at most that on entry, so a field of that width
+    /// leaves at most 64 bits behind. An offset code of 31 bits is the real
+    /// case, and 32 is the asserted ceiling.
+    #[test]
+    fn back_to_back_maximum_width_fields_round_trip() {
+        let mut w = BitWriter::new();
+        let fields: [(u64, u32); 6] = [
+            (0xFFFF_FFFF, 32),
+            (1, 1),
+            (0x7FFF_FFFF, 31),
+            (0xFFFF, 16),
+            (0x3FF, 10),
+            (0xFFFF_FFFF, 32),
+        ];
+        for (value, bits) in fields {
+            w.add_bits(value, bits);
+        }
+        let bytes = w.close();
+
+        let mut r = BackwardBits::new(&bytes).expect("a stream we just closed");
+        for (value, bits) in fields.iter().rev() {
+            assert_eq!(u64::from(r.read(*bits)), *value, "field of {bits} bits");
+        }
+        assert!(!r.exhausted(), "the reader must not have run past the end");
     }
 
     #[test]

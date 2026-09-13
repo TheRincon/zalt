@@ -456,6 +456,55 @@ _canary-frame:
 baseline DIR="corpus":
     cargo run --release -p zalt-bench -- baseline {{DIR}}
 
+# Encode throughput against libzstd, over a corpus directory.
+#
+#   just encode-bench corpus/ztml
+#
+# The counterpart to `encode-ratio`, which answers what the encoder produces and
+# never what it cost. Reports the *gap* to `zstd -3` and `-9` rather than MB/s,
+# because a rate off this laptop is a number about the laptop: §10 records the
+# same encode measured at 0.37 s and 0.17 s in consecutive runs. libzstd is
+# linked in and its batches are interleaved with ours, so a thermal step or a
+# core migration moves both columns and leaves the gap where it was.
+#
+# Both levels, because zalt's output sits between them — quoting one picks the
+# flattering half.
+[doc("Encode throughput vs libzstd over a corpus, reported as a gap ratio.")]
+encode-bench DIR="corpus":
+    cargo run --release -p zalt-bench -- encode {{DIR}}
+
+# Leaf-weighted profile of encoding one file. Needs nothing installed.
+#
+#   just profile-encode doc/rfc8878.txt
+#   just profile-encode corpus/ztml/showcase.zdoc 10
+#
+# The encode counterpart of `profile-decode`, and it earned its place the same
+# way: the gap ratio says how far behind libzstd we are and never which part is
+# behind. One run of this attributed 70% of encode time to `Matcher::find`, and
+# every M5 throughput change came out of it — including the two that were
+# reverted because the profile's explanation turned out not to predict a
+# measurement. See doc/ZALT-MAC.md §10.
+[doc("Leaf-weighted profile of encoding one file.")]
+profile-encode FILE SECS="14":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cargo build --release -q -p zalt-bench || exit 1
+    out=$(mktemp -t zalt-encode-sample)
+    ./target/release/zalt-bench profile-encode "{{FILE}}" "{{SECS}}" &
+    pid=$!
+    sleep 2
+    sample "$pid" "$(( {{SECS}} - 3 ))" -mayDie -f "$out" >/dev/null 2>&1
+    wait "$pid"
+    echo
+    if grep -q 'Sort by top of stack' "$out"; then
+        sed -n "$(grep -n 'Sort by top of stack' "$out" | cut -d: -f1),/^$/p" "$out" \
+            | sed -E 's/\(in [^)]*\)//'
+    else
+        echo "sample produced no call graph — is it permitted to attach?"
+        echo "full output: $out"
+    fi
+    rm -f "$out"
+
 # Profile a release binary with Instruments (needs cargo-instruments).
 #
 # For cycle-level work — cache misses, branch misses, the M1 PMU counters.

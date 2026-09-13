@@ -384,10 +384,36 @@ around them. §10's M3 notes carry the numbers. Nothing above is wrong about the
 architecture; it was simply never checked against a profile, and this section
 said so about itself two paragraphs ago.
 
+**And the encoder repeated it at M5.** The largest win there was `common_prefix`
+a word at a time — the same shape as M3's word-at-a-time bit reader, in the
+encoder instead of the decoder, found the same way and not predicted by anything
+here either. Meanwhile the one change on this page's own logic — interleaving
+two chain walks to expose independent dependency chains, which is the Firestorm
+argument above applied exactly as written — measured nothing, for the reason
+item #7 already gives about windows that fit in L2. The list keeps being right
+about the machine and wrong about where the time is.
+
 ### Measurement discipline
 
 Nothing lands without a benchmark. Build `zalt-bench` *before* the optimization
 phase. Compare against system `zstd` 1.5.7 (`/opt/homebrew/bin/zstd`).
+
+**Interleave the rivals; quote the ratio.** Two implementations timed one after
+the other are timed in different windows of wall-clock time, and on this machine
+that is the difference between a result and a rumour — §10 records the same
+encode measured at 0.37 s and then 0.17 s back to back. Alternating their
+batches does not quiet the machine, it makes the interference *shared*, so a
+thermal step or a core migration moves both columns and leaves the ratio where
+it was. An absolute MB/s off this laptop is a number about the laptop; the gap
+ratio is the part that transfers. `zalt-bench encode` works this way and links
+libzstd in rather than shelling out to it, which is what makes a 3 KB file
+measure an encoder rather than a `posix_spawn`.
+
+**A change that is supposed to leave the output alone must be shown to.** Every
+encoder change in M5's throughput pass was checked byte-for-byte against the
+ratio table before it was timed, which is also what makes an A/B between two
+builds worth anything: binaries that emit identical bytes differ in exactly one
+thing, so the difference between them is not a second encoder being measured.
 
 Use `cargo-instruments` / Instruments for cycle-level work; the M1 PMU gives
 cache-miss and branch-miss attribution worth having.
@@ -3012,10 +3038,10 @@ something saying so.
       zalt now sits **between `zstd -3` and `-9`** on every file measured.
 - [x] **Repeat offsets**, with the decoder's own rule as the oracle. Worth
       0.1%-1.4%, rising with file size.
-- [ ] Encoder throughput, which has never been measured properly. The one
-      box left open, and deliberately: three separate choices in this encoder
-      build both candidates and keep the smaller, which is the right call for
-      ratio and an obvious place to look for time.
+- [x] **Encoder throughput**, measured properly at last, and then worked on:
+      **1.58x**, with the output byte-identical at every step. The guess about
+      where the time went — the three build-both-and-compare choices — was
+      wrong, and the profile said so in one run.
 - [x] **Block splitting** at statistical transitions (§7) — built as a
       *detector*, after the measurement below contradicted the premise. Worth
       1.6% on separable content and exactly nothing, at no cost, on everything
@@ -3335,6 +3361,10 @@ encoder does not encode anything twice and the feature costs nothing at all.
 When it does propose something, both arrangements are encoded and the smaller
 kept, so the fixed-stride result is always the floor.
 
+> **"Costs nothing at all" is wrong, and was measured at about 3%** during the
+> throughput work below. Nothing is encoded twice, but the detector is itself a
+> full histogram pass over the input before it can say so.
+
 That is the third place in this encoder where a candidate is built and measured
 rather than chosen by estimate — after the literals section and the sequence
 tables. The pattern is deliberate: every one of those choices is invisible when
@@ -3355,6 +3385,193 @@ carries at least one obvious waste — the sequences section is built twice, onc
 against the predefined tables and once against fitted ones, to compare their
 sizes. Anyone acting on encoder speed should measure it properly first, against
 the discipline in §10 rather than against the numbers here.
+
+> **The paragraph above took its own advice and did not survive it.** Measured
+> properly, the figure was **3.5x `zstd -9`**, not 1.1x-1.4x. The next section
+> is what the measurement actually said.
+
+#### Encoder throughput: the harness, and what it found
+
+The box above asked for this to be measured before anyone acted on it, and the
+first thing measuring it did was refute the number beside the request. Both
+halves of that are worth keeping, because the estimate was not idly made — it
+came from timing whole files with a stopwatch on a machine §10 has twice caught
+lying — and it was wrong by a factor of two and a half.
+
+**`zalt-bench encode` is the harness**, and it differs from the `decode` mode in
+two ways that were the whole reason the old figure was unreliable:
+
+- **libzstd is linked in, not driven through its CLI.** The decode mode's own
+  comment concedes its reference column "is not comparable at small sizes"
+  because it carries a fork and two pipes. For encode that is not a caveat but a
+  defect: §8's workload is many small resources, and a 3 KB file would have been
+  mostly measuring `posix_spawn`.
+- **The rivals alternate batches inside one loop.** Running one implementation
+  to completion and then the other puts them in different windows of wall-clock
+  time, and on this machine that is not a detail. Interleaving does not make the
+  machine quieter; it makes the interference *shared*, so a thermal step moves
+  both columns and leaves the ratio where it was. The ratio is what gets quoted,
+  so the ratio is what has to be defended.
+
+The headline is a **gap ratio** rather than MB/s, for the reason §5 gives about
+corpora: a rate off this laptop is a number about the laptop. And both `-3` and
+`-9` are timed, because zalt's output sits between them and quoting one level
+alone picks the flattering half.
+
+**The starting point, alternating against the finished encoder on the same
+corpus:**
+
+| | gap to `zstd -3` | gap to `zstd -9` |
+|---|---|---|
+| M5 as it stood | 16.49x | 3.51x |
+| after this work | **10.36x** | **2.22x** |
+
+**1.58x, and every byte of output is unchanged** — `showcase.zdoc` is still
+2 920, `rfc8878.txt` still 25 172, `synthetic.zdoc` still 11 741. That was the
+constraint the whole pass was run under, and it is also what made the A/B
+trustworthy: two binaries that emit identical bytes differ in exactly one thing,
+so a difference between them is not a different encoder being measured.
+
+On the small `.zdoc` files that §8 says are the dominant case, zalt now encodes
+**faster than `zstd -9`** — 0.56x-0.68x — while producing smaller output than
+`-9` on several of them.
+
+#### The profile, and the guess it replaced
+
+The open box guessed that the time was in the three places this encoder builds
+both candidates and keeps the smaller. One run of `just profile-encode` said
+otherwise, and it was not close:
+
+| | 112 KB text | 7.7 KB `.zdoc` |
+|---|---:|---:|
+| `Matcher::find` | **70%** | 37% |
+| `block::write_compressed` (the parse loop, inlined) | 12% | 26% |
+| `CState::encode` + `write_values` (the sequence bitstream) | 11% | 14% |
+| `memset` (the matcher's own tables) | <1% | **7.6%** |
+
+The build-both waste is the third row, and it is real — but it was never going
+to be more than a tenth, and the match finder was two thirds. **This is the same
+shape of error §5 records against its own ranked list**: a plausible ordering
+derived by reasoning, never checked against a profile, wrong about which end of
+the program the time was at.
+
+Four changes carried the 1.58x:
+
+- **`common_prefix` a word at a time.** The innermost loop of the encoder, run
+  up to `SEARCH_DEPTH` times per position and twice over for the lazy step, was
+  a byte-at-a-time `take_while` — a compare and an unpredictable branch per
+  byte. Eight bytes at once is an XOR and a `trailing_zeros`: `eor`/`rbit`/`clz`
+  on Firestorm, three instructions for what was eight iterations. It needs no
+  `unsafe` and no bounds check either, because `first_chunk` returning `None` is
+  the loop's exit condition.
+- **Rejecting a candidate on one byte.** A candidate is only worth comparing if
+  it is *longer* than the match in hand, so it must agree at the byte where that
+  match ends. Most candidates fail it — they share a four-byte hash and little
+  else — and the effect compounds, because the longer the best match grows the
+  cheaper each remaining candidate is to dismiss. **Selection is provably
+  unchanged**: a candidate that agrees up to `best_len` and then differs *ties*,
+  and a tie never passed `length > best_len` either. The same rejection was
+  worth having on the three repeat-offset probes, which run for every position
+  that finds a match.
+- **Sizing the matcher's tables to the input.** A 2^17 hash table and a chain of
+  the same order is about a megabyte zeroed per frame, and §8's workload pays
+  that once per resource on resources of a few kilobytes — 7.6% of a 7.7 KB
+  encode spent clearing slots no position can reach. The chain cap is free of
+  consequence rather than a trade, since a chain at least as long as the input
+  never has two live positions sharing a slot.
+- **Deferring the bit writer's flush.** `bitstream.rs` said in its own comment
+  that flushing after every field was the safe choice and that deferring it was
+  "the change to make when there is a measurement asking for it". This was that
+  measurement. **The invariant taken is local**, which is the point: a field is
+  at most 32 bits, so flushing whenever `bit_pos` exceeds 32 leaves at most 32
+  behind and the next field cannot overflow the container — provable from the
+  assertion three lines above it, not from a bit budget every caller has to
+  maintain. The bytes are identical; only when a complete byte leaves the
+  container changes.
+
+#### Two rearrangements that measured nothing
+
+Both are recorded because the reasoning behind them was good and the reasoning
+was not the point.
+
+`Matcher::find` is a **pointer chase**: each candidate's address comes out of
+the previous candidate's chain slot, so the walk runs at one dependent load per
+step and nothing can prefetch it. §5 says Firestorm "rewards *exposing
+independent dependency chains* far more than clever vectorization of a serial
+loop", and the encoder has two such chains available at every position, because
+the lazy step searches `pos + 1` whatever `pos` found. So:
+
+1. **The two walks were interleaved**, stepping alternately to put two misses in
+   flight instead of one.
+2. **The lookahead was carried forward.** When `pos` finds nothing the parse
+   advances one byte and searches `pos + 1` — the position the lazy step just
+   examined, against a chain that changed in no way that walk could see. That is
+   a real halving of the searches on literal-heavy content, not a latency trick.
+
+A three-way alternating A/B put all three variants inside run-to-run noise:
+
+| | gap to `-9`, best of three | gap to `-3`, best of three |
+|---|---|---|
+| plain | 2.43x | 11.70x |
+| carried lookahead | 2.43x | 11.46x |
+| interleaved pair | 2.51x | 11.40x |
+
+**Neither is kept.** The interleave needs the insert to lead the search, which
+is exactly the bug this parse has already had once — the chain walk stopping on
+`pos` itself and never finding a match — and re-admitting that ordering behind a
+skip is a liability with no payoff on the other side of it.
+
+The likely reason the premise failed is written down one section up, about a
+different feature. §5 struck match-source prefetching at M3 on the finding that
+"a 2 MiB window — and even the 8 MiB browser ceiling — sits inside the M1
+P-cluster's 12 MiB shared L2, so the load is already ~15 cycles and an
+out-of-order core hides it without help." A 128 KiB window's hash and chain
+tables are far smaller again. **The walk was never missing cache**, so there was
+no latency to overlap, and the second miss put in flight was a miss that did not
+exist. That argument was available before either change was written, in this
+document, about this machine.
+
+#### A claim in the section above, corrected
+
+§10's block-splitting notes say that when the detector proposes nothing —
+the answer for every file in this corpus — "the encoder does not encode anything
+twice and the feature costs nothing at all."
+
+The first half is true and the second is not. `split::transitions` is a full
+histogram pass over the input before it can conclude there is nothing to
+propose. Alternating a build with the detector against one that returns
+immediately puts it at **about 3%** of encode time, for no change in output on
+any file here.
+
+That is not an argument for removing it — it pays 1.6% on content that is
+genuinely separable, and 3% of encode is a fair price for a ratio win the
+encoder cannot otherwise get. It is an argument for not writing "costs nothing
+at all" about a pass over the input, which is the kind of claim that is only
+ever checked when somebody goes looking for time.
+
+#### What is left, and what the numbers do not say
+
+The remaining gap is still overwhelmingly `Matcher::find`, at about 58% after
+this work. Closing it means changing what the search *does* — a better hash, a
+bounded tree, a cost model for the depth budget — rather than making the current
+search faster, and all of those change the output, so each needs the ratio table
+defended as well as the throughput one. That is a different kind of increment
+from this one and should not be started by assuming it wins.
+
+**Two things this measurement exposed that are not throughput**, recorded here
+because nothing else in §10 would catch them:
+
+- **`zstd -3` beats zalt on ratio on large, varied input.** On 4 MB of mixed
+  source text zalt produces 662 766 bytes against `-3`'s 510 872 — 30% larger.
+  M5's "better than `zstd -3` on every file measured" is true of the files it
+  measured, all of which are documents under 220 KB. The claim should not be
+  carried past that corpus.
+- **The corpus used here is not the ZTML corpus.** It adds the two RFCs and a
+  4 MB slice of mixed source text, because a throughput measurement over six
+  files of 3-12 KB is dominated by per-frame setup and says nothing about
+  steady state. §5 is right that corpus choice is a recipe concern; that cuts
+  both ways, and a throughput corpus and a ratio corpus are not the same
+  document set.
 
 #### `ci/interop.sh`, and why it is not the same evidence as the tests
 

@@ -13,11 +13,20 @@
 //! content. Which files belong in a corpus is a recipe concern (L3), not a
 //! benchmark concern — see `doc/ZALT-MAC.md` §5.
 //!
+//! Since M5 it also measures the *encoder*, which until then had never been
+//! timed properly — see `doc/ZALT-MAC.md` §10. That mode differs from `decode`
+//! in two ways worth knowing before reading its output: libzstd is linked in
+//! rather than driven through its CLI, so a 3 KB resource is not measuring a
+//! fork and two pipes; and the rivals alternate batches inside one loop, so
+//! interference lands on all of them instead of on whichever ran second.
+//!
 //! ```text
 //! cargo run --release -p zalt-bench -- kernels
 //! cargo run --release -p zalt-bench -- baseline <corpus-dir>
 //! cargo run --release -p zalt-bench -- decode <corpus-dir>
+//! cargo run --release -p zalt-bench -- encode <corpus-dir>
 //! cargo run --release -p zalt-bench -- profile <file.zst> [seconds]
+//! cargo run --release -p zalt-bench -- profile-encode <file> [seconds]
 //! ```
 
 use std::fs;
@@ -61,9 +70,27 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        "encode" => match args.get(2) {
+            Some(dir) => bench_encode(Path::new(dir)),
+            None => {
+                eprintln!("usage: zalt-bench encode <corpus-dir>");
+                std::process::exit(2);
+            }
+        },
+        "profile-encode" => match args.get(2) {
+            Some(file) => profile_encode(
+                Path::new(file),
+                args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20),
+            ),
+            None => {
+                eprintln!("usage: zalt-bench profile-encode <file> [seconds]");
+                std::process::exit(2);
+            }
+        },
         other => {
             eprintln!(
-                "unknown mode {other:?}; expected 'kernels', 'baseline', 'decode' or 'profile'"
+                "unknown mode {other:?}; expected 'kernels', 'baseline', 'decode', 'encode', \
+                 'profile' or 'profile-encode'"
             );
             std::process::exit(2);
         }
@@ -213,6 +240,82 @@ fn measure(bytes_per_op: usize, mut op: impl FnMut()) -> Sample {
 /// Best-case throughput of `op` in GB/s of `bytes_per_op`.
 fn throughput(bytes_per_op: usize, op: impl FnMut()) -> f64 {
     measure(bytes_per_op, op).best
+}
+
+/// Measure several implementations of the same work, **alternating batches**.
+///
+/// # Why this exists beside [`measure`]
+///
+/// [`measure`] runs one implementation to completion. Comparing two rivals that
+/// way puts them in different windows of wall-clock time, and on this machine
+/// that is not a detail: §10 records the same measurement of one file giving
+/// 0.37 s and then 0.17 s in consecutive runs. Whatever moved between those two
+/// runs — a thermal step, a migration from a P core to an E core, another
+/// process waking up — lands entirely on whichever rival happened to be running,
+/// and shows up as a difference between them.
+///
+/// Round-robining the batches does not make the machine quieter. It makes the
+/// interference *shared*, so a drift that would otherwise read as a 2x win
+/// instead moves both columns together and leaves the ratio where it was. The
+/// ratio is what gets quoted, so the ratio is what has to be defended.
+///
+/// Each op is calibrated to its own iteration count, so a fast one and a slow
+/// one still contribute batches of comparable duration; the returned samples are
+/// per-op, in the order given.
+fn measure_interleaved(bytes_per_op: usize, ops: &mut [&mut dyn FnMut()]) -> Vec<Sample> {
+    const BATCH: Duration = Duration::from_millis(20);
+    const WARMUP: Duration = Duration::from_millis(60);
+    const ROUNDS: usize = 9;
+
+    let mut iters = Vec::with_capacity(ops.len());
+    for op in ops.iter_mut() {
+        let probe_start = Instant::now();
+        op();
+        let probe = probe_start.elapsed().max(Duration::from_nanos(1));
+        iters.push(((BATCH.as_secs_f64() / probe.as_secs_f64()) as u64).clamp(1, 1 << 24));
+    }
+
+    // Warm every op before timing any of them, so the first round does not
+    // charge one rival for cold caches the others have already paid off.
+    for (op, &n) in ops.iter_mut().zip(&iters) {
+        let warm = Instant::now();
+        while warm.elapsed() < WARMUP {
+            for _ in 0..n {
+                op();
+            }
+        }
+    }
+
+    let mut rates: Vec<Vec<f64>> = vec![Vec::with_capacity(ROUNDS); ops.len()];
+    for _ in 0..ROUNDS {
+        for (i, op) in ops.iter_mut().enumerate() {
+            let n = iters[i];
+            let start = Instant::now();
+            for _ in 0..n {
+                op();
+            }
+            let elapsed = start.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+            rates[i].push(bytes_per_op as f64 * n as f64 / elapsed / 1e9);
+        }
+    }
+
+    rates
+        .into_iter()
+        .map(|mut r| {
+            r.sort_by(|a, b| a.partial_cmp(b).expect("no NaN from a positive divide"));
+            let best = r[r.len() - 1];
+            let worst = r[0];
+            Sample {
+                best,
+                median: r[r.len() / 2],
+                spread: if best > 0.0 {
+                    (best - worst) / best
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect()
 }
 
 // --------------------------------------------------------------- baseline
@@ -801,6 +904,207 @@ fn compress_bytes(zstd: &Path, path: &Path, level: u32) -> Option<Vec<u8>> {
     out.status.success().then_some(out.stdout)
 }
 
+// ----------------------------------------------------------------- encode
+
+/// Encoder parameters matching what `just encode-ratio` measures.
+fn encode_params() -> zalt_codec::encode::EncodeParams {
+    zalt_codec::encode::EncodeParams {
+        strategy: zalt_codec::encode::Strategy::Compress,
+        // The `--no-check` argument from `compress_bytes`, on the other side of
+        // the wire: the library default is off, and charging the encoder for a
+        // checksum the deployed workload does not ask for would flatter libzstd
+        // by exactly one pass over the input.
+        checksum: false,
+        ..Default::default()
+    }
+}
+
+/// Compress `input` with libzstd, in process.
+fn zstd_compress(input: &[u8], level: i32) -> Vec<u8> {
+    zstd::bulk::compress(input, level).expect("libzstd compresses anything")
+}
+
+/// Time zalt's encoder against libzstd, over a corpus.
+///
+/// # Why the gap ratio and not MB/s
+///
+/// An absolute throughput off this laptop is a number about the laptop. §10
+/// records 0.37 s and 0.17 s for the same encode in consecutive runs, and the
+/// `MachineState` warning exists because the same binary on the same input
+/// measured 339 and 535 MB/s. What survives that is the *ratio* between two
+/// implementations measured in the same window, which is why every rival here is
+/// timed by [`measure_interleaved`] rather than in its own pass, and why the
+/// `SUMMARY` line carries gaps rather than rates.
+///
+/// # Why two levels of the reference
+///
+/// zalt's output sits between `zstd -3` and `-9` (§10, M5), so neither level
+/// alone is a fair rival: `-3` is faster and larger, `-9` is slower and smaller,
+/// and quoting only one picks the flattering half. Both are timed, the sizes are
+/// printed beside the rates, and a reader can see what the speed bought.
+fn bench_encode(dir: &Path) {
+    let files = match collect_files(dir) {
+        Ok(f) if !f.is_empty() => f,
+        Ok(_) => {
+            eprintln!("no files found under {}", dir.display());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("cannot read {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    };
+
+    let params = encode_params();
+
+    println!("encode throughput — MB/s of *input*, interleaved against libzstd");
+    println!(
+        "reference: libzstd {} (in process)",
+        zstd::zstd_safe::version_string()
+    );
+    if let Some(state) = MachineState::read() {
+        state.report();
+    }
+    println!();
+    println!("{:-<118}", "");
+    println!(
+        "{:<22} {:>9} {:>9} {:>9} {:>9} {:>10} {:>10} {:>10} {:>8} {:>8}",
+        "file",
+        "raw",
+        "zalt",
+        "zstd -3",
+        "zstd -9",
+        "zalt MB/s",
+        "-3 MB/s",
+        "-9 MB/s",
+        "gap -3",
+        "gap -9"
+    );
+    println!("{:-<118}", "");
+
+    let mut cases = Vec::new();
+    for path in &files {
+        let Ok(raw) = fs::read(path) else { continue };
+        if raw.len() < 1024 {
+            // Below this the measurement is mostly per-call overhead, and
+            // reporting it as throughput reports the harness.
+            continue;
+        }
+        // Never benchmark an encoder whose output does not decode. Bytes
+        // produced fast and read by nobody is the failure the whole differential
+        // apparatus exists to prevent, and it must not show up as a good number.
+        match zalt_codec::encode::compress(&raw, &params) {
+            Ok(frame) => match zalt_codec::decompress(&frame, permissive_limits()) {
+                Ok(out) if out == raw => cases.push((path.clone(), raw)),
+                _ => {
+                    eprintln!("SKIP {}: our own frame does not round trip", path.display());
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!("SKIP {}: {e}", path.display());
+                continue;
+            }
+        }
+    }
+
+    if cases.is_empty() {
+        eprintln!("nothing encodable in {}", dir.display());
+        std::process::exit(1);
+    }
+
+    let mut total_raw = 0u64;
+    let (mut total_zalt, mut total_l3, mut total_l9) = (0u64, 0u64, 0u64);
+    let (mut t_zalt, mut t_l3, mut t_l9) = (0f64, 0f64, 0f64);
+    let mut any_noisy = false;
+
+    for (path, raw) in &cases {
+        let zalt_size = zalt_codec::encode::compress(raw, &params)
+            .expect("verified encodable")
+            .len();
+        let l3_size = zstd_compress(raw, 3).len();
+        let l9_size = zstd_compress(raw, 9).len();
+
+        let samples = measure_interleaved(
+            raw.len(),
+            &mut [
+                &mut || {
+                    let f = zalt_codec::encode::compress(raw, &params).expect("verified encodable");
+                    std::hint::black_box(&f);
+                },
+                &mut || drop(std::hint::black_box(zstd_compress(raw, 3))),
+                &mut || drop(std::hint::black_box(zstd_compress(raw, 9))),
+            ],
+        );
+        let (zalt, l3, l9) = (samples[0], samples[1], samples[2]);
+
+        total_raw += raw.len() as u64;
+        total_zalt += zalt_size as u64;
+        total_l3 += l3_size as u64;
+        total_l9 += l9_size as u64;
+        // Sum time, not rates: averaging MB/s weights a 1 KB file like a 10 MB
+        // one and means nothing.
+        t_zalt += raw.len() as f64 / (zalt.best * 1e9);
+        t_l3 += raw.len() as f64 / (l3.best * 1e9);
+        t_l9 += raw.len() as f64 / (l9.best * 1e9);
+
+        let noisy = zalt.noisy() || l3.noisy() || l9.noisy();
+        any_noisy |= noisy;
+
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        println!(
+            "{:<22} {:>9} {zalt_size:>9} {l3_size:>9} {l9_size:>9} {:>10.1} {:>10.1} {:>10.1} {:>7.2}x {:>7.2}x{}",
+            truncate(&name, 22),
+            raw.len(),
+            zalt.best * 1000.0,
+            l3.best * 1000.0,
+            l9.best * 1000.0,
+            l3.best / zalt.best,
+            l9.best / zalt.best,
+            if noisy { "  ~noisy" } else { "" }
+        );
+    }
+
+    println!("{:-<118}", "");
+    let (r_zalt, r_l3, r_l9) = (
+        total_raw as f64 / t_zalt / 1e6,
+        total_raw as f64 / t_l3 / 1e6,
+        total_raw as f64 / t_l9 / 1e6,
+    );
+    println!(
+        "{:<22} {total_raw:>9} {total_zalt:>9} {total_l3:>9} {total_l9:>9} {r_zalt:>10.1} {r_l3:>10.1} {r_l9:>10.1} {:>7.2}x {:>7.2}x",
+        format!("TOTAL ({})", cases.len()),
+        r_l3 / r_zalt,
+        r_l9 / r_zalt
+    );
+    println!();
+    println!(
+        "ratio: zalt {:.3}x, zstd -3 {:.3}x, zstd -9 {:.3}x",
+        total_raw as f64 / total_zalt.max(1) as f64,
+        total_raw as f64 / total_l3.max(1) as f64,
+        total_raw as f64 / total_l9.max(1) as f64,
+    );
+    if any_noisy {
+        println!();
+        println!("~noisy: best and worst round differed by >15% for some rival. The");
+        println!("        batches are interleaved, so a shared disturbance cancels in the");
+        println!("        gap columns — but treat a small delta in a noisy row as unmeasured.");
+    }
+    println!();
+    println!("A gap above 1.00x means the reference is faster by that factor.");
+    println!(
+        "SUMMARY encode gap_l3={:.2} gap_l9={:.2} ratio_zalt={:.3} ratio_l3={:.3} ratio_l9={:.3}",
+        r_l3 / r_zalt,
+        r_l9 / r_zalt,
+        total_raw as f64 / total_zalt.max(1) as f64,
+        total_raw as f64 / total_l3.max(1) as f64,
+        total_raw as f64 / total_l9.max(1) as f64,
+    );
+}
+
 // ---------------------------------------------------------------- profile
 
 /// Decode one frame in a loop so a sampling profiler can attach.
@@ -871,6 +1175,59 @@ fn profile_decode(file: &Path, seconds: u64, force_scalar: bool) {
     eprintln!(
         "{iterations} iterations, {produced} bytes, ~{:.0} MB/s",
         produced as f64 / seconds as f64 / 1e6
+    );
+}
+
+/// Encode one file in a loop so a sampling profiler can attach.
+///
+/// The encode counterpart of [`profile_decode`], and here for the same reason:
+/// the throughput table says how far behind the reference we are and never which
+/// part is behind. §10 records three inferences about the *decoder* — bounds
+/// checks, double-symbol Huffman, prefetching — that were all wrong, and a
+/// profile that answered it in one run.
+///
+/// Everything the encoder does per frame is inside the loop, including the
+/// matcher's allocation. That is not overhead to be hoisted out: §8's workload
+/// is many small resources, one frame each, so per-frame setup is the cost that
+/// dominates and hiding it would profile a function nobody calls.
+fn profile_encode(file: &Path, seconds: u64) {
+    let raw = match fs::read(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("cannot read {}: {e}", file.display());
+            std::process::exit(1);
+        }
+    };
+    let params = encode_params();
+
+    // Fail out here rather than once per iteration under the profiler.
+    let size = match zalt_codec::encode::compress(&raw, &params) {
+        Ok(f) => f.len(),
+        Err(e) => {
+            eprintln!("{}: {e}", file.display());
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "profiling encode of {} — {} -> {size} bytes, {seconds}s",
+        file.display(),
+        raw.len(),
+    );
+    eprintln!("attach with:  sample {} {seconds}", std::process::id());
+
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut iterations = 0u64;
+    while Instant::now() < deadline {
+        let frame = zalt_codec::encode::compress(&raw, &params).expect("verified before the loop");
+        std::hint::black_box(&frame);
+        iterations += 1;
+    }
+
+    let consumed = raw.len() as u64 * iterations;
+    eprintln!(
+        "{iterations} iterations, {consumed} bytes in, ~{:.0} MB/s",
+        consumed as f64 / seconds as f64 / 1e6
     );
 }
 

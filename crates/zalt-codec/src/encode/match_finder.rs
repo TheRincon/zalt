@@ -55,8 +55,33 @@ const SEARCH_DEPTH: usize = 32;
 /// that taking it costs.
 const LAZY_MARGIN: usize = 1;
 
-const HASH_LOG: u32 = 17;
-const HASH_SIZE: usize = 1 << HASH_LOG;
+/// Largest hash table the matcher will build, as a log2.
+///
+/// Also the *only* size it used to build. A 2^17 table of `u32` is 512 KiB, and
+/// with a chain of the same order that is around a megabyte zeroed per frame —
+/// which §8's workload pays once per resource, on resources of a few kilobytes.
+/// The M5 profile found `memset` at 7.6% of a 7.7 KB encode, all of it clearing
+/// table space for positions that do not exist.
+const HASH_LOG_MAX: u32 = 17;
+
+/// Smallest hash table worth building.
+///
+/// Below a few thousand slots the table stops separating anything and the chain
+/// walk does all the work, spending its [`SEARCH_DEPTH`] budget on collisions
+/// instead of candidates.
+const HASH_LOG_MIN: u32 = 12;
+
+/// Hash bits for an input of this size.
+///
+/// One slot per input position, clamped. A 4 KB resource cannot fill more than
+/// 4096 slots however large the table is, so sizing to the content is not a
+/// tuning compromise on small inputs — it is declining to clear memory that
+/// provably stays empty. Inputs at or above 128 KB get the full table and are
+/// unaffected.
+fn hash_log_for(len: usize) -> u32 {
+    let needed = usize::BITS - len.max(1).leading_zeros();
+    needed.clamp(HASH_LOG_MIN, HASH_LOG_MAX)
+}
 
 /// Marks an empty slot. Unreachable as a position: a frame this encoder emits
 /// is bounded well below 4 GiB.
@@ -89,22 +114,64 @@ pub struct Parse {
     pub literals: Vec<u8>,
 }
 
-fn hash4(bytes: &[u8]) -> usize {
+fn hash4(bytes: &[u8], hash_log: u32) -> usize {
     let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     // Knuth's multiplicative constant; the top bits of the product are the best
     // mixed, so the shift takes those.
-    (v.wrapping_mul(2_654_435_761) >> (32 - HASH_LOG)) as usize
+    (v.wrapping_mul(2_654_435_761) >> (32 - hash_log)) as usize
 }
 
 /// How far two slices agree, from their starts.
+///
+/// **A word at a time**, which is where the encoder's time was going. This is
+/// the innermost loop of the whole encoder — [`Matcher::find`] runs it up to
+/// [`SEARCH_DEPTH`] times per position, twice over for the lazy step — and a
+/// byte-at-a-time `take_while` walks it with a compare and an unpredictable
+/// branch per byte. Comparing eight bytes at once turns that into an XOR and a
+/// `trailing_zeros`, which on Firestorm is `eor`/`rbit`/`clz`: three
+/// instructions for what was eight iterations.
+///
+/// `trailing_zeros` finds the lowest *bit* that differs, and because the load is
+/// little-endian the lowest differing bit lies in the lowest differing byte —
+/// so `>> 3` is the byte index, with no endianness correction. A big-endian host
+/// would need `leading_zeros` instead, which is why the load is explicitly
+/// `from_le_bytes` rather than native.
+///
+/// No `unsafe`, and no bounds check in the loop either: `first_chunk` returns
+/// `None` at the end of the shorter slice, which is also the loop's exit
+/// condition. `matched` only advances after *both* chunks are produced, so the
+/// slicing below it can never be out of range.
 fn common_prefix(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    const WORD: usize = 8;
+
+    let mut matched = 0usize;
+    while let (Some(x), Some(y)) = (
+        a[matched..].first_chunk::<WORD>(),
+        b[matched..].first_chunk::<WORD>(),
+    ) {
+        let diff = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+        if diff != 0 {
+            return matched + (diff.trailing_zeros() >> 3) as usize;
+        }
+        matched += WORD;
+    }
+
+    // Fewer than eight bytes left on one side. At most seven iterations.
+    matched
+        + a[matched..]
+            .iter()
+            .zip(&b[matched..])
+            .take_while(|(x, y)| x == y)
+            .count()
 }
 
 /// A match finder whose history persists across the blocks of one frame.
 pub struct Matcher {
     /// Most recent position for each hash.
     head: Vec<u32>,
+    /// Bits of hash `head` is indexed by. Sized to the input — see
+    /// [`hash_log_for`].
+    hash_log: u32,
     /// Previous position sharing a hash, indexed by position modulo the window.
     chain: Vec<u32>,
     chain_mask: usize,
@@ -119,15 +186,32 @@ pub struct Matcher {
 }
 
 impl Matcher {
-    /// A matcher for a frame with this `windowLog`.
-    pub fn new(window_log: u8) -> Self {
+    /// A matcher for a frame with this `windowLog`, encoding `input_len` bytes.
+    ///
+    /// **`input_len` sizes the tables and nothing else.** It is not a limit —
+    /// every offset is still bounded by the window, and a caller that passes a
+    /// larger figure gets a larger table and the same output.
+    pub fn new(window_log: u8, input_len: usize) -> Self {
         let window = 1usize << window_log.min(31);
         // The chain is indexed modulo its own size, so entries older than the
         // window are overwritten and drop out — which is exactly the set of
         // positions an offset could no longer reach anyway.
-        let chain_size = window.next_power_of_two();
+        //
+        // Capping it at the input length as well is free of consequence rather
+        // than a trade: a chain at least as long as the input never has two
+        // live positions sharing a slot, so nothing that could have been found
+        // in the larger table is missing from this one. It only declines to
+        // clear slots no position can reach.
+        let chain_size = window.next_power_of_two().min(
+            input_len
+                .max(1)
+                .checked_next_power_of_two()
+                .unwrap_or(window),
+        );
+        let hash_log = hash_log_for(input_len);
         Self {
-            head: vec![EMPTY; HASH_SIZE],
+            head: vec![EMPTY; 1 << hash_log],
+            hash_log,
             chain: vec![EMPTY; chain_size],
             chain_mask: chain_size - 1,
             max_offset: window,
@@ -136,7 +220,7 @@ impl Matcher {
     }
 
     fn insert(&mut self, input: &[u8], pos: usize) {
-        let h = hash4(&input[pos..]);
+        let h = hash4(&input[pos..], self.hash_log);
         self.chain[pos & self.chain_mask] = self.head[h];
         self.head[h] = pos as u32;
     }
@@ -146,7 +230,7 @@ impl Matcher {
     /// Returns `(length, offset)`. `limit` is the position matching may not run
     /// past — the block's tail boundary.
     fn find(&self, input: &[u8], pos: usize, limit: usize) -> Option<(usize, usize)> {
-        let available = limit - pos;
+        let available = limit.saturating_sub(pos);
         if available < MIN_MATCH {
             return None;
         }
@@ -154,7 +238,11 @@ impl Matcher {
 
         let mut best_len = 0usize;
         let mut best_offset = 0usize;
-        let mut candidate = self.head[hash4(&input[pos..])];
+        // The byte one past the end of the best match — what a candidate has to
+        // agree with to be worth comparing. Held rather than re-loaded from
+        // `input` for every candidate. Never read while `best_len` is zero.
+        let mut best_tail = 0u8;
+        let mut candidate = self.head[hash4(&input[pos..], self.hash_log)];
 
         for _ in 0..SEARCH_DEPTH {
             if candidate == EMPTY {
@@ -165,22 +253,50 @@ impl Matcher {
                 break;
             }
 
-            // The source runs to the end of the input, not to `pos`. Bounding
-            // it at `pos` would cap every match at its own offset and forbid
-            // overlapping matches — the offset-1 run that is §5's win #2 has a
-            // one-byte source. Reaching past `pos` is sound because the decoder
-            // copies byte by byte and reads back what it has just written.
-            let length = common_prefix(&input[c..], &input[pos..pos + available]);
-            if length > best_len {
-                best_len = length;
-                best_offset = pos - c;
-                if best_len == available {
-                    // Nothing can beat a match that runs to the limit.
-                    break;
+            // **The next chain link is loaded before it is needed.**
+            //
+            // `candidate = chain[candidate]` is a pointer chase: each link
+            // depends on the one before it, so the walk cannot be prefetched —
+            // the address is not known until the previous load lands. Issuing
+            // it at the top, where everything below is independent of it, lets
+            // the latency overlap the comparison work rather than queue behind
+            // it.
+            let next = self.chain[c & self.chain_mask];
+
+            // Reject on one byte before comparing any. A candidate is only
+            // worth having if it is *longer* than the one in hand, so it must
+            // at minimum agree at the byte where the best match ends. Most
+            // candidates fail it — they share a four-byte hash and little else
+            // — and the effect compounds: the longer the best match gets, the
+            // cheaper each remaining candidate is to dismiss.
+            //
+            // Selection is unchanged by this, which is what makes it free
+            // rather than a trade. A candidate agreeing up to `best_len` and
+            // then differing *ties* the match in hand, and a tie never passed
+            // `length > best_len` either.
+            //
+            // In range because `best_len < available` whenever it is non-zero
+            // (the loop breaks on equality), so `c + best_len < pos + available
+            // = limit <= input.len()`.
+            if best_len == 0 || input[c + best_len] == best_tail {
+                // The source runs to the end of the input, not to `pos`.
+                // Bounding it at `pos` would cap every match at its own offset
+                // and forbid overlapping matches — the offset-1 run that is
+                // §5's win #2 has a one-byte source. Reaching past `pos` is
+                // sound because the decoder copies byte by byte and reads back
+                // what it has just written.
+                let length = common_prefix(&input[c..], &input[pos..pos + available]);
+                if length > best_len {
+                    best_len = length;
+                    best_offset = pos - c;
+                    if best_len == available {
+                        // Nothing can beat a match that runs to the limit.
+                        break;
+                    }
+                    best_tail = input[pos + best_len];
                 }
             }
 
-            let next = self.chain[c & self.chain_mask];
             // The chain must strictly descend. Anything else is a stale entry
             // from a wrapped slot, and following it would loop forever.
             if next >= candidate {
@@ -233,13 +349,32 @@ impl Matcher {
     }
 
     /// Length of a match at one of the current repeat offsets, if it is usable.
-    fn repeat_match(&self, input: &[u8], pos: usize, limit: usize, offset: u32) -> usize {
+    ///
+    /// `floor` is the length the caller already has in hand. A repeat is only
+    /// taken when it is **no shorter** than that, so a repeat that cannot reach
+    /// `floor` need not be measured — and the byte at `floor - 1` settles it in
+    /// one compare, where `common_prefix` would walk the whole agreement first.
+    /// Three of these run for every position that found a match, and on
+    /// structured text most of them lose.
+    fn repeat_match(
+        &self,
+        input: &[u8],
+        pos: usize,
+        limit: usize,
+        offset: u32,
+        floor: usize,
+    ) -> usize {
         let offset = offset as usize;
         if offset == 0 || offset > pos {
             return 0;
         }
         let available = limit - pos;
-        if available < MIN_MATCH {
+        if available < MIN_MATCH || floor > available {
+            return 0;
+        }
+        // In range: `floor <= available`, so `pos + floor - 1 < limit`, and
+        // `offset <= pos` puts the source at or after the start of the input.
+        if floor > 0 && input[pos - offset + floor - 1] != input[pos + floor - 1] {
             return 0;
         }
         common_prefix(&input[pos - offset..], &input[pos..pos + available])
@@ -259,8 +394,14 @@ impl Matcher {
     /// the window. `start` must be where the previous call ended, so the chain
     /// stays in step with the positions it names.
     pub fn parse(&mut self, input: &[u8], start: usize, end: usize) -> Parse {
-        let mut sequences = Vec::new();
-        let mut literals = Vec::new();
+        // Both grow to some fraction of the block and both are rebuilt for
+        // every block, so starting them at zero spends the block's first
+        // kilobytes reallocating and copying. These are opening sizes, not
+        // bounds — a block of pure literals still grows `literals` past the
+        // guess, and a block that matches everything leaves it nearly empty.
+        let span = end - start;
+        let mut sequences = Vec::with_capacity(span / 16);
+        let mut literals = Vec::with_capacity(span / 2);
 
         if end - start <= TAIL + MIN_MATCH {
             // Still index it, or the next block's matches cannot see it.
@@ -283,6 +424,15 @@ impl Matcher {
         // first candidate because it is not *earlier*, and no match is ever
         // found. Inserting twice is worse: the second `insert` points a slot at
         // itself, and the chain from there is a self-loop.
+        //
+        // **Two rearrangements of this loop were measured and neither paid**;
+        // see §10's M5 throughput notes. Walking the `pos` and `pos + 1`
+        // searches in lockstep to overlap their cache misses, and carrying the
+        // lookahead forward so a failed position does not search twice, both
+        // came out inside run-to-run noise on a three-way alternating A/B. They
+        // are recorded there rather than kept here, because each one costs this
+        // invariant its simple form — the interleave in particular needs the
+        // insert to lead the search, which is precisely the bug above.
         while pos + MIN_MATCH <= limit {
             let found = self.find(input, pos, limit);
             self.insert(input, pos);
@@ -299,7 +449,11 @@ impl Matcher {
             // real trade, and making it well needs a cost model this encoder
             // does not have yet.
             for candidate in self.repeats {
-                let repeat_len = self.repeat_match(input, pos, limit, candidate);
+                // `length.max(MIN_MATCH)` is exactly the bar the test below
+                // sets, handed down so a repeat that cannot clear it is
+                // dismissed on one byte rather than measured.
+                let repeat_len =
+                    self.repeat_match(input, pos, limit, candidate, length.max(MIN_MATCH));
                 if repeat_len >= length && repeat_len >= MIN_MATCH {
                     length = repeat_len;
                     offset = candidate as usize;
@@ -310,8 +464,7 @@ impl Matcher {
             // Lazy: a match one byte later may be long enough to be worth the
             // literal that taking it costs. One step only — a second lookahead
             // doubles the search for very little.
-            if pos + 1 + MIN_MATCH <= limit
-                && let Some((next_len, next_offset)) = self.find(input, pos + 1, limit)
+            if let Some((next_len, next_offset)) = self.find(input, pos + 1, limit)
                 && next_len >= length + LAZY_MARGIN
             {
                 self.insert(input, pos + 1);
@@ -356,7 +509,7 @@ mod tests {
     use super::*;
 
     fn parse_one(block: &[u8]) -> Parse {
-        Matcher::new(17).parse(block, 0, block.len())
+        Matcher::new(17, block.len()).parse(block, 0, block.len())
     }
 
     /// A parse must account for every byte of the block, exactly once.
@@ -464,7 +617,7 @@ mod tests {
         let mut input = half.clone();
         input.extend_from_slice(&half);
 
-        let mut matcher = Matcher::new(17);
+        let mut matcher = Matcher::new(17, 1 << 17);
         let first = matcher.parse(&input, 0, half.len());
         let second = matcher.parse(&input, half.len(), input.len());
 
@@ -515,7 +668,7 @@ mod tests {
         // decoder has already dropped.
         let block = b"abcdefghijklmnop".repeat(500);
         let window_log = 10u8;
-        let parse = Matcher::new(window_log).parse(&block, 0, block.len());
+        let parse = Matcher::new(window_log, block.len()).parse(&block, 0, block.len());
         assert_accounts_for(&block, &parse);
         assert_eq!(replay(&[], &parse), block);
         for s in &parse.sequences {
@@ -570,7 +723,7 @@ mod tests {
             (99, 0),
         ];
 
-        let mut matcher = Matcher::new(17);
+        let mut matcher = Matcher::new(17, 1 << 17);
         let mut theirs = REP_INITIAL;
         let mut repeats_used = 0usize;
 
@@ -602,7 +755,7 @@ mod tests {
     fn a_repeated_offset_costs_almost_nothing() {
         // The point of the mechanism: the second use of an offset names it
         // rather than spelling out the seventeen bits a 128 KiB offset needs.
-        let mut matcher = Matcher::new(17);
+        let mut matcher = Matcher::new(17, 1 << 17);
         assert_eq!(
             matcher.choose_offset_value(100_000, 5),
             100_003,
@@ -618,7 +771,7 @@ mod tests {
     #[test]
     fn a_rolled_back_table_is_exactly_the_one_saved() {
         // What a block falling back to stored depends on.
-        let mut matcher = Matcher::new(17);
+        let mut matcher = Matcher::new(17, 1 << 17);
         matcher.choose_offset_value(40, 2);
         let saved = matcher.repeats();
         matcher.choose_offset_value(999, 0);
