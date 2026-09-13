@@ -4,11 +4,6 @@ A clean-room **Zstandard (RFC 8878)** implementation in Rust, built to be
 embedded in a hostile-input setting — a browser, an app, anything that handles
 bytes it did not create.
 
-**The decoder is what exists today; an encoder is planned** (milestone M5).
-Decoding came first deliberately: it is the side exposed to bytes an attacker
-chose, so it is where the security argument lives and where correctness had to
-be settled before anything else.
-
 Three things it tries to be, in order. Each is useful without the ones below it:
 
 1. A clean, general, reliable Rust zstd implementation — modern format only, no
@@ -24,7 +19,7 @@ real document; this file is the map.
 
 ## Status
 
-> **Status: pre-release (`0.0.1`).** Not published to crates.io. 
+> **pre-release (`0.0.1`).** Not published to crates.io. 
 
 | Milestone | | |
 |---|---|---|
