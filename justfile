@@ -473,6 +473,29 @@ baseline DIR="corpus":
 encode-bench DIR="corpus":
     cargo run --release -p zalt-bench -- encode {{DIR}}
 
+# How decode scales across threads, and what sharing a pool costs.
+#
+#   just concurrent corpus/ztml
+#   just concurrent corpus/ztml 4
+#
+# §6 gives L2 a global budget and a decoder pool; §8 says the workload is many
+# small resources decoded concurrently; §10's zalt-darwin re-check admits none
+# of it was ever measured under concurrency. This is that measurement.
+#
+# Two shapes run the identical workload — through the shared pool, and with one
+# decoder per thread sharing nothing — so the gap between them at a given thread
+# count is the cost of sharing, with everything else held constant.
+#
+# **This mode needs a quiet machine in a way the others do not.** Interleaving
+# rescues a comparison between two implementations, because a disturbance lands
+# on both and cancels in the ratio. It cannot rescue a comparison between thread
+# counts: with no idle cores an added thread has nowhere to run, and the row
+# reports the scheduler. The harness checks load against core count, and voids
+# itself outright if any row comes back superlinear.
+[doc("Decode scaling across threads, and what the pool costs. Needs an idle machine.")]
+concurrent DIR="corpus/ztml" THREADS="":
+    cargo run --release -p zalt-bench -- concurrent {{DIR}} {{THREADS}}
+
 # Leaf-weighted profile of encoding one file. Needs nothing installed.
 #
 #   just profile-encode doc/rfc8878.txt

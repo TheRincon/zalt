@@ -32,6 +32,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use zalt_codec::{Backend, Scalar};
@@ -77,6 +78,38 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        "concurrent" => match args.get(2) {
+            Some(dir) => bench_concurrent(
+                Path::new(dir),
+                args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(8)
+                }),
+            ),
+            None => {
+                eprintln!("usage: zalt-bench concurrent <corpus-dir> [max-threads]");
+                std::process::exit(2);
+            }
+        },
+        "profile-concurrent" => match args.get(2) {
+            Some(dir) => profile_concurrent(
+                Path::new(dir),
+                args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20),
+                args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8),
+                if args.iter().any(|a| a == "owned") {
+                    Supply::Owned
+                } else {
+                    Supply::Pooled
+                },
+            ),
+            None => {
+                eprintln!(
+                    "usage: zalt-bench profile-concurrent <corpus-dir> [seconds] [threads] [owned]"
+                );
+                std::process::exit(2);
+            }
+        },
         "profile-encode" => match args.get(2) {
             Some(file) => profile_encode(
                 Path::new(file),
@@ -90,7 +123,7 @@ fn main() {
         other => {
             eprintln!(
                 "unknown mode {other:?}; expected 'kernels', 'baseline', 'decode', 'encode', \
-                 'profile' or 'profile-encode'"
+                 'concurrent', 'profile' or 'profile-encode'"
             );
             std::process::exit(2);
         }
@@ -902,6 +935,410 @@ fn compress_bytes(zstd: &Path, path: &Path, level: u32) -> Option<Vec<u8>> {
         .output()
         .ok()?;
     out.status.success().then_some(out.stdout)
+}
+
+// ------------------------------------------------------------- concurrent
+
+/// How a worker gets a decoder for each frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Supply {
+    /// From the shared [`zalt_embed::DecoderPool`], returned on drop. Every
+    /// checkout takes the pool's mutex and every return takes it again; a new
+    /// decoder also reserves against the shared [`zalt_embed::Budget`].
+    Pooled,
+    /// One decoder per thread, reset between frames. Shares nothing, so it is
+    /// the ceiling the pooled shape is measured against.
+    Owned,
+}
+
+impl Supply {
+    fn label(self) -> &'static str {
+        match self {
+            Supply::Pooled => "pooled",
+            Supply::Owned => "owned",
+        }
+    }
+}
+
+/// Decode every frame `passes` times, spread across `threads` workers.
+///
+/// Workers pull from one shared cursor rather than taking a fixed slice each.
+/// §8's resources differ in size by two orders of magnitude, so a static split
+/// would leave one thread holding `synthetic.zdoc` while the others finished and
+/// idled — and the measurement would be of the tail, not of the contention.
+/// A shared `fetch_add` is itself a contended atomic, which is why the index it
+/// hands out covers a whole frame: one atomic per resource, against the
+/// thousands of decode operations that resource costs.
+fn run_workload(
+    frames: &[Vec<u8>],
+    pool: &zalt_embed::DecoderPool,
+    supply: Supply,
+    threads: usize,
+    passes: usize,
+) {
+    let cursor = AtomicUsize::new(0);
+    let total = frames.len() * passes;
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                // Built once per worker, outside the frame loop, because a
+                // thread in a browser's network stack is not created per
+                // response either.
+                let mut owned = (supply == Supply::Owned)
+                    .then(|| zalt_embed::Decoder::new(permissive_policy()));
+                let mut out = Vec::new();
+
+                loop {
+                    let index = cursor.fetch_add(1, Ordering::Relaxed);
+                    if index >= total {
+                        break;
+                    }
+                    let frame = &frames[index % frames.len()];
+
+                    out.clear();
+                    match owned.as_mut() {
+                        Some(decoder) => {
+                            decoder.reset();
+                            decoder.decompress(frame, &mut out).expect("verified");
+                        }
+                        None => {
+                            let mut decoder = pool.get().expect("budget admits a decoder");
+                            decoder.decompress(frame, &mut out).expect("verified");
+                        }
+                    }
+                    std::hint::black_box(&out);
+                }
+            });
+        }
+    });
+}
+
+/// Bounds wide enough not to reject a corpus file, for the embed layer.
+fn permissive_policy() -> zalt_embed::Policy {
+    zalt_embed::Policy::trusted()
+}
+
+/// Measure how decode scales across threads, and what sharing costs.
+///
+/// # The question this answers
+///
+/// §6 gives L2 a global budget across live decoders and a decoder pool, and §8
+/// says the workload is many small resources decoded concurrently. §10 then
+/// admits, in the `zalt-darwin` re-check, that none of it was ever measured
+/// under concurrency: *"That is an argument for measuring the pool under
+/// concurrency, not for a Darwin VM layer."* This is that measurement.
+///
+/// # Why two shapes and not one
+///
+/// A scaling curve on its own cannot separate *the decoder does not scale* from
+/// *the pool does not scale*. So the identical workload runs two ways — through
+/// the shared pool, and with one decoder per thread sharing nothing — and the
+/// gap between them at a given thread count is the cost of sharing, with
+/// everything else held constant. `owned` is not a shipping configuration; it is
+/// the control.
+fn bench_concurrent(dir: &Path, max_threads: usize) {
+    let files = match collect_files(dir) {
+        Ok(f) if !f.is_empty() => f,
+        Ok(_) => {
+            eprintln!("no files found under {}", dir.display());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("cannot read {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    };
+
+    let Some(zstd) = find_zstd() else {
+        eprintln!("system `zstd` not found on PATH; cannot build the inputs");
+        std::process::exit(1);
+    };
+
+    let mut frames = Vec::new();
+    let mut decoded_bytes = 0usize;
+    for path in &files {
+        let Ok(raw) = fs::read(path) else { continue };
+        if raw.len() < 64 {
+            continue;
+        }
+        let Some(compressed) = compress_bytes(&zstd, path, 3) else {
+            continue;
+        };
+        // Never benchmark something that does not decode correctly.
+        match zalt_codec::decompress(&compressed, permissive_limits()) {
+            Ok(out) if out == raw => {}
+            _ => {
+                eprintln!("SKIP {}", path.display());
+                continue;
+            }
+        }
+        decoded_bytes += raw.len();
+        frames.push(compressed);
+    }
+
+    if frames.is_empty() {
+        eprintln!("nothing decodable in {}", dir.display());
+        std::process::exit(1);
+    }
+
+    // Enough repetitions that one measured op is tens of milliseconds, not
+    // microseconds. Two separate reasons, and the second is specific to this
+    // mode: the scoped-thread spawn at the start of each op should be a small
+    // share of it, and an op shorter than a scheduling quantum (~10 ms on
+    // Darwin) can be preempted in its entirety, which turns one descheduled
+    // batch into a row that reads as contention. Spawn stays *inside* the timed
+    // region deliberately — hoisting it would measure a thread pool this
+    // harness does not have and a host would.
+    const TARGET_BYTES_PER_OP: usize = 32 * 1024 * 1024;
+    let passes = (TARGET_BYTES_PER_OP / decoded_bytes.max(1)).max(4);
+    let bytes_per_op = decoded_bytes * passes;
+
+    let counts: Vec<usize> = [1usize, 2, 4, 8, 16]
+        .into_iter()
+        .filter(|&n| n <= max_threads)
+        .collect();
+
+    println!("concurrent decode — {} frames, zstd -3", frames.len());
+    println!(
+        "corpus {decoded_bytes} bytes decoded per pass, {passes} passes per measurement, {} cores",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
+    );
+    if let Some(state) = MachineState::read() {
+        state.report();
+    }
+    // A precondition this mode has and the others do not.
+    //
+    // Interleaving rescues a comparison between two implementations, because a
+    // disturbance lands on both and cancels in the ratio. It cannot rescue a
+    // comparison between *thread counts*: if the machine has no idle cores, an
+    // eighth thread has nowhere to run, and the row reports the scheduler
+    // timeslicing rather than anything about zalt. That is not noise to be
+    // averaged away — it is the wrong quantity, measured precisely.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    if let Some(state) = MachineState::read()
+        && cores > 0
+        && state.load_1min > cores as f64 * 0.5
+    {
+        println!();
+        println!("  STOP: load {:.2} against {cores} cores.", state.load_1min);
+        println!("  A scaling curve needs idle cores to scale onto. Close what is");
+        println!("  running and re-run; the rows below would describe the scheduler.");
+    }
+    println!();
+
+    // A budget generous enough that refusal never enters the measurement. This
+    // measures contention on the accounting, not the accounting's ceiling —
+    // backpressure is a correctness behaviour and has its own tests.
+    let budget = zalt_embed::Budget::new(1 << 30);
+    let pool = zalt_embed::DecoderPool::new(
+        zalt_embed::PoolConfig {
+            policy: permissive_policy(),
+            // Room for every worker to hold one at once. A pool smaller than
+            // the thread count would guarantee the allocation path on every
+            // checkout and measure the allocator instead of the pool.
+            max_idle: max_threads.max(8),
+            ..Default::default()
+        },
+        budget.clone(),
+    );
+
+    // Every shape and thread count is one op, and they all alternate. Measuring
+    // one thread count to completion and then the next puts them in different
+    // windows of wall-clock time, which on this machine is the difference
+    // between a scaling curve and a record of what else was running.
+    let mut ops: Vec<(Supply, usize)> = Vec::new();
+    for &supply in &[Supply::Owned, Supply::Pooled] {
+        for &n in &counts {
+            ops.push((supply, n));
+        }
+    }
+
+    let mut closures: Vec<Box<dyn FnMut() + '_>> = ops
+        .iter()
+        .map(|&(supply, n)| {
+            let frames = &frames;
+            let pool = &pool;
+            Box::new(move || run_workload(frames, pool, supply, n, passes)) as Box<dyn FnMut()>
+        })
+        .collect();
+    let mut refs: Vec<&mut dyn FnMut()> = closures.iter_mut().map(|b| &mut **b as _).collect();
+    let samples = measure_interleaved(bytes_per_op, &mut refs);
+
+    println!("{:-<86}", "");
+    println!(
+        "{:<10} {:>8} {:>12} {:>10} {:>12} {:>12} {:>10}",
+        "supply", "threads", "MB/s", "speedup", "efficiency", "vs owned", "spread"
+    );
+    println!("{:-<86}", "");
+
+    let mut baseline: std::collections::HashMap<(Supply, usize), f64> = Default::default();
+    let mut owned_at: std::collections::HashMap<usize, f64> = Default::default();
+    for (&(supply, n), sample) in ops.iter().zip(&samples) {
+        baseline.insert((supply, n), sample.best);
+        if supply == Supply::Owned {
+            owned_at.insert(n, sample.best);
+        }
+    }
+
+    /// Efficiency above this is not a good result but an impossible one.
+    ///
+    /// N threads cannot do more than N times the work of one. A little slack
+    /// covers the honest ways a ratio drifts high — the one-thread row losing a
+    /// batch, turbo headroom at low occupancy — but past this the run has
+    /// measured something other than what it says.
+    const IMPOSSIBLE_EFFICIENCY: f64 = 1.10;
+
+    let mut superlinear = Vec::new();
+    for (&(supply, n), sample) in ops.iter().zip(&samples) {
+        let one = baseline.get(&(supply, 1)).copied().unwrap_or(f64::NAN);
+        let speedup = sample.best / one;
+        let efficiency = speedup / n as f64;
+        let owned = owned_at.get(&n).copied().unwrap_or(f64::NAN);
+        if n > 1 && efficiency > IMPOSSIBLE_EFFICIENCY {
+            superlinear.push((supply, n, efficiency));
+        }
+        println!(
+            "{:<10} {n:>8} {:>12.1} {:>9.2}x {:>11.0}% {:>11.2}x {:>9.0}%{}",
+            supply.label(),
+            sample.best * 1000.0,
+            speedup,
+            100.0 * efficiency,
+            sample.best / owned,
+            100.0 * sample.spread,
+            if sample.noisy() { "  ~noisy" } else { "" }
+        );
+        if supply == Supply::Owned && n == *counts.last().expect("non-empty") {
+            println!("{:-<86}", "");
+        }
+    }
+
+    println!("{:-<86}", "");
+
+    // The self-check, and the reason it prints loudly rather than as a footnote.
+    //
+    // §9 records a recipe that reported "all 2500 frames decode and match the
+    // reference" having compared none of them, and draws the rule: a guard that
+    // lets a check pass on absent data turns a test into a formality. A scaling
+    // table that prints 119% efficiency without remark is the same failure in a
+    // benchmark — the number is not merely noisy, it is arithmetically
+    // impossible, and printing it beside plausible ones invites a reader to
+    // average them. So the run declares itself void instead.
+    if !superlinear.is_empty() {
+        println!();
+        println!(
+            "  VOID: {} row(s) report superlinear scaling, which cannot happen.",
+            superlinear.len()
+        );
+        for (supply, n, efficiency) in &superlinear {
+            println!(
+                "        {:<7} {n:>3} threads at {:.0}% efficiency",
+                supply.label(),
+                100.0 * efficiency
+            );
+        }
+        println!();
+        println!("  N threads cannot exceed N times one thread's work, so the one-thread");
+        println!("  baseline was itself disturbed and every ratio here is built on it.");
+        println!("  Nothing in this table is a finding. Re-run on an idle machine.");
+    }
+    println!();
+    println!("efficiency = speedup / threads. 100% is perfect scaling; the shortfall");
+    println!("            is contention, memory bandwidth, or E-cores taking work.");
+    println!("vs owned   = this row against one-decoder-per-thread at the same count,");
+    println!("            which is the cost of sharing a pool and a budget.");
+
+    let top = *counts.last().expect("non-empty");
+    let owned_top = owned_at.get(&top).copied().unwrap_or(f64::NAN);
+    let pooled_top = baseline
+        .get(&(Supply::Pooled, top))
+        .copied()
+        .unwrap_or(f64::NAN);
+    let owned_one = baseline
+        .get(&(Supply::Owned, 1))
+        .copied()
+        .unwrap_or(f64::NAN);
+    println!();
+    println!(
+        "SUMMARY concurrent threads={top} owned_speedup={:.2} pooled_speedup={:.2} pool_cost={:.3} budget_used_after={}",
+        owned_top / owned_one,
+        pooled_top
+            / baseline
+                .get(&(Supply::Pooled, 1))
+                .copied()
+                .unwrap_or(f64::NAN),
+        pooled_top / owned_top,
+        budget.used(),
+    );
+}
+
+/// Run the concurrent workload in a loop so a sampling profiler can attach.
+///
+/// The `concurrent` mode finishes in seconds, which is faster than `sample` can
+/// attach to it — and the scaling table says *that* sharing costs something
+/// without saying *where*, which is the same gap `profile-encode` exists to
+/// close. Defaults to the pooled shape, because the unpooled one shares nothing
+/// and has no contention to attribute.
+fn profile_concurrent(dir: &Path, seconds: u64, threads: usize, supply: Supply) {
+    let Some(zstd) = find_zstd() else {
+        eprintln!("system `zstd` not found on PATH");
+        std::process::exit(1);
+    };
+    let files = collect_files(dir).unwrap_or_default();
+    let mut frames = Vec::new();
+    let mut decoded_bytes = 0usize;
+    for path in &files {
+        let Ok(raw) = fs::read(path) else { continue };
+        if raw.len() < 64 {
+            continue;
+        }
+        let Some(compressed) = compress_bytes(&zstd, path, 3) else {
+            continue;
+        };
+        if !matches!(zalt_codec::decompress(&compressed, permissive_limits()), Ok(out) if out == raw)
+        {
+            continue;
+        }
+        decoded_bytes += raw.len();
+        frames.push(compressed);
+    }
+    if frames.is_empty() {
+        eprintln!("nothing decodable in {}", dir.display());
+        std::process::exit(1);
+    }
+
+    let budget = zalt_embed::Budget::new(1 << 30);
+    let pool = zalt_embed::DecoderPool::new(
+        zalt_embed::PoolConfig {
+            policy: permissive_policy(),
+            max_idle: threads.max(8),
+            ..Default::default()
+        },
+        budget,
+    );
+
+    eprintln!(
+        "profiling {} decode — {} frames, {threads} threads, {seconds}s",
+        supply.label(),
+        frames.len(),
+    );
+    eprintln!("attach with:  sample {} {seconds}", std::process::id());
+
+    let passes = (8 * 1024 * 1024 / decoded_bytes.max(1)).max(4);
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut rounds = 0u64;
+    while Instant::now() < deadline {
+        run_workload(&frames, &pool, supply, threads, passes);
+        rounds += 1;
+    }
+    eprintln!(
+        "{rounds} rounds, {} bytes decoded",
+        rounds * (decoded_bytes * passes) as u64
+    );
 }
 
 // ----------------------------------------------------------------- encode
