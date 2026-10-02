@@ -110,6 +110,36 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
             }));
             v
         }),
+        // Structured text past one block, built for the match finder rather
+        // than the frame layer: a template repeated with varying fields, so
+        // there are matches at every distance from a few bytes to across the
+        // block boundary, runs of repeat offsets broken by fresh ones, and
+        // literals between them that are neither random nor constant. Every
+        // other input here is a header boundary, a run, or noise — none of
+        // which gives an optimal parser a real choice to get wrong.
+        ("structured text across blocks", {
+            let mut s = 0x9E37_79B9u32;
+            let mut v = Vec::new();
+            let mut i = 0u32;
+            while v.len() < 140_000 {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let hash = s;
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                v.extend_from_slice(
+                    format!(
+                        "  <entry id=\"{i}\" hash=\"{hash:08x}{s:08x}\">item {} of {}</entry>\n",
+                        (i * 7) % 1000,
+                        i % 13
+                    )
+                    .as_bytes(),
+                );
+                if i % 97 == 0 {
+                    v.extend_from_slice(b"    <!-- a comment that recurs, a long way back -->\n");
+                }
+                i += 1;
+            }
+            v
+        }),
         // Incompressible-looking content, which is what `stored` is *for*.
         (
             "high entropy",
@@ -120,9 +150,16 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// Display names for the level rows, so the matrix can stay `&'static str`.
+const LEVEL_NAMES: [&str; 19] = [
+    "level 1", "level 2", "level 3", "level 4", "level 5", "level 6", "level 7", "level 8",
+    "level 9", "level 10", "level 11", "level 12", "level 13", "level 14", "level 15", "level 16",
+    "level 17", "level 18", "level 19",
+];
+
 fn params_matrix() -> Vec<(&'static str, EncodeParams)> {
     let base = EncodeParams::default();
-    vec![
+    let mut matrix = vec![
         ("default", base),
         (
             "checksum",
@@ -184,7 +221,50 @@ fn params_matrix() -> Vec<(&'static str, EncodeParams)> {
                 ..base
             },
         ),
-    ]
+    ];
+
+    // Every level, through every decoder.
+    //
+    // A level changes which sequences are emitted and nothing below that, so in
+    // principle the rows above already cover the wire format. They do not cover
+    // the *parsers*: greedy, one- and two-step lazy, and optimal parsing each
+    // choose sequences their own way, and the optimal parser tracks repeat
+    // offsets per path. A choice the decoder reads differently from the encoder
+    // shows up as wrong bytes and nowhere else, which is what these rows exist
+    // to catch.
+    for (level, name) in (1..=19).zip(LEVEL_NAMES) {
+        matrix.push((
+            name,
+            EncodeParams {
+                strategy: Strategy::Compress,
+                level,
+                ..base
+            },
+        ));
+    }
+    // The optimal parser under constraint: a window smaller than the input, so
+    // candidates and repeat offsets must be refused for distance; and with a
+    // checksum, so a decoder that agrees on length but not bytes still fails.
+    matrix.push((
+        "level 19, small window and blocks",
+        EncodeParams {
+            strategy: Strategy::Compress,
+            level: 19,
+            block_size: 1024,
+            window_log: 10,
+            ..base
+        },
+    ));
+    matrix.push((
+        "level 19 with checksum",
+        EncodeParams {
+            strategy: Strategy::Compress,
+            level: 19,
+            checksum: true,
+            ..base
+        },
+    ));
+    matrix
 }
 
 #[test]

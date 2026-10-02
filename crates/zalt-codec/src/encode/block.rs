@@ -8,6 +8,7 @@
 
 use alloc::vec::Vec;
 
+use super::level::Tuning;
 use super::match_finder;
 use super::sequences;
 use crate::block::BlockType;
@@ -118,7 +119,7 @@ pub fn write_all(
     out: &mut Vec<u8>,
     input: &[u8],
     boundaries: &[usize],
-    compress: bool,
+    compress: Option<Tuning>,
     window_log: u8,
 ) -> Vec<Emitted> {
     let mut emitted = Vec::new();
@@ -133,7 +134,8 @@ pub fn write_all(
     // `input.len()` is the whole frame, not this block: the matcher indexes
     // every position of the frame and reaches back across block boundaries, so
     // sizing its tables to one block would alias positions that are still live.
-    let mut matcher = compress.then(|| match_finder::Matcher::new(window_log, input.len()));
+    let mut matcher =
+        compress.map(|tuning| match_finder::Matcher::with_tuning(tuning, window_log, input.len()));
 
     let mut offset = 0usize;
     for &end in boundaries.iter().chain(core::iter::once(&input.len())) {
@@ -214,7 +216,7 @@ mod tests {
             &mut out,
             &input,
             &crate::encode::split::fixed(input.len(), 100),
-            false,
+            None,
             17,
         );
         assert_eq!(emitted.len(), 3);
@@ -232,7 +234,7 @@ mod tests {
     #[test]
     fn an_empty_input_still_produces_one_final_block() {
         let mut out = Vec::new();
-        let emitted = write_all(&mut out, &[], &[], false, 17);
+        let emitted = write_all(&mut out, &[], &[], None, 17);
         assert_eq!(emitted.len(), 1);
         assert!(parse_first(&out).last);
         assert_eq!(parse_first(&out).size, 0);

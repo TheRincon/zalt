@@ -30,6 +30,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::level::{Finder, Parse as ParseMode, Tuning};
+use super::optimal::{Prices, Stats};
 use crate::sequences::{REP_COUNT, REP_INITIAL, resolve_offset};
 
 /// Shortest match worth emitting.
@@ -39,6 +41,29 @@ use crate::sequences::{REP_COUNT, REP_INITIAL, resolve_offset};
 /// sequence describing it.
 const MIN_MATCH: usize = 4;
 
+/// How far the binary tree compares two positions before giving up on
+/// ordering them.
+///
+/// The tree orders positions by the bytes that follow them; two that agree all
+/// the way to this limit cannot be ordered, and the tree forgets one of them
+/// and everything below it. That is the price of a bound, and it was measured:
+/// at 4 KiB — libzstd's `ZSTD_OPT_NUM` — level 19 came out 0.7% larger on large
+/// input than at 64 KiB, because text with long duplicated stretches made the
+/// tree forget constantly. The bound exists at all because the cost of
+/// inserting a long duplicated region grows with the square of its length;
+/// [`Matcher::insert_up_to`]'s skip is what keeps that affordable at 64 KiB.
+const TREE_COMPARE_MAX: usize = 1 << 16;
+
+/// A tree insertion that found a match longer than this lets the next few
+/// positions go uninserted — libzstd's `ZSTD_insertBt1` speed rule, with its
+/// numbers. Positions deep inside a long match are the ones least likely to be
+/// the best source for anything later, and inserting each costs a compare as
+/// long as the match.
+const TREE_SKIP_AFTER: usize = 384;
+
+/// The most positions one such insertion skips.
+const TREE_SKIP_MAX: usize = 192;
+
 /// Bytes at the end of a block left as literals rather than matched into.
 ///
 /// The hash reads four bytes at a time, so the last few positions have nothing
@@ -46,9 +71,11 @@ const MIN_MATCH: usize = 4;
 /// sequence section's trailing literals non-degenerate.
 const TAIL: usize = 8;
 
-/// Candidates examined per position before settling.
+/// Candidates examined per position before settling, for a matcher built
+/// without a level — see [`Matcher::new`]. A level sets its own.
 ///
 /// Cost is linear in this and the benefit falls off quickly.
+#[cfg(test)]
 const SEARCH_DEPTH: usize = 32;
 
 /// A later match must beat the one in hand by this much to be worth the literal
@@ -62,6 +89,7 @@ const LAZY_MARGIN: usize = 1;
 /// which §8's workload pays once per resource, on resources of a few kilobytes.
 /// The M5 profile found `memset` at 7.6% of a 7.7 KB encode, all of it clearing
 /// table space for positions that do not exist.
+#[cfg(test)]
 const HASH_LOG_MAX: u32 = 17;
 
 /// Smallest hash table worth building.
@@ -78,9 +106,9 @@ const HASH_LOG_MIN: u32 = 12;
 /// tuning compromise on small inputs — it is declining to clear memory that
 /// provably stays empty. Inputs at or above 128 KB get the full table and are
 /// unaffected.
-fn hash_log_for(len: usize) -> u32 {
+fn hash_log_for(len: usize, max: u32) -> u32 {
     let needed = usize::BITS - len.max(1).leading_zeros();
-    needed.clamp(HASH_LOG_MIN, HASH_LOG_MAX)
+    needed.clamp(HASH_LOG_MIN, max.max(HASH_LOG_MIN))
 }
 
 /// Marks an empty slot. Unreachable as a position: a frame this encoder emits
@@ -165,6 +193,111 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
             .count()
 }
 
+/// The `Offset_Value` that encodes `offset`, and the repeat table after it.
+///
+/// **The choice is made by asking the decoder.** §4 records the
+/// `literals_length == 0` shift as the most commonly botched part of the format,
+/// and it is not a rule worth re-deriving: each candidate is tried against
+/// [`resolve_offset`] on a copy of the table, and whichever reproduces the
+/// offset wins. Pure, so the optimal parser can price a repeat code along a
+/// path it has not committed to, with the same rule that later writes it.
+fn offset_code_for(
+    repeats: [u32; REP_COUNT],
+    offset: u32,
+    literals_zero: bool,
+) -> (u32, [u32; REP_COUNT]) {
+    for candidate in 1..=REP_COUNT as u32 {
+        let mut trial = repeats;
+        if resolve_offset(candidate, literals_zero, &mut trial) == Ok(offset) {
+            return (candidate, trial);
+        }
+    }
+    let value = offset + REP_COUNT as u32;
+    let mut trial = repeats;
+    let resolved = resolve_offset(value, literals_zero, &mut trial);
+    debug_assert_eq!(resolved, Ok(offset));
+    (value, trial)
+}
+
+/// Positions the optimal parser explores before committing to a path — libzstd's
+/// `ZSTD_OPT_NUM`. Bounds the table, and the distance a decision can be
+/// deferred.
+const OPT_NUM: usize = 1 << 12;
+
+/// One position in the optimal parser's table: the cheapest known way to reach
+/// it, and the state that way leaves behind.
+#[derive(Debug, Clone, Copy)]
+struct Node {
+    /// Cost of the cheapest path here, in [`super::optimal::BIT`] units.
+    /// Signed: a literal step charges the *change* in the literals-length
+    /// price, which can be negative when a longer run has a commoner code.
+    price: i64,
+    /// Length of the match that ends here on that path, or 0 for a literal.
+    match_length: u32,
+    offset: u32,
+    /// Literals pending since the path's last match.
+    literals: u32,
+    /// The decoder's repeat table, had it followed this path. Repeat matches
+    /// are priced from it, so two paths reaching one position can disagree
+    /// about which offsets are cheap — and should.
+    repeats: [u32; REP_COUNT],
+}
+
+const UNREACHED: Node = Node {
+    price: i64::MAX,
+    match_length: 0,
+    offset: 0,
+    literals: 0,
+    repeats: [0; REP_COUNT],
+};
+
+fn ensure(opt: &mut Vec<Node>, index: usize) {
+    if opt.len() <= index {
+        opt.resize(index + 1, UNREACHED);
+    }
+}
+
+/// Offer every match length of every candidate from `from` to the table.
+///
+/// Candidates arrive in increasing length, each at a farther (dearer) offset
+/// than the last. So a length is best served by the *first* candidate long
+/// enough to reach it: candidate `k` prices only the lengths candidate `k - 1`
+/// could not.
+fn relax(
+    opt: &mut Vec<Node>,
+    from: usize,
+    candidates: &[(u32, u32)],
+    prices: &Prices,
+    last: &mut usize,
+) {
+    let node = opt[from];
+    let literals_zero = node.literals == 0;
+    // The sequence's literals-length price for a run of zero; a longer run has
+    // already paid the difference, one literal step at a time.
+    let base = node.price + i64::from(prices.literal_length(0));
+    let mut shortest = MIN_MATCH as u32;
+    for &(length, offset) in candidates {
+        let (value, repeats) = offset_code_for(node.repeats, offset, literals_zero);
+        let reach = from + length as usize;
+        ensure(opt, reach);
+        for ml in shortest..=length {
+            let price = base + i64::from(prices.sequence(ml, value));
+            let slot = &mut opt[from + ml as usize];
+            if price < slot.price {
+                *slot = Node {
+                    price,
+                    match_length: ml,
+                    offset,
+                    literals: 0,
+                    repeats,
+                };
+            }
+        }
+        shortest = length + 1;
+        *last = (*last).max(reach);
+    }
+}
+
 /// A match finder whose history persists across the blocks of one frame.
 pub struct Matcher {
     /// Most recent position for each hash.
@@ -175,8 +308,38 @@ pub struct Matcher {
     /// Previous position sharing a hash, indexed by position modulo the window.
     chain: Vec<u32>,
     chain_mask: usize,
+    /// How candidates are found. See [`Finder`].
+    finder: Finder,
+    /// The binary tree, for [`Finder::Tree`]: two child slots per position —
+    /// the earlier position that sorts just below it, and the one just above —
+    /// indexed by position modulo the tree's size. Empty for the chain.
+    tree: Vec<u32>,
+    tree_mask: usize,
     /// Largest offset the frame's declared window admits.
     max_offset: usize,
+    /// Chain candidates examined per search.
+    depth: usize,
+    /// How the candidates found are chosen among.
+    mode: ParseMode,
+    /// A match this long ends the search early. See [`Tuning::target_length`].
+    target_length: usize,
+    /// The level's knobs and the declared window, kept so a two-pass level can
+    /// build a scout matcher identical to this one.
+    tuning: Tuning,
+    window_log: u8,
+    /// First position not yet inserted. Only the optimal parser uses it: it
+    /// searches positions out of the order the lazy loop visits them, and
+    /// catches the chain up to wherever it is about to search.
+    indexed: usize,
+    /// What the optimal parser prices from, carried across blocks.
+    stats: Option<Stats>,
+    /// Whether a two-pass level has already scouted this frame's first block.
+    scouted: bool,
+    /// Scratch for the optimal parser, kept so it is allocated once per frame
+    /// rather than once per stretch of input.
+    opt: Vec<Node>,
+    candidates: Vec<(u32, u32)>,
+    path: Vec<(usize, usize, usize)>,
     /// The three recent offsets, as the decoder will hold them.
     ///
     /// Advanced through [`crate::sequences::resolve_offset`] so it cannot drift
@@ -191,7 +354,35 @@ impl Matcher {
     /// **`input_len` sizes the tables and nothing else.** It is not a limit —
     /// every offset is still bounded by the window, and a caller that passes a
     /// larger figure gets a larger table and the same output.
+    ///
+    /// This is the configuration the encoder had before levels existed — depth
+    /// 32, one lazy step, a hash table of at most 2^17 — and it is kept, for the
+    /// tests, as a fixed point: a level that sets the same knobs must parse the
+    /// same input to the same sequences.
+    #[cfg(test)]
     pub fn new(window_log: u8, input_len: usize) -> Self {
+        Self::with_tuning(
+            Tuning {
+                window_log,
+                hash_log: HASH_LOG_MAX,
+                search_depth: SEARCH_DEPTH,
+                parse: ParseMode::Lazy(1),
+                finder: Finder::Chain,
+                target_length: usize::MAX,
+            },
+            window_log,
+            input_len,
+        )
+    }
+
+    /// A matcher for one compression level.
+    ///
+    /// `window_log` is what the frame actually declares, which the caller has
+    /// already capped — by its own ceiling and by the content's size — so it may
+    /// be smaller than the level's. The level's own window is not consulted here
+    /// for exactly that reason: an offset past the declared window names history
+    /// the decoder has been told it may drop.
+    pub fn with_tuning(tuning: Tuning, window_log: u8, input_len: usize) -> Self {
         let window = 1usize << window_log.min(31);
         // The chain is indexed modulo its own size, so entries older than the
         // window are overwritten and drop out — which is exactly the set of
@@ -208,13 +399,41 @@ impl Matcher {
                 .checked_next_power_of_two()
                 .unwrap_or(window),
         );
-        let hash_log = hash_log_for(input_len);
+        let hash_log = hash_log_for(input_len, tuning.hash_log);
+        // A tree only where something can use it: the lazy parse searches
+        // positions it may then skip inserting, and in a tree searching *is*
+        // inserting. Level tables pair them correctly; this keeps a wrong
+        // pairing from ever reaching the lazy loop.
+        let finder = match (tuning.finder, tuning.parse) {
+            (Finder::Tree, ParseMode::Optimal { .. }) => Finder::Tree,
+            _ => Finder::Chain,
+        };
+        // Whichever structure is not in use is a single slot rather than a
+        // window's worth, so a tree level does not also pay to clear a chain.
+        let (chain_size, tree_size) = match finder {
+            Finder::Chain => (chain_size, 0),
+            Finder::Tree => (1, chain_size),
+        };
         Self {
             head: vec![EMPTY; 1 << hash_log],
             hash_log,
             chain: vec![EMPTY; chain_size],
             chain_mask: chain_size - 1,
+            finder,
+            tree: vec![EMPTY; 2 * tree_size],
+            tree_mask: tree_size.saturating_sub(1),
             max_offset: window,
+            depth: tuning.search_depth.max(1),
+            mode: tuning.parse,
+            target_length: tuning.target_length.max(MIN_MATCH),
+            tuning,
+            window_log,
+            indexed: 0,
+            stats: None,
+            scouted: false,
+            opt: Vec::new(),
+            candidates: Vec::new(),
+            path: Vec::new(),
             repeats: REP_INITIAL,
         }
     }
@@ -244,7 +463,7 @@ impl Matcher {
         let mut best_tail = 0u8;
         let mut candidate = self.head[hash4(&input[pos..], self.hash_log)];
 
-        for _ in 0..SEARCH_DEPTH {
+        for _ in 0..self.depth {
             if candidate == EMPTY {
                 break;
             }
@@ -289,8 +508,9 @@ impl Matcher {
                 if length > best_len {
                     best_len = length;
                     best_offset = pos - c;
-                    if best_len == available {
-                        // Nothing can beat a match that runs to the limit.
+                    if best_len == available || best_len >= self.target_length {
+                        // Nothing can beat a match that runs to the limit, and
+                        // a level may declare a shorter one good enough.
                         break;
                     }
                     best_tail = input[pos + best_len];
@@ -333,18 +553,8 @@ impl Matcher {
     /// exactly the case §4 warns about, and the symptom would be a frame that
     /// decodes to plausible wrong bytes.
     fn choose_offset_value(&mut self, offset: u32, literal_length: u32) -> u32 {
-        for candidate in 1..=REP_COUNT as u32 {
-            let mut trial = self.repeats;
-            if resolve_offset(candidate, literal_length == 0, &mut trial) == Ok(offset) {
-                self.repeats = trial;
-                return candidate;
-            }
-        }
-        let value = offset + REP_COUNT as u32;
-        let mut trial = self.repeats;
-        let resolved = resolve_offset(value, literal_length == 0, &mut trial);
-        debug_assert_eq!(resolved, Ok(offset));
-        self.repeats = trial;
+        let (value, repeats) = offset_code_for(self.repeats, offset, literal_length == 0);
+        self.repeats = repeats;
         value
     }
 
@@ -380,6 +590,528 @@ impl Matcher {
         common_prefix(&input[pos - offset..], &input[pos..pos + available])
     }
 
+    /// Insert every position from the cursor up to, not including, `target`.
+    ///
+    /// The optimal parser's version of the loop invariant the lazy parse keeps
+    /// by hand: whenever a position is searched, everything before it is in the
+    /// chain and it is not. Positions with fewer than four bytes left have
+    /// nothing to hash and are skipped, as [`Matcher::index_range`] skips them.
+    fn insert_up_to(&mut self, input: &[u8], target: usize) {
+        let hashable = input.len().saturating_sub(MIN_MATCH - 1);
+        while self.indexed < target {
+            let mut step = 1;
+            if self.indexed < hashable {
+                match self.finder {
+                    Finder::Chain => self.insert(input, self.indexed),
+                    Finder::Tree => step = self.tree_update(input, self.indexed, 0, 0, None),
+                }
+            }
+            // Never past `target`. The parser is about to search there, and
+            // in a tree searching inserts: a skip that jumped over `target`
+            // would leave it to be inserted *after* newer positions, as the
+            // root of a tree that must be ordered by age. Clamped, a skip can
+            // only ever leave positions out — which costs a match, never order.
+            self.indexed += step.min(target - self.indexed);
+        }
+    }
+
+    /// Search the binary tree at `pos` and insert `pos` into it, in one descent.
+    ///
+    /// libzstd's `ZSTD_insertBtAndGetAllMatches`, in shape. Each hash bucket
+    /// is a binary search tree of earlier positions, ordered by the bytes that
+    /// follow them, with the newest at the root. Inserting `pos` makes it the
+    /// new root: the descent compares it against one node at a time, hangs each
+    /// node below or above it accordingly, and steps into the side of that
+    /// node's subtree where `pos` belongs. Every node visited is a candidate
+    /// match, and because the tree is ordered, the nodes visited are the ones
+    /// closest to `pos` in sort order — which is to say the longest matches.
+    ///
+    /// **The tree navigates; it is not trusted to measure.** A node's place in
+    /// the tree implies it shares at least `min(common_below, common_above)`
+    /// bytes with `pos`, and libzstd skips comparing those. So does this, to
+    /// steer. But a match is *reported* only after a full comparison from its
+    /// first byte. A tree made inconsistent by something unforeseen — a slot
+    /// reused after the window wrapped, an ordering decided under a different
+    /// limit — would otherwise report a length the bytes do not support, and
+    /// the frame would decode wrong with nothing to say so. Reports happen only
+    /// on an improvement, a handful per search, so the check costs little; an
+    /// inconsistency costs a missed match, never a wrong one.
+    ///
+    /// With `out` absent this only inserts. With it, every match longer than
+    /// `best` and no longer than `available` is appended, shortest first.
+    ///
+    /// Returns how many positions an insertion-only caller may advance — 1,
+    /// or more after a long or self-overlapping match. See
+    /// [`TREE_SKIP_AFTER`].
+    fn tree_update(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        available: usize,
+        mut best: usize,
+        mut out: Option<&mut Vec<(u32, u32)>>,
+    ) -> usize {
+        let h = hash4(&input[pos..], self.hash_log);
+        let mut node = self.head[h];
+        self.head[h] = pos as u32;
+
+        // Bytes compared for ordering. Never past the input, and never past
+        // `TREE_COMPARE_MAX` — see there.
+        let hi = input.len().min(pos + TREE_COMPARE_MAX);
+        let floor = pos.saturating_sub(self.max_offset);
+        // A node at or below this may share its slots with a newer position
+        // once the tree has wrapped, so its children are not followed.
+        let reused_below = pos.saturating_sub(self.tree_mask);
+
+        // The two open edges: where the next node sorting below `pos` hangs,
+        // and where the next one sorting above it does. They start as `pos`'s
+        // own slots and move down the tree as the descent does. `None` once an
+        // edge has run into a node whose children cannot be trusted.
+        let own = 2 * (pos & self.tree_mask);
+        let mut below = Some(own);
+        let mut above = Some(own + 1);
+        let mut common_below = 0usize;
+        let mut common_above = 0usize;
+        // The tree is a heap by age — every node is newer than its children —
+        // so a real descent strictly decreases. Anything else is a stale slot.
+        let mut previous = pos;
+        // For the skip: the longest agreement seen, and the furthest any
+        // matched source runs. The second is libzstd's test for a run whose
+        // period is shorter than itself — a source ending past `pos` means the
+        // positions after `pos` are copies of positions already in the tree.
+        let mut longest = 0usize;
+        let mut source_end = pos + 9;
+
+        for _ in 0..self.depth {
+            if node == EMPTY {
+                break;
+            }
+            let m = node as usize;
+            if m < floor || m >= previous {
+                break;
+            }
+            previous = m;
+            let slots = 2 * (m & self.tree_mask);
+
+            let known = common_below.min(common_above);
+            let mut length = known + common_prefix(&input[m + known..], &input[pos + known..hi]);
+            longest = longest.max(length);
+            source_end = source_end.max(m + length);
+
+            if length > best && out.is_some() {
+                // The verification described above: measured from byte zero.
+                length = common_prefix(&input[m..], &input[pos..hi]);
+                let reportable = length.min(available);
+                if reportable > best
+                    && reportable >= MIN_MATCH
+                    && let Some(out) = out.as_mut()
+                {
+                    out.push((reportable as u32, (pos - m) as u32));
+                    best = reportable;
+                }
+            }
+
+            if pos + length >= hi {
+                // Equal as far as the comparison goes, so there is no telling
+                // which sorts first. Drop this node and its subtree from the
+                // new tree rather than guess — libzstd's choice, and it costs a
+                // little compression, never a wrong order.
+                break;
+            }
+
+            if input[m + length] < input[pos + length] {
+                // `m` sorts below `pos`: it hangs on the lower edge, and the
+                // descent continues into the part of its subtree above it.
+                if let Some(edge) = below {
+                    self.tree[edge] = node;
+                }
+                common_below = length;
+                if m <= reused_below {
+                    below = None;
+                    break;
+                }
+                below = Some(slots + 1);
+                node = self.tree[slots + 1];
+            } else {
+                if let Some(edge) = above {
+                    self.tree[edge] = node;
+                }
+                common_above = length;
+                if m <= reused_below {
+                    above = None;
+                    break;
+                }
+                above = Some(slots);
+                node = self.tree[slots];
+            }
+        }
+
+        // Close both edges: whatever was not reached is no longer in the tree.
+        if let Some(edge) = below {
+            self.tree[edge] = EMPTY;
+        }
+        if let Some(edge) = above {
+            self.tree[edge] = EMPTY;
+        }
+
+        let long = if longest > TREE_SKIP_AFTER {
+            (longest - TREE_SKIP_AFTER).min(TREE_SKIP_MAX)
+        } else {
+            0
+        };
+        long.max(source_end - (pos + 8)).max(1)
+    }
+
+    /// Every match at `pos` worth pricing, shortest first, into `out`.
+    ///
+    /// Each entry is strictly longer than the one before it, so the list is the
+    /// set of lengths reachable and, for each, the cheapest offset found that
+    /// reaches it. The repeat offsets go first — they are the cheapest offsets
+    /// to name — and a chain candidate is kept only if it is longer than
+    /// anything already found.
+    ///
+    /// `repeats` and `literals_zero` are the decoder's state *along the path
+    /// being priced*, which is why they are arguments: with no literals before
+    /// the match, the three codable repeats shift by one (§4), and a parser
+    /// that priced from the committed table instead would think the wrong
+    /// offsets cheap.
+    fn gather(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        limit: usize,
+        repeats: [u32; REP_COUNT],
+        literals_zero: bool,
+        out: &mut Vec<(u32, u32)>,
+    ) {
+        out.clear();
+        let available = limit.saturating_sub(pos);
+        if available < MIN_MATCH {
+            return;
+        }
+        // The length to beat. `best < available` holds throughout — the search
+        // stops when a match reaches the limit — which is what keeps every
+        // `[_ + best]` below in range.
+        let mut best = MIN_MATCH - 1;
+
+        let codable = if literals_zero {
+            [repeats[1], repeats[2], repeats[0].wrapping_sub(1)]
+        } else {
+            repeats
+        };
+        for offset in codable {
+            let offset = offset as usize;
+            if offset == 0 || offset > pos || offset > self.max_offset {
+                continue;
+            }
+            if input[pos - offset + best] != input[pos + best] {
+                continue;
+            }
+            let length = common_prefix(&input[pos - offset..], &input[pos..pos + available]);
+            if length > best {
+                out.push((length as u32, offset as u32));
+                best = length;
+                if best == available || best >= self.target_length {
+                    return;
+                }
+            }
+        }
+
+        if self.finder == Finder::Tree {
+            // Searching the tree inserts `pos`, so the cursor moves past it
+            // here — `insert_up_to` must not insert it a second time. Only on
+            // this path: a return above, on a repeat that reached the target,
+            // leaves `pos` for the cursor to insert later, as the chain does.
+            debug_assert_eq!(self.indexed, pos, "searched out of order");
+            self.tree_update(input, pos, available, best, Some(out));
+            self.indexed = pos + 1;
+            return;
+        }
+
+        let floor = pos.saturating_sub(self.max_offset);
+        let mut candidate = self.head[hash4(&input[pos..], self.hash_log)];
+        for _ in 0..self.depth {
+            if candidate == EMPTY {
+                break;
+            }
+            let c = candidate as usize;
+            if c < floor || c >= pos {
+                break;
+            }
+            let next = self.chain[c & self.chain_mask];
+            if input[c + best] == input[pos + best] {
+                let length = common_prefix(&input[c..], &input[pos..pos + available]);
+                if length > best {
+                    out.push((length as u32, (pos - c) as u32));
+                    best = length;
+                    if best == available || best >= self.target_length {
+                        break;
+                    }
+                }
+            }
+            if next >= candidate {
+                break;
+            }
+            candidate = next;
+        }
+    }
+
+    /// Prices from the statistics as they stand.
+    fn prices(&self) -> Prices {
+        match &self.stats {
+            Some(stats) => Prices::new(stats),
+            None => Prices::new(&Stats::first_block(&[])),
+        }
+    }
+
+    /// Get the statistics ready for the block `input[start..end]`.
+    ///
+    /// A two-pass level scouts the frame's first block: a separate matcher,
+    /// identical but for its own empty tables, parses the block purely to learn
+    /// what its literals and sequences look like, and this matcher starts from
+    /// what the scout learned. libzstd's `btultra2` does the same, for the same
+    /// reason — the first block's prices are otherwise a guess from raw byte
+    /// counts, and every later block inherits them. The scout's sequences are
+    /// discarded, and nothing it does touches this matcher's chain or repeat
+    /// table, so it changes which path is preferred and never what is legal.
+    fn prepare_statistics(&mut self, input: &[u8], start: usize, end: usize) {
+        if let ParseMode::Optimal { passes: 2 } = self.mode
+            && start == 0
+            && !self.scouted
+        {
+            let mut scout = Matcher::with_tuning(self.tuning, self.window_log, end);
+            scout.scouted = true;
+            let _ = scout.parse_optimal(input, start, end);
+            self.stats = scout.stats;
+            self.scouted = true;
+            return;
+        }
+        let block = &input[start..end];
+        match self.stats.as_mut() {
+            None => self.stats = Some(Stats::first_block(block)),
+            Some(stats) if start > 0 => stats.next_block(block),
+            Some(_) => {}
+        }
+    }
+
+    /// Commit one match: its literals, its sequence, and what it teaches the
+    /// price model.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_match(
+        &mut self,
+        input: &[u8],
+        anchor: &mut usize,
+        at: usize,
+        length: usize,
+        offset: usize,
+        literals: &mut Vec<u8>,
+        sequences: &mut Vec<Sequence>,
+    ) {
+        let literal_length = (at - *anchor) as u32;
+        // Through the decoder's rule, whatever the parser assumed. The parser
+        // tracks the same table per path and should agree; if it ever does
+        // not, this is where the frame stays correct and only the price was
+        // wrong.
+        let offset_value = self.choose_offset_value(offset as u32, literal_length);
+        let run = &input[*anchor..at];
+        if let Some(stats) = self.stats.as_mut() {
+            stats.record(run, length as u32, offset_value);
+        }
+        literals.extend_from_slice(run);
+        sequences.push(Sequence {
+            literal_length,
+            match_length: length as u32,
+            offset: offset as u32,
+            offset_value,
+        });
+        *anchor = at + length;
+    }
+
+    /// Decompose `input[start..end]` by pricing paths rather than taking
+    /// matches as they come.
+    ///
+    /// From each position that has a match, the parser walks forward filling a
+    /// table: the cheapest known cost of reaching each later position, by a
+    /// literal from the position before it or by any length of any match found
+    /// at an earlier one. It stops when no path reaches further, when the table
+    /// is [`OPT_NUM`] long, or when a match is long enough
+    /// ([`Tuning::target_length`]) to take outright. Then it follows the
+    /// cheapest path back and commits it.
+    ///
+    /// What the lazy parse cannot do and this can is give up a long match for a
+    /// shorter one that leaves the input better placed — a repeat offset two
+    /// bytes later, a literal now so that the next match is cheap. Every such
+    /// trade is a price comparison, which is why the price model exists.
+    fn parse_optimal(&mut self, input: &[u8], start: usize, end: usize) -> Parse {
+        let span = end - start;
+        let mut sequences = Vec::with_capacity(span / 16);
+        let mut literals = Vec::with_capacity(span / 2);
+
+        if span <= TAIL + MIN_MATCH {
+            self.insert_up_to(input, end);
+            literals.extend_from_slice(&input[start..end]);
+            return Parse {
+                sequences,
+                literals,
+            };
+        }
+
+        self.prepare_statistics(input, start, end);
+        let mut prices = self.prices();
+
+        let limit = end - TAIL;
+        let target = self.target_length.min(OPT_NUM - 1);
+        let mut opt = core::mem::take(&mut self.opt);
+        let mut candidates = core::mem::take(&mut self.candidates);
+        let mut path = core::mem::take(&mut self.path);
+
+        let mut pos = start;
+        let mut anchor = start;
+        while pos + MIN_MATCH <= limit {
+            self.insert_up_to(input, pos);
+            self.gather(
+                input,
+                pos,
+                limit,
+                self.repeats,
+                pos == anchor,
+                &mut candidates,
+            );
+            let Some(&(longest, longest_offset)) = candidates.last() else {
+                pos += 1;
+                continue;
+            };
+            if longest as usize >= target {
+                self.emit_match(
+                    input,
+                    &mut anchor,
+                    pos,
+                    longest as usize,
+                    longest_offset as usize,
+                    &mut literals,
+                    &mut sequences,
+                );
+                pos = anchor;
+                prices = self.prices();
+                continue;
+            }
+
+            opt.clear();
+            opt.push(Node {
+                price: 0,
+                match_length: 0,
+                offset: 0,
+                literals: (pos - anchor) as u32,
+                repeats: self.repeats,
+            });
+            let mut last = 0usize;
+            relax(&mut opt, 0, &candidates, &prices, &mut last);
+
+            let mut cur = 1usize;
+            while cur <= last {
+                // Reach `cur` by one more literal. Charged the byte, plus the
+                // change in the literals-length price the longer run implies.
+                let prev = opt[cur - 1];
+                let run = prev.literals;
+                let price = prev.price
+                    + i64::from(prices.literal(input[pos + cur - 1]))
+                    + i64::from(prices.literal_length(run + 1))
+                    - i64::from(prices.literal_length(run));
+                if price < opt[cur].price {
+                    opt[cur] = Node {
+                        price,
+                        match_length: 0,
+                        offset: 0,
+                        literals: run + 1,
+                        repeats: prev.repeats,
+                    };
+                }
+                if cur == last {
+                    break;
+                }
+                if cur >= OPT_NUM {
+                    last = cur;
+                    break;
+                }
+
+                let here = pos + cur;
+                if here + MIN_MATCH <= limit {
+                    let node = opt[cur];
+                    self.insert_up_to(input, here);
+                    self.gather(
+                        input,
+                        here,
+                        limit,
+                        node.repeats,
+                        node.literals == 0,
+                        &mut candidates,
+                    );
+                    if let Some(&(length, offset)) = candidates.last() {
+                        if length as usize >= target {
+                            // Long enough to take without pricing the
+                            // alternatives: end the stretch here, through it.
+                            let reach = cur + length as usize;
+                            ensure(&mut opt, reach);
+                            let (_, repeats) =
+                                offset_code_for(node.repeats, offset, node.literals == 0);
+                            opt[reach] = Node {
+                                price: node.price,
+                                match_length: length,
+                                offset,
+                                literals: 0,
+                                repeats,
+                            };
+                            last = reach;
+                            break;
+                        }
+                        relax(&mut opt, cur, &candidates, &prices, &mut last);
+                    }
+                }
+                cur += 1;
+            }
+
+            // Follow the cheapest path back from the furthest position, then
+            // commit its matches in order. Literals along it are not emitted
+            // here: they stay pending behind `anchor`, and a run that ends the
+            // stretch carries into the next one.
+            path.clear();
+            let mut i = last;
+            while i > 0 {
+                let node = opt[i];
+                if node.match_length > 0 {
+                    let length = node.match_length as usize;
+                    path.push((i - length, length, node.offset as usize));
+                    i -= length;
+                } else {
+                    i -= 1;
+                }
+            }
+            for &(at, length, offset) in path.iter().rev() {
+                self.emit_match(
+                    input,
+                    &mut anchor,
+                    pos + at,
+                    length,
+                    offset,
+                    &mut literals,
+                    &mut sequences,
+                );
+            }
+            pos += last;
+            prices = self.prices();
+        }
+
+        self.insert_up_to(input, end);
+        literals.extend_from_slice(&input[anchor..end]);
+        self.opt = opt;
+        self.candidates = candidates;
+        self.path = path;
+        Parse {
+            sequences,
+            literals,
+        }
+    }
+
     /// Index every position in a range that has four bytes to hash.
     fn index_range(&mut self, input: &[u8], from: usize, to: usize) {
         let end = to.min(input.len().saturating_sub(MIN_MATCH - 1));
@@ -394,6 +1126,9 @@ impl Matcher {
     /// the window. `start` must be where the previous call ended, so the chain
     /// stays in step with the positions it names.
     pub fn parse(&mut self, input: &[u8], start: usize, end: usize) -> Parse {
+        if let ParseMode::Optimal { .. } = self.mode {
+            return self.parse_optimal(input, start, end);
+        }
         // Both grow to some fraction of the block and both are rebuilt for
         // every block, so starting them at zero spends the block's first
         // kilobytes reallocating and copying. These are opening sizes, not
@@ -461,16 +1196,27 @@ impl Matcher {
                 }
             }
 
-            // Lazy: a match one byte later may be long enough to be worth the
-            // literal that taking it costs. One step only — a second lookahead
-            // doubles the search for very little.
-            if let Some((next_len, next_offset)) = self.find(input, pos + 1, limit)
-                && next_len >= length + LAZY_MARGIN
-            {
-                self.insert(input, pos + 1);
-                pos += 1;
-                length = next_len;
-                offset = next_offset;
+            // Lazy: a match a byte later may be long enough to be worth the
+            // literal that taking it costs. Greedy levels take what they have;
+            // lazy levels look one or two bytes ahead, moving forward each time
+            // the next position does better. Each step that moves inserts the
+            // position it leaves behind, which keeps the loop invariant — every
+            // position below the one being searched is in, and it is not.
+            let lookahead = match self.mode {
+                ParseMode::Greedy => 0,
+                ParseMode::Lazy(steps) => steps,
+                ParseMode::Optimal { .. } => 0,
+            };
+            for _ in 0..lookahead {
+                match self.find(input, pos + 1, limit) {
+                    Some((next_len, next_offset)) if next_len >= length + LAZY_MARGIN => {
+                        self.insert(input, pos + 1);
+                        pos += 1;
+                        length = next_len;
+                        offset = next_offset;
+                    }
+                    _ => break,
+                }
             }
 
             let literal_length = (pos - anchor) as u32;
@@ -507,6 +1253,7 @@ impl Matcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
 
     fn parse_one(block: &[u8]) -> Parse {
         Matcher::new(17, block.len()).parse(block, 0, block.len())
@@ -823,6 +1570,259 @@ mod tests {
             parse.sequences.iter().any(|s| s.match_length > 20),
             "the older, longer match should have been found: {:?}",
             parse.sequences
+        );
+    }
+
+    // ------------------------------------------------- the optimal parser
+
+    /// A matcher at the top level, which parses optimally with a scout pass,
+    /// finding candidates the level's way — a binary tree.
+    fn optimal(window_log: u8, len: usize) -> Matcher {
+        Matcher::with_tuning(crate::encode::level::tuning(19), window_log, len)
+    }
+
+    /// The same, but with the hash chain. No level uses this pairing today; it
+    /// is kept working, and tested, because it is the simpler of the two and
+    /// the one a tree bug would be bisected against.
+    fn optimal_chain(window_log: u8, len: usize) -> Matcher {
+        let tuning = Tuning {
+            finder: Finder::Chain,
+            ..crate::encode::level::tuning(19)
+        };
+        Matcher::with_tuning(tuning, window_log, len)
+    }
+
+    /// Every shape the lazy parse is tested on, through the optimal parser.
+    ///
+    /// It shares the lazy parse's invariants and none of its code: it inserts
+    /// positions through its own cursor, searches out of the lazy loop's order,
+    /// and commits a path it found by walking backwards. So each of these is a
+    /// separate claim about it, not a repeat of one already made.
+    #[test]
+    fn the_optimal_parse_accounts_for_and_replays_every_shape() {
+        let incompressible: Vec<u8> = (0..4000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let mut patterned = Vec::new();
+        for _ in 0..3 {
+            patterned.extend_from_slice(b"PATTERNPATTERNPATTERN");
+            patterned.extend_from_slice(&[b'.'; 40]);
+        }
+        patterned.extend_from_slice(&[b';'; 32]);
+        let shapes: [(&str, Vec<u8>); 6] = [
+            ("repetitive", b"abcdefgh".repeat(200)),
+            ("one byte", alloc::vec![0x41u8; 1000]),
+            ("incompressible", incompressible),
+            (
+                "prose",
+                b"the quick brown fox the quick brown fox the quick".repeat(30),
+            ),
+            ("patterned", patterned),
+            ("short", b"tiny".to_vec()),
+        ];
+        for ((name, block), finder) in shapes
+            .iter()
+            .flat_map(|shape| [(shape, "tree"), (shape, "chain")])
+        {
+            let mut matcher = if finder == "tree" {
+                optimal(17, block.len())
+            } else {
+                optimal_chain(17, block.len())
+            };
+            let parse = matcher.parse(block, 0, block.len());
+            let name = &format!("{name} ({finder})");
+            assert_accounts_for(block, &parse);
+            assert_eq!(&replay(&[], &parse), block, "{name}");
+            let mut produced = 0u64;
+            for s in &parse.sequences {
+                produced += u64::from(s.literal_length);
+                assert!(s.match_length >= 3, "{name}: match below the format floor");
+                assert!(s.offset >= 1, "{name}: zero offset");
+                assert!(
+                    u64::from(s.offset) <= produced,
+                    "{name}: reaches before the start"
+                );
+                produced += u64::from(s.match_length);
+            }
+        }
+    }
+
+    /// The table's repeat state per path must agree with the decoder's at every
+    /// committed sequence — checked by replaying the offset *values*, not the
+    /// offsets, through the decoder's own rule.
+    #[test]
+    fn the_optimal_parse_writes_offset_values_the_decoder_resolves_correctly() {
+        let mut block = Vec::new();
+        for i in 0..400u32 {
+            block.extend_from_slice(format!("<row n=\"{}\">{}</row>\n", i % 17, i % 5).as_bytes());
+        }
+        let parse = optimal(17, block.len()).parse(&block, 0, block.len());
+        let mut theirs = REP_INITIAL;
+        let mut repeats_used = 0;
+        for s in &parse.sequences {
+            let resolved = resolve_offset(s.offset_value, s.literal_length == 0, &mut theirs);
+            assert_eq!(
+                resolved,
+                Ok(s.offset),
+                "value {} for offset {}",
+                s.offset_value,
+                s.offset
+            );
+            if s.offset_value <= REP_COUNT as u32 {
+                repeats_used += 1;
+            }
+        }
+        assert!(
+            repeats_used > 0,
+            "structured rows should reach for repeat codes"
+        );
+        assert_eq!(replay(&[], &parse), block);
+    }
+
+    /// **The tree navigates; it is never trusted to measure.**
+    ///
+    /// The claim [`Matcher::tree_update`] rests its safety on, tested the only
+    /// way it can be: by breaking the tree. Every child link is overwritten
+    /// with an arbitrary earlier position — an ordering the tree's invariants
+    /// forbid and libzstd would trust — and every match reported afterwards
+    /// must still be real, byte for byte. A version that reported the length
+    /// the tree *implied* would fail here on its first skipped prefix.
+    #[test]
+    fn a_corrupted_tree_still_reports_only_real_matches() {
+        let mut block = Vec::new();
+        for i in 0..600u32 {
+            block.extend_from_slice(format!("<k{}>{}</k{}>", i % 9, i % 31, i % 9).as_bytes());
+        }
+        let mut matcher = optimal(17, block.len());
+        let half = block.len() / 2;
+        matcher.insert_up_to(&block, half);
+
+        let mut s = 0x2545_F491u32;
+        for slot in 0..matcher.tree.len() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let owner = slot / 2;
+            if owner > 0 && owner < half {
+                // Strictly older than the slot's owner, so the age guard does
+                // not catch it, and arbitrary otherwise.
+                matcher.tree[slot] = (s as usize % owner) as u32;
+            }
+        }
+
+        let limit = block.len() - TAIL;
+        let mut out = Vec::new();
+        let mut reported = 0usize;
+        for pos in half..limit - MIN_MATCH {
+            matcher.insert_up_to(&block, pos);
+            matcher.gather(&block, pos, limit, REP_INITIAL, false, &mut out);
+            for &(length, offset) in &out {
+                let (length, offset) = (length as usize, offset as usize);
+                assert!(offset >= 1 && offset <= pos, "offset {offset} at {pos}");
+                assert!(pos + length <= limit, "past the limit at {pos}");
+                assert_eq!(
+                    block[pos - offset..pos - offset + length],
+                    block[pos..pos + length],
+                    "a {length}-byte match at offset {offset} from {pos} is not real"
+                );
+                reported += 1;
+            }
+        }
+        assert!(
+            reported > 100,
+            "the corrupted tree should still find matches: {reported}"
+        );
+    }
+
+    /// Every position goes into the tree once, in order, unless a skip left it
+    /// out — and a skip never jumps past where the parser will search next.
+    #[test]
+    fn tree_insertion_never_passes_the_search_position() {
+        let block = b"abababababababababababababababab-the-run-ends-here-".repeat(80);
+        let mut matcher = optimal(17, block.len());
+        let mut out = Vec::new();
+        let limit = block.len() - TAIL;
+        let mut pos = 0;
+        while pos + MIN_MATCH <= limit {
+            matcher.insert_up_to(&block, pos);
+            assert_eq!(matcher.indexed, pos, "the cursor overshot {pos}");
+            matcher.gather(&block, pos, limit, REP_INITIAL, false, &mut out);
+            pos += 7;
+        }
+    }
+
+    /// History across blocks, and a window that refuses some of it.
+    #[test]
+    fn the_optimal_parse_reaches_across_blocks_and_honours_the_window() {
+        let half: Vec<u8> = (0..4000u32)
+            .scan(12345u32, |st, _| {
+                *st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                Some((*st >> 24) as u8)
+            })
+            .collect();
+        let mut input = half.clone();
+        input.extend_from_slice(&half);
+
+        let mut matcher = optimal(17, input.len());
+        let first = matcher.parse(&input, 0, half.len());
+        let second = matcher.parse(&input, half.len(), input.len());
+        assert_eq!(replay(&[], &first), half);
+        assert_eq!(replay(&input[..half.len()], &second), half);
+        assert!(
+            second.literals.len() * 8 < first.literals.len(),
+            "a verbatim repeat a block back should cost few literals: {} then {}",
+            first.literals.len(),
+            second.literals.len()
+        );
+
+        // A 1 KiB window cannot see 4000 bytes back, so the copy must not be
+        // found — and nothing may reach past the window to find it anyway.
+        let mut small = optimal(10, input.len());
+        let _ = small.parse(&input, 0, half.len());
+        let second = small.parse(&input, half.len(), input.len());
+        assert_eq!(replay(&input[..half.len()], &second), half);
+        for s in &second.sequences {
+            assert!(
+                s.offset <= 1 << 10,
+                "offset {} past a 1 KiB window",
+                s.offset
+            );
+        }
+    }
+
+    /// The optimal parser must not lose to the lazy one on ordinary structured
+    /// text.
+    ///
+    /// Not a theorem — its prices are estimates, and an estimate can steer it
+    /// wrong — but on content like this a loss means the price model is broken,
+    /// and a broken price model is invisible to every correctness test here:
+    /// the frames still decode. M5 recorded two bugs of exactly that kind, each
+    /// found only because something asserted a size.
+    #[test]
+    fn the_optimal_parse_is_no_larger_than_the_lazy_parse_on_structured_text() {
+        let mut block = Vec::new();
+        for i in 0..2000u32 {
+            block.extend_from_slice(
+                format!(
+                    "  <entry id=\"{i}\" kind=\"{}\">value {}</entry>\n",
+                    i % 7,
+                    (i * 13) % 101
+                )
+                .as_bytes(),
+            );
+        }
+        let size = |level| {
+            let params = crate::encode::EncodeParams {
+                strategy: crate::encode::Strategy::Compress,
+                level,
+                ..Default::default()
+            };
+            crate::encode::compress(&block, &params)
+                .expect("encodable")
+                .len()
+        };
+        let (lazy, optimal) = (size(15), size(19));
+        assert!(
+            optimal <= lazy,
+            "level 19 {optimal} bytes against level 15 {lazy}"
         );
     }
 }

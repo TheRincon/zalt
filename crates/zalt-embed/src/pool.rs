@@ -19,7 +19,42 @@
 //! is shrunk rather than kept. That trades one allocation on its next use for
 //! not holding the peak indefinitely, which is the right way round when idle
 //! time dominates.
+//!
+//! # Why the idle set is sharded, and the decoders boxed
+//!
+//! Both measured with `zalt-bench concurrent` on the small `.zdoc` documents
+//! that are §8's actual workload, against a control of one decoder per thread
+//! that shares nothing (`doc/ZALT-MAC.md` §10):
+//!
+//! | idle set | pooled, 8 threads | cost against the control |
+//! |---|---:|---:|
+//! | one `Mutex<Vec<Decoder>>` | ~946 MB/s | 0.84x |
+//! | sharded per thread | ~1 038 MB/s | 0.92x |
+//! | sharded, decoders boxed | ~1 123 MB/s | **1.00x** |
+//!
+//! The two costs were different in kind, and the measurement only separated
+//! them because the pool was ~7% behind the control **at one thread**, where
+//! there is nothing to contend with.
+//!
+//! - **Contention** grew with thread count. The lock is taken twice per
+//!   resource, and with few-kilobyte resources those acquisitions are
+//!   microseconds apart. Each thread now reaches for a shard of its own first;
+//!   a miss falls through to the others with `try_lock`, so it never blocks.
+//!   `max_idle` stays one exact global cap held in an atomic — a per-shard cap
+//!   would be a memory ceiling that moves with how many threads touched the
+//!   pool.
+//! - **Copying** was flat. A `Decoder` carries its entropy tables inline and is
+//!   about 14 KB, and a checkout moved it by value four to six times; profiled
+//!   side by side, the only difference from the control was 14% more
+//!   `_platform_memmove`. Boxing makes each move a pointer, for one allocation
+//!   per decoder created rather than per resource served.
+//!
+//! An earlier attempt at sharding measured nothing and was reverted, on a
+//! machine with its swap file 94% full; on a quiet one it is reproducible to
+//! about 1%. The table above is from the quiet one.
 
+use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::alloc::SharedSource;
@@ -60,8 +95,39 @@ pub struct DecoderPool {
 struct Inner {
     config: PoolConfig,
     budget: Budget,
-    idle: Mutex<Vec<Decoder>>,
+    /// Idle decoders, split so threads rarely touch the same lock.
+    shards: Vec<Mutex<Vec<Box<Decoder>>>>,
+    /// Total decoders across every shard. Authoritative for admission, so
+    /// `max_idle` means the same thing however the threads land on shards.
+    idle_total: AtomicUsize,
     source: Option<SharedSource>,
+}
+
+/// One shard per core, bounded.
+fn shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+thread_local! {
+    /// This thread's preferred shard, fixed on first use.
+    static PREFERRED_SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Hands out a distinct starting shard to each thread that asks.
+static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+fn preferred_shard(shards: usize) -> usize {
+    PREFERRED_SHARD.with(|cell| {
+        let mut index = cell.get();
+        if index == usize::MAX {
+            index = NEXT_SHARD.fetch_add(1, Ordering::Relaxed);
+            cell.set(index);
+        }
+        index % shards.max(1)
+    })
 }
 
 impl DecoderPool {
@@ -71,7 +137,8 @@ impl DecoderPool {
             inner: Arc::new(Inner {
                 config,
                 budget,
-                idle: Mutex::new(Vec::new()),
+                shards: (0..shard_count()).map(|_| Mutex::new(Vec::new())).collect(),
+                idle_total: AtomicUsize::new(0),
                 source: None,
             }),
         }
@@ -94,7 +161,8 @@ impl DecoderPool {
             inner: Arc::new(Inner {
                 config,
                 budget,
-                idle: Mutex::new(Vec::new()),
+                shards: (0..shard_count()).map(|_| Mutex::new(Vec::new())).collect(),
+                idle_total: AtomicUsize::new(0),
                 source: Some(source),
             }),
         }
@@ -117,7 +185,11 @@ impl DecoderPool {
 
     /// Number of decoders currently idle.
     pub fn idle_count(&self) -> usize {
-        self.inner.idle.lock().map(|g| g.len()).unwrap_or(0)
+        self.inner
+            .shards
+            .iter()
+            .map(|s| s.lock().map(|g| g.len()).unwrap_or(0))
+            .sum()
     }
 
     /// Take a decoder, reusing an idle one when available.
@@ -125,19 +197,19 @@ impl DecoderPool {
     /// Returns `None` when the budget cannot admit another decoder — the signal
     /// to apply backpressure rather than start a decode that will fail.
     pub fn get(&self) -> Option<PooledDecoder> {
-        let reused = self.inner.idle.lock().ok().and_then(|mut idle| idle.pop());
+        let reused = self.take_idle();
 
         let decoder = match reused {
             Some(mut d) => {
                 d.reset();
                 d
             }
-            None => match self.inner.source.clone() {
+            None => Box::new(match self.inner.source.clone() {
                 Some(source) => {
                     Decoder::with_source(self.inner.config.policy, &self.inner.budget, source)?
                 }
                 None => Decoder::budgeted(self.inner.config.policy, &self.inner.budget)?,
-            },
+            }),
         };
 
         Some(PooledDecoder {
@@ -146,7 +218,50 @@ impl DecoderPool {
         })
     }
 
-    fn give_back(&self, mut decoder: Decoder) {
+    /// Take an idle decoder, preferring this thread's own shard. Other shards
+    /// are tried with `try_lock`, so a miss never blocks.
+    fn take_idle(&self) -> Option<Box<Decoder>> {
+        let shards = &self.inner.shards;
+        let start = preferred_shard(shards.len());
+        if let Ok(mut own) = shards[start].lock()
+            && let Some(decoder) = own.pop()
+        {
+            self.inner.idle_total.fetch_sub(1, Ordering::Relaxed);
+            return Some(decoder);
+        }
+        for offset in 1..shards.len() {
+            let index = (start + offset) % shards.len();
+            if let Ok(mut other) = shards[index].try_lock()
+                && let Some(decoder) = other.pop()
+            {
+                self.inner.idle_total.fetch_sub(1, Ordering::Relaxed);
+                return Some(decoder);
+            }
+        }
+        None
+    }
+
+    /// Claim a slot under the global `max_idle` cap.
+    fn claim_idle_slot(&self) -> bool {
+        let max = self.inner.config.max_idle;
+        let mut current = self.inner.idle_total.load(Ordering::Relaxed);
+        loop {
+            if current >= max {
+                return false;
+            }
+            match self.inner.idle_total.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn give_back(&self, mut decoder: Box<Decoder>) {
         // Reset before shrinking, not after. `reset` re-arms the state machine
         // and, when there is a buffer source, refills an empty decoder from it
         // — so shrinking first and resetting second would hand the buffers to
@@ -158,11 +273,18 @@ impl DecoderPool {
             decoder.shrink();
         }
 
-        if let Ok(mut idle) = self.inner.idle.lock() {
-            if idle.len() < self.inner.config.max_idle {
-                idle.push(decoder);
+        if !self.claim_idle_slot() {
+            // Drops here, releasing its lease.
+            return;
+        }
+        let shards = &self.inner.shards;
+        let index = preferred_shard(shards.len());
+        match shards[index].lock() {
+            Ok(mut shard) => shard.push(decoder),
+            // Poisoned: the decoder drops, so the claimed slot goes back.
+            Err(_) => {
+                self.inner.idle_total.fetch_sub(1, Ordering::Relaxed);
             }
-            // Otherwise it drops here, releasing its lease.
         }
     }
 }
@@ -171,7 +293,17 @@ impl DecoderPool {
 #[derive(Debug)]
 pub struct PooledDecoder {
     // `Option` only so `Drop` can move the decoder back into the pool.
-    decoder: Option<Decoder>,
+    //
+    // Boxed, and the reason is measured rather than tidy. A `Decoder` carries
+    // its entropy tables inline and is about 14 KB, and a checkout moves it by
+    // value several times over — out of the shard's `Vec`, into this struct,
+    // out again on drop, into `give_back`, back into the `Vec`. On §8's
+    // workload of few-kilobyte resources that was *more bytes copied than
+    // decoded*: `_platform_memmove` ran 14% higher pooled than with a decoder
+    // per thread, and the pool cost 7–8% at one thread where there is nothing
+    // to contend with. A box makes every one of those moves a pointer, for one
+    // allocation per decoder *created* rather than per resource served.
+    decoder: Option<Box<Decoder>>,
     pool: DecoderPool,
 }
 
@@ -497,5 +629,79 @@ mod tests {
         }
         assert!(p.idle_count() <= p.config().max_idle);
         assert_eq!(p.budget().used(), p.budget().used(), "no accounting drift");
+    }
+
+    /// `max_idle` is one global cap, however the threads land on shards.
+    ///
+    /// The invariant sharding could most easily break: with a per-shard cap, or
+    /// a counter that drifts from what the shards hold, the pool's memory
+    /// ceiling would depend on how many threads happened to use it. Many threads
+    /// each hold several decoders at once and return them together, so returns
+    /// arrive on every shard at the same moment.
+    #[test]
+    fn max_idle_is_exact_across_shards_under_concurrent_returns() {
+        let config = PoolConfig {
+            max_idle: 3,
+            ..Default::default()
+        };
+        let p = DecoderPool::new(config, Budget::new(1 << 30));
+
+        for _ in 0..20 {
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let p = p.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        // Each decodes a frame first, so it holds real buffers
+                        // and a real reservation — an untouched decoder holds
+                        // neither, and the budget check below would pass on a
+                        // leak.
+                        let held: Vec<_> = (0..4)
+                            .map(|_| {
+                                let mut d = p.get().expect("ample");
+                                let mut out = Vec::new();
+                                d.decompress(HELLO_ZST, &mut out).expect("decodes");
+                                d
+                            })
+                            .collect();
+                        barrier.wait();
+                        drop(held);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("no panic");
+            }
+            assert_eq!(
+                p.idle_count(),
+                3,
+                "32 decoders returned at once must leave exactly max_idle parked"
+            );
+        }
+
+        // And the 29 that were not parked released their reservations. The
+        // reference is measured in a *separate* pool, so it cannot be derived
+        // from the number it checks: one decoder, having decoded the same
+        // frame, held and charged.
+        let one = {
+            let reference = DecoderPool::new(config, Budget::new(1 << 30));
+            let mut d = reference.get().expect("ample");
+            let mut out = Vec::new();
+            d.decompress(HELLO_ZST, &mut out).expect("decodes");
+            reference.budget().used()
+        };
+        assert!(one > 0, "a decoder that has decoded holds a reservation");
+        assert_eq!(
+            p.budget().used(),
+            3 * one,
+            "exactly the three parked decoders are charged; a leak would be 32"
+        );
+        drop(p.get());
+        assert_eq!(
+            p.budget().used(),
+            3 * one,
+            "a checkout and return must leave the reservation where it was"
+        );
     }
 }

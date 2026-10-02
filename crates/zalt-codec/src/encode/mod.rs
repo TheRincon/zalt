@@ -49,7 +49,9 @@ mod block;
 mod frame;
 mod fse;
 mod huffman;
+pub mod level;
 mod match_finder;
+mod optimal;
 mod sequences;
 mod split;
 
@@ -80,13 +82,24 @@ pub enum Strategy {
 /// Parameters for one encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeParams {
-    /// Compression level. Carried for the recipe plumbing, and not yet acted
-    /// on: [`Strategy::Stored`] has no decisions a level could tune, and the
-    /// match finder has no knobs to turn until there is more than one of it.
+    /// Compression level, 1 to 19; 0 means the default (3). See [`level`] for
+    /// what each one sets and why levels above 19 are treated as 19.
+    ///
+    /// Ignored by [`Strategy::Stored`], which has no decisions to tune.
     pub level: i32,
     /// Whether to attempt compression at all.
     pub strategy: Strategy,
-    /// `windowLog` to declare in the frame header.
+    /// The largest `windowLog` the frame may declare — a **ceiling**, not a
+    /// request.
+    ///
+    /// The window is decoder memory, so it is the receiver's to bound: this
+    /// says how much history the other end has agreed to hold. The level then
+    /// picks a window within it, and the frame declares no more than the
+    /// content needs — a 10 KB document declares a 16 KB window whatever the
+    /// level, because history that does not exist need not be held.
+    ///
+    /// The default is 23 (8 MiB): RFC 8878's interop floor and §6's untrusted
+    /// decode ceiling, so a default frame is one every browser accepts.
     ///
     /// Must admit the block size: `Block_Maximum_Size` is
     /// `min(128 KiB, windowSize)`, so declaring a window smaller than the
@@ -113,11 +126,13 @@ pub struct EncodeParams {
 impl Default for EncodeParams {
     fn default() -> Self {
         Self {
-            level: 3,
+            level: level::LEVEL_DEFAULT,
             strategy: Strategy::Stored,
-            // 128 KiB, which admits the largest block the format allows and so
-            // never forces a split the content did not ask for.
-            window_log: 17,
+            // 8 MiB, the interop floor every browser decodes. A ceiling: see
+            // the field. It was 17 (128 KiB) before levels existed, which
+            // capped every large input at a window a fifth the size of
+            // `zstd -3`'s and was worth 30% of output size on its own.
+            window_log: 23,
             checksum: false,
             dictionary_id: None,
             block_size: BLOCK_SIZE_DEFAULT,
@@ -157,7 +172,19 @@ impl EncodeParams {
 pub fn compress(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
     params.validate()?;
 
-    let compress = params.strategy == Strategy::Compress;
+    let tuning = (params.strategy == Strategy::Compress).then(|| level::tuning(params.level));
+    let compress = tuning.is_some();
+
+    // The window the frame will actually declare — the smallest of the caller's
+    // ceiling, the level's choice, and what the content can use. Only ever
+    // *smaller* than what validate() accepted, and never smaller than a block
+    // the content can produce, because the content clamp rounds up.
+    let window_log = effective_window_log(params, tuning, input.len());
+    let params = &EncodeParams {
+        window_log,
+        block_size: params.block_size.min(1u32 << window_log.min(31)),
+        ..*params
+    };
     let block_size = params.block_size as usize;
 
     let mut out = Vec::with_capacity(input.len() + MAX_HEADER + 16);
@@ -168,7 +195,7 @@ pub fn compress(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
         &mut out,
         input,
         &split::fixed(input.len(), block_size),
-        compress,
+        tuning,
         params.window_log,
     );
 
@@ -188,7 +215,7 @@ pub fn compress(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
                 &mut alternative,
                 input,
                 &candidate,
-                compress,
+                tuning,
                 params.window_log,
             );
             if alternative.len() < out.len() - header_len {
@@ -202,7 +229,98 @@ pub fn compress(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The `windowLog` a frame declares.
+///
+/// The caller's ceiling, then the level's own window, then the content: a
+/// window larger than the input asks the decoder to reserve history that
+/// cannot exist. That last clamp is also what keeps a high level from costing a
+/// small resource anything — libzstd makes the same choice, and keeps a separate
+/// parameter table for inputs under 16 KB largely to express it.
+///
+/// Stored frames ignore the level and keep the ceiling, clamped to the content
+/// the same way.
+fn effective_window_log(params: &EncodeParams, tuning: Option<level::Tuning>, len: usize) -> u8 {
+    // Smallest `k` with `2^k >= len`, so the content always fits the window.
+    let content_log = (usize::BITS - len.saturating_sub(1).leading_zeros()) as u8;
+    let wanted = tuning.map_or(params.window_log, |t| t.window_log.min(params.window_log));
+    wanted.min(content_log.max(WINDOWLOG_MIN))
+}
+
 /// Compress with the default parameters.
 pub fn compress_default(input: &[u8]) -> Result<Vec<u8>> {
     compress(input, &EncodeParams::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The window a frame declares is decoder memory, so it must respect three
+    /// bounds at once: the caller's ceiling, the level's choice, and the
+    /// content — and never fall below what the content needs to fit.
+    ///
+    /// The ceiling is the browser's promise (§6: 8 MiB untrusted), and a frame
+    /// past it is one every browser refuses, so the claim "no level emits such
+    /// a frame" is checked here across every level, including those that clamp,
+    /// and every size class from empty to a gigabyte.
+    #[test]
+    fn the_declared_window_respects_the_ceiling_the_level_and_the_content() {
+        let base = EncodeParams {
+            strategy: Strategy::Compress,
+            ..Default::default()
+        };
+        let sizes = [
+            0usize,
+            1,
+            1023,
+            1024,
+            1025,
+            16_000,
+            131_072,
+            131_073,
+            1 << 20,
+            9 << 20,
+            1 << 30,
+        ];
+        for level in -3..=25 {
+            let tuning = level::tuning(level);
+            for len in sizes {
+                let params = EncodeParams { level, ..base };
+                let w = effective_window_log(&params, Some(tuning), len);
+                assert!(w <= 23, "level {level}, {len} bytes: windowLog {w}");
+                assert!(
+                    w <= tuning.window_log,
+                    "level {level}: above its own window"
+                );
+                assert!(w >= WINDOWLOG_MIN, "level {level}, {len} bytes: {w}");
+                // Either the content fits, or a ceiling — the level's or the
+                // caller's — is what stopped it.
+                assert!(
+                    (1usize << w) >= len || w == tuning.window_log.min(params.window_log),
+                    "level {level}, {len} bytes: windowLog {w} neither fits nor is capped"
+                );
+                // And no larger than the content needs, past the minimum.
+                if len > (1 << WINDOWLOG_MIN) {
+                    assert!(
+                        (1usize << (w - 1)) < len,
+                        "level {level}, {len} bytes: {w} oversized"
+                    );
+                }
+            }
+        }
+
+        // An explicit ceiling below the level's window wins.
+        let capped = EncodeParams {
+            window_log: 17,
+            level: 19,
+            ..base
+        };
+        assert_eq!(
+            effective_window_log(&capped, Some(level::tuning(19)), 9 << 20),
+            17
+        );
+        // Stored frames have no level, and keep the ceiling clamped to content.
+        assert_eq!(effective_window_log(&base, None, 9 << 20), 23);
+        assert_eq!(effective_window_log(&base, None, 5000), 13);
+    }
 }

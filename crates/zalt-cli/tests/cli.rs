@@ -559,3 +559,236 @@ fn size_suffixes_are_accepted() {
         assert_eq!(code(&out), EXIT_USAGE, "budget {bad:?} should be refused");
     }
 }
+
+// ---------------------------------------------------------------- compress
+
+/// Text with structure at several distances, so every level has real choices.
+fn compressible() -> Vec<u8> {
+    let mut v = Vec::new();
+    for i in 0..1500u32 {
+        v.extend_from_slice(
+            format!(
+                "<row id=\"{i}\" kind=\"{}\">value {}</row>\n",
+                i % 7,
+                (i * 13) % 101
+            )
+            .as_bytes(),
+        );
+    }
+    v
+}
+
+/// The checksum flag, read from the frame header the way a decoder reads it:
+/// bit 2 of the descriptor byte that follows the four-byte magic.
+fn declares_checksum(frame: &[u8]) -> bool {
+    assert_eq!(&frame[..4], &[0x28, 0xB5, 0x2F, 0xFD], "not a zstd frame");
+    frame[4] & 0b100 != 0
+}
+
+#[test]
+fn every_level_round_trips_through_the_cli() {
+    let data = compressible();
+    let mut sizes = Vec::new();
+    for level in 1..=19 {
+        let flag = format!("-{level}");
+        let packed = zalt_stdin(&["c", "-q", &flag], &data);
+        assert_eq!(code(&packed), 0, "level {level}: {}", stderr(&packed));
+        assert!(packed.stderr.is_empty(), "-q must keep stderr quiet");
+        let unpacked = zalt_stdin(&["d", "-q"], &packed.stdout);
+        assert_eq!(code(&unpacked), 0, "level {level}: {}", stderr(&unpacked));
+        assert_eq!(unpacked.stdout, data, "level {level} did not round trip");
+        sizes.push(packed.stdout.len());
+    }
+    // Not a strict ordering — the levels trade differently — but the top
+    // must beat the bottom, or the level never reached the encoder.
+    assert!(
+        sizes[18] < sizes[0],
+        "level 19 ({}) should be smaller than level 1 ({})",
+        sizes[18],
+        sizes[0]
+    );
+}
+
+#[test]
+fn the_long_level_flag_and_the_short_one_agree() {
+    let data = compressible();
+    let short = zalt_stdin(&["c", "-q", "-17"], &data);
+    let long = zalt_stdin(&["compress", "-q", "--level", "17"], &data);
+    assert_eq!(code(&short), 0);
+    assert_eq!(
+        short.stdout, long.stdout,
+        "the same level must give the same bytes"
+    );
+}
+
+#[test]
+fn a_checksum_is_written_by_default_and_can_be_declined() {
+    let data = compressible();
+    let default = zalt_stdin(&["c", "-q"], &data);
+    let declined = zalt_stdin(&["c", "-q", "--no-check"], &data);
+    let explicit = zalt_stdin(&["c", "-q", "--check"], &data);
+    assert!(
+        declares_checksum(&default.stdout),
+        "zstd(1)'s default, and ours"
+    );
+    assert!(!declares_checksum(&declined.stdout));
+    assert!(declares_checksum(&explicit.stdout));
+    assert_eq!(
+        default.stdout.len(),
+        declined.stdout.len() + 4,
+        "four bytes of XXH64"
+    );
+}
+
+#[test]
+fn levels_outside_what_is_implemented_are_refused_not_clamped() {
+    for (args, wanted) in [
+        (&["c", "-0"][..], "1..=19"),
+        (&["c", "-20"][..], "not implemented"),
+        (&["c", "-22"][..], "8 MiB"),
+        (&["c", "--level", "99"][..], "1..=19"),
+        (&["c", "--level", "abc"][..], "not a compression level"),
+        (&["c", "-123"][..], "unknown option"),
+    ] {
+        let out = zalt_stdin(args, b"x");
+        assert_eq!(code(&out), EXIT_USAGE, "{args:?}");
+        assert!(stderr(&out).contains(wanted), "{args:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn a_flag_given_to_the_wrong_direction_is_refused() {
+    for args in [
+        &["c", "--budget", "1M"][..],
+        &["c", "--trusted"][..],
+        &["c", "--recycle"][..],
+        &["c", "--max-decoded", "1M"][..],
+    ] {
+        let out = zalt_stdin(args, b"x");
+        assert_eq!(code(&out), EXIT_USAGE, "{args:?}");
+        assert!(
+            stderr(&out).contains("decoding"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+    for args in [
+        &["d", "-19"][..],
+        &["d", "--stored"][..],
+        &["d", "--no-check"][..],
+    ] {
+        let out = zalt_stdin(args, HELLO_ZST);
+        assert_eq!(code(&out), EXIT_USAGE, "{args:?}");
+        assert!(
+            stderr(&out).contains("compress only"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+    let out = zalt_stdin(&["c", "--stored", "-9"], b"x");
+    assert_eq!(
+        code(&out),
+        EXIT_USAGE,
+        "a level with --stored is a contradiction"
+    );
+}
+
+#[test]
+fn stored_output_is_the_content_plus_headers_and_still_decodes() {
+    let data = compressible();
+    let out = zalt_stdin(&["c", "-q", "--stored", "--no-check"], &data);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(out.stdout.len() > data.len(), "stored does not compress");
+    assert!(out.stdout.len() < data.len() + 32, "only headers on top");
+    let back = zalt_stdin(&["d", "-q"], &out.stdout);
+    assert_eq!(back.stdout, data);
+}
+
+#[test]
+fn several_inputs_become_frames_that_decode_to_their_concatenation() {
+    let dir = std::env::temp_dir().join(format!("zalt-cli-c-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    fs::write(&a, b"first file\n".repeat(50)).unwrap();
+    fs::write(&b, compressible()).unwrap();
+    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+
+    let packed = zalt(&["c", "-q", "-9", a, b]);
+    assert_eq!(code(&packed), 0, "{}", stderr(&packed));
+    let unpacked = zalt_stdin(&["d", "-q"], &packed.stdout);
+    let mut expected = b"first file\n".repeat(50);
+    expected.extend_from_slice(&compressible());
+    assert_eq!(unpacked.stdout, expected);
+
+    let refused = zalt(&["c", "-q", a, b, "-o", dir.join("x.zst").to_str().unwrap()]);
+    assert_eq!(code(&refused), EXIT_USAGE, "one --output, two inputs");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compress_will_not_overwrite_without_force() {
+    let dir = std::env::temp_dir().join(format!("zalt-cli-o-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("out.zst");
+    fs::write(&target, b"precious").unwrap();
+    let t = target.to_str().unwrap();
+
+    let refused = zalt_stdin(&["c", "-q", "-o", t], b"data");
+    assert_eq!(code(&refused), EXIT_INPUT, "{}", stderr(&refused));
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"precious",
+        "must not have been touched"
+    );
+
+    let forced = zalt_stdin(&["c", "-q", "-f", "-o", t], b"data");
+    assert_eq!(code(&forced), 0, "{}", stderr(&forced));
+    let back = zalt(&["d", "-q", t]);
+    assert_eq!(back.stdout, b"data");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The test that matters most for an encoder: the reference reads it.
+/// Skipped, loudly, where `zstd` is not installed.
+#[test]
+fn the_reference_decodes_what_the_cli_compresses() {
+    let Ok(version) = Command::new("zstd").arg("--version").output() else {
+        eprintln!("SKIP: zstd(1) not on PATH");
+        return;
+    };
+    assert!(version.status.success());
+    let data = compressible();
+    for level in ["-1", "-5", "-9", "-16", "-19"] {
+        let packed = zalt_stdin(&["c", "-q", level], &data);
+        assert_eq!(code(&packed), 0);
+        let mut child = Command::new("zstd")
+            .args(["-q", "-d", "-c"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&packed.stdout)
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "zstd refused level {level}");
+        assert_eq!(out.stdout, data, "zstd decoded level {level} wrongly");
+    }
+}
+
+#[test]
+fn the_summary_goes_to_stderr_and_names_the_level() {
+    let out = zalt_stdin(&["c", "-12"], &compressible());
+    assert_eq!(code(&out), 0);
+    let summary = stderr(&out);
+    assert!(summary.contains("level 12"), "{summary}");
+    assert!(summary.contains("checksum"), "{summary}");
+    assert!(
+        declares_checksum(&out.stdout),
+        "stdout is the frame and nothing else"
+    );
+}

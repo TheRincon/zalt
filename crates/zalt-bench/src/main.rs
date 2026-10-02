@@ -78,6 +78,20 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        "encode-levels" => match args.get(2) {
+            Some(dir) => {
+                let levels: Vec<i32> = args
+                    .get(3)
+                    .filter(|a| !a.starts_with("--"))
+                    .map(|list| list.split(',').filter_map(|l| l.parse().ok()).collect())
+                    .unwrap_or_else(|| vec![1, 3, 5, 7, 9, 12, 15, 17, 19]);
+                bench_encode_levels(Path::new(dir), &levels, args.iter().any(|a| a == "--time"))
+            }
+            None => {
+                eprintln!("usage: zalt-bench encode-levels <corpus-dir> [1,3,9,19] [--time]");
+                std::process::exit(2);
+            }
+        },
         "concurrent" => match args.get(2) {
             Some(dir) => bench_concurrent(
                 Path::new(dir),
@@ -1339,6 +1353,149 @@ fn profile_concurrent(dir: &Path, seconds: u64, threads: usize, supply: Supply) 
         "{rounds} rounds, {} bytes decoded",
         rounds * (decoded_bytes * passes) as u64
     );
+}
+
+// ----------------------------------------------------------- encode levels
+
+/// zalt's encoder at one compression level, everything else at its default.
+fn encode_params_at(level: i32) -> zalt_codec::encode::EncodeParams {
+    zalt_codec::encode::EncodeParams {
+        level,
+        ..encode_params()
+    }
+}
+
+/// Every level against the reference's *same* level, over a corpus.
+///
+/// # The comparison is level against level, not against a fixed rival
+///
+/// `encode` compares one zalt configuration to `zstd -3` and `-9`, which was the
+/// right question when zalt had one configuration. With levels, the question a
+/// caller actually has is "if I ask zalt for level N, how does it compare to
+/// asking zstd for level N" — on both axes at once, because a level that matches
+/// the reference's size at a tenth of its speed, or its speed at twice its size,
+/// has not matched the level. So each row is a pair, and `size` and `time` are
+/// both zalt divided by zstd: **below 1.00 is better on that axis.**
+///
+/// Sizes are deterministic and summed exactly. Times are interleaved per level
+/// (zalt and zstd alternate batches), so a disturbance lands on both. Every
+/// frame zalt emits at every level is decoded and compared before anything is
+/// timed — a level that produces a small, fast, wrong frame must not show up as
+/// a good row.
+fn bench_encode_levels(dir: &Path, levels: &[i32], timed: bool) {
+    let files: Vec<(PathBuf, Vec<u8>)> = match collect_files(dir) {
+        Ok(f) if !f.is_empty() => f
+            .into_iter()
+            .filter_map(|p| fs::read(&p).ok().map(|d| (p, d)))
+            .filter(|(_, d)| d.len() >= 64)
+            .collect(),
+        _ => {
+            eprintln!("no readable files under {}", dir.display());
+            std::process::exit(1);
+        }
+    };
+    let total_raw: usize = files.iter().map(|(_, d)| d.len()).sum();
+
+    println!(
+        "encode by level — zalt level N against zstd level N, {} files, {total_raw} bytes",
+        files.len()
+    );
+    println!(
+        "reference: libzstd {} (in process)",
+        zstd::zstd_safe::version_string()
+    );
+    if timed && let Some(state) = MachineState::read() {
+        state.report();
+    }
+    println!();
+    println!("{:-<100}", "");
+    println!(
+        "{:>6} {:>11} {:>11} {:>8} {:>8} {:>11} {:>11} {:>8}",
+        "level", "zalt bytes", "zstd bytes", "ratio", "size", "zalt MB/s", "zstd MB/s", "time"
+    );
+    println!("{:-<100}", "");
+
+    let mut summary = Vec::new();
+    for &level in levels {
+        let params = encode_params_at(level);
+
+        let mut zalt_bytes = 0usize;
+        let mut zstd_bytes = 0usize;
+        for (path, raw) in &files {
+            let frame = match zalt_codec::encode::compress(raw, &params) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("level {level}: {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            };
+            match zalt_codec::decompress(&frame, permissive_limits()) {
+                Ok(out) if &out == raw => {}
+                _ => {
+                    eprintln!(
+                        "level {level}: {} does NOT round trip — refusing to report it",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+            zalt_bytes += frame.len();
+            zstd_bytes += zstd_compress(raw, level).len();
+        }
+
+        let (mut zalt_rate, mut zstd_rate) = (f64::NAN, f64::NAN);
+        if timed {
+            // Sum time over files, then divide: a mean of per-file rates would
+            // weight a 3 KB document like a 4 MB one.
+            let (mut t_zalt, mut t_zstd) = (0f64, 0f64);
+            for (_, raw) in &files {
+                let s = measure_interleaved(
+                    raw.len(),
+                    &mut [
+                        &mut || {
+                            let f = zalt_codec::encode::compress(raw, &params).expect("verified");
+                            std::hint::black_box(&f);
+                        },
+                        &mut || drop(std::hint::black_box(zstd_compress(raw, level))),
+                    ],
+                );
+                t_zalt += raw.len() as f64 / (s[0].best * 1e9);
+                t_zstd += raw.len() as f64 / (s[1].best * 1e9);
+            }
+            zalt_rate = total_raw as f64 / t_zalt / 1e6;
+            zstd_rate = total_raw as f64 / t_zstd / 1e6;
+        }
+
+        let size = zalt_bytes as f64 / zstd_bytes as f64;
+        let time = zstd_rate / zalt_rate;
+        // Untimed runs print dashes, not NaN: a column of NaN reads as a
+        // failure to someone skimming, and it is only an option not taken.
+        let (zr, sr, tm) = if timed {
+            (
+                format!("{zalt_rate:.1}"),
+                format!("{zstd_rate:.1}"),
+                format!("{time:.2}x"),
+            )
+        } else {
+            ("-".into(), "-".into(), "-".into())
+        };
+        println!(
+            "{level:>6} {zalt_bytes:>11} {zstd_bytes:>11} {:>7.3}x {:>7.3}x {zr:>11} {sr:>11} {tm:>8}",
+            total_raw as f64 / zalt_bytes as f64,
+            size,
+        );
+        summary.push(if timed {
+            format!("L{level}:size={size:.3},time={time:.2}")
+        } else {
+            format!("L{level}:size={size:.3}")
+        });
+    }
+    println!("{:-<100}", "");
+    println!();
+    println!("ratio = raw / zalt bytes.  size, time = zalt / zstd at the same level;");
+    println!("below 1.00 is better on that axis. Every zalt frame above was decoded");
+    println!("and compared to its input before it was counted.");
+    println!("SUMMARY levels {}", summary.join(" "));
 }
 
 // ----------------------------------------------------------------- encode
