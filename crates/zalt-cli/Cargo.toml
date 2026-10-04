@@ -15,3 +15,5 @@ path = "src/main.rs"
 [dependencies]
 zalt-codec.workspace = true
 zalt-embed.workspace = true
+# `native-fs`: archiving and extracting real files, with their macOS metadata.
+zalt-archive = { workspace = true, features = ["native-fs"] }

@@ -372,6 +372,8 @@ USAGE
 COMMANDS
     compress, c     encode each input as one frame, to stdout or --output
     decompress, d   decode frames to stdout or --output  (also: zalt -d)
+    archive, a      ZSTA archives: create, list, extract, verify
+                    (see 'zalt archive help')
     info, i         report frame and block structure without decoding
     check           decode and discard; exit non-zero if any input fails
     version         print the version and the selected backend

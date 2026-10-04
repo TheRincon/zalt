@@ -146,7 +146,7 @@ fi
 # A binary crate's root is main.rs, a library's is lib.rs. Check whichever the
 # crate actually has rather than assuming, or the check passes vacuously on a
 # grep error for a file that was never going to exist.
-for crate in zalt-embed zalt-cli zalt-recipe zalt-ztml zalt-recipe-train; do
+for crate in zalt-embed zalt-cli zalt-recipe zalt-ztml zalt-recipe-train zalt-archive; do
     [ -d "crates/${crate}/src" ] || continue
     root=""
     for candidate in lib.rs main.rs; do
@@ -172,6 +172,17 @@ done
 #              inherently an aliasing read-and-write of one buffer.
 #   zalt-ffi   a C ABI cannot exist without it.
 #
+# And one test-only crate, with its argument:
+#
+#   zsta-seekable-probe
+#              the oracle for ZSTA archives. Its whole job is to run libzstd's
+#              *reference* seekable reader and frame inspector over zalt's
+#              archives, and those exist only as C (`contrib/seekable_format`),
+#              reached through `zstd-sys`. A safe re-implementation would not be
+#              the reference, which is the point of an oracle. It ships in
+#              nothing: the check below fails the build if any crate takes it as
+#              anything but a dev-dependency.
+#
 # `forbid(unsafe_code)` already makes this a compile error where it is set; this
 # check exists to catch the crate that quietly drops the attribute, and to cover
 # crates added later before anyone remembers to add it.
@@ -179,12 +190,29 @@ done
 # Adding a third name to this list should be an argument, not an edit.
 for dir in crates/*/src; do
     crate=$(basename "$(dirname "${dir}")")
-    case "${crate}" in zalt-neon | zalt-ffi) continue ;; esac
+    case "${crate}" in zalt-neon | zalt-ffi | zsta-seekable-probe) continue ;; esac
     unsafe_hits=$(grep -rnw 'unsafe' "${dir}" 2>/dev/null | strip_comments || true)
     if [ -n "${unsafe_hits}" ]; then
         echo "SAFETY VIOLATION in ${crate}"
         echo "  Only zalt-neon may contain unsafe. Found:"
         echo "${unsafe_hits}" | sed 's/^/    /'
+        echo
+        fail=1
+    fi
+done
+
+# The probe's exemption above holds only while it stays test-only: it may be a
+# dev-dependency, never a dependency of anything that builds into a product.
+for manifest in crates/*/Cargo.toml; do
+    hits=$(awk '
+        /^\[/ { section = $0 }
+        /zsta-seekable-probe/ && section !~ /dev-dependencies/ && section !~ /^\[package\]/ {
+            print FILENAME ": " section ": " $0
+        }' "${manifest}")
+    if [ -n "${hits}" ]; then
+        echo "SAFETY VIOLATION: zsta-seekable-probe outside dev-dependencies"
+        echo "  It contains unsafe FFI and is exempt only as a test oracle."
+        echo "${hits}" | sed 's/^/    /'
         echo
         fail=1
     fi

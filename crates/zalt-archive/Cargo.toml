@@ -1,0 +1,50 @@
+[package]
+name = "zalt-archive"
+description = "ZSTA: multi-file archives built entirely from standard zstd frames — a valid .tar.zst that is also randomly accessible."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+zalt-codec.workspace = true
+# For the backend chosen at compile time (NEON on aarch64), so archive
+# decoding runs the same kernels every other zalt decode does.
+zalt-embed.workspace = true
+
+# `native-fs`: archiving and extracting real files (the `fs` module), with
+# the metadata §9.3 asks for. Each of these replaces hand-written system-call
+# bindings this crate would otherwise need `unsafe` for.
+[target.'cfg(unix)'.dependencies]
+# Descriptor-relative extraction (§13's `openat`-style creation).
+cap-std = { version = "4", optional = true }
+cap-fs-ext = { version = "4", optional = true }
+# Extended attributes, through the file descriptor. Already in the tree under
+# cap-std. (Not the `xattr` crate: on macOS it truncates every resource fork
+# to 4 KiB — it takes a short read for a whole one; see `fs::get_xattr`.)
+rustix = { version = "1", optional = true, features = ["fs"] }
+# Owner and group names, FIFOs and device nodes, BSD file flags, and the
+# `*at` calls cap-std does not wrap.
+nix = { version = "0.31", optional = true, default-features = false, features = ["fs", "user"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# NFSv4-style ACLs (the macOS model `SCHILY.acl.ace` carries).
+exacl = { version = "0.13", optional = true }
+
+[features]
+native-fs = ["dep:cap-std", "dep:cap-fs-ext", "dep:rustix", "dep:nix", "dep:exacl"]
+
+[dev-dependencies]
+# The oracle: libzstd's reference seekable reader, an independent reading of
+# the Central Index (§7), and zstd(1) and tar, judging every archive the
+# writer produces. Test-only — it links C through zstd-sys.
+zsta-seekable-probe = { path = "../zsta-seekable-probe" }
+
+# To inspect what extraction restored, by readers independent of the ones
+# the crate uses. (`xattr` is fine for the small values the tests check with
+# it; resource forks are read through `..namedfork/rsrc` instead.)
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+exacl = "0.13"
+xattr = "1.6"

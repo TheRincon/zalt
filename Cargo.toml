@@ -10,6 +10,11 @@ members = [
     "crates/zalt-recipe",
     "crates/zalt-ztml",
     "crates/zalt-recipe-train",
+    "crates/zalt-archive",
+    # Test-only: libzstd's reference seekable reader, zstd(1) and tar as the
+    # oracle for every archive zalt-archive writes. Links C through zstd-sys,
+    # which is why it is a crate of its own and never a library dependency.
+    "crates/zsta-seekable-probe",
 ]
 # `fuzz` is its own workspace: fuzz targets build with sanitizers and coverage
 # instrumentation and must not perturb this workspace's lockfile or profiles.
@@ -33,6 +38,7 @@ zalt-neon = { path = "crates/zalt-neon", version = "0.0.1" }
 zalt-embed = { path = "crates/zalt-embed", version = "0.0.1" }
 zalt-recipe = { path = "crates/zalt-recipe", version = "0.0.1" }
 zalt-ztml = { path = "crates/zalt-ztml", version = "0.0.1" }
+zalt-archive = { path = "crates/zalt-archive", version = "0.0.1" }
 
 [profile.release]
 opt-level = 3
@@ -50,6 +56,25 @@ codegen-units = 1
 # but "should" is doing load-bearing work in that sentence, and the boundary is
 # where a wrong assumption stops being our problem and becomes the host's.
 panic = "unwind"
+
+# The codec, lightly optimised even in debug builds.
+#
+# The encoder's top levels price every path through a stretch of input, which
+# unoptimised is some thirty times slower than optimised: the encode
+# differential suite went from about two seconds to fourteen when every level
+# was added to it, and `just t` is meant to be the sub-second inner loop.
+#
+# Only the optimisation level moves. `debug-assertions` and `overflow-checks`
+# are separate keys and stay on — they are why the debug tests exist alongside
+# `test-release`, and every `debug_assert!` in the codec still runs here.
+[profile.dev.package.zalt-codec]
+opt-level = 1
+
+# libzstd under the ZSTA probe: the reference seekable reader is exercised
+# heavily by its tests, so it is not run at -O0. (Moved from the probe's own
+# manifest, since cargo honours profiles only at the workspace root.)
+[profile.dev.package.zstd-sys]
+opt-level = 3
 
 # Benchmarks need unwinding for harness reporting; keep it separate.
 [profile.bench]

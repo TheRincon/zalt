@@ -792,3 +792,226 @@ fn the_summary_goes_to_stderr_and_names_the_level() {
         "stdout is the frame and nothing else"
     );
 }
+
+// ----------------------------------------------------------------- archive
+
+struct TempDir(std::path::PathBuf);
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("zalt-cli-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        Self(p)
+    }
+    fn s(&self, rel: &str) -> String {
+        self.0.join(rel).to_str().unwrap().to_string()
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tree(at: &Path) {
+    fs::create_dir_all(at.join("proj/src")).unwrap();
+    fs::write(at.join("proj/src/a.txt"), compressible()).unwrap();
+    fs::write(
+        at.join("proj/b.bin"),
+        (0..70_000u32)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("src/a.txt", at.join("proj/latest")).unwrap();
+}
+
+#[test]
+fn an_archive_round_trips_through_the_cli() {
+    let t = TempDir::new("arch");
+    tree(&t.0);
+    let archive = t.s("a.tar.zst");
+    let made = Command::new(ZALT)
+        .args(["archive", "create", "-q", "-9", "-o", &archive, "proj"])
+        .current_dir(&t.0)
+        .output()
+        .unwrap();
+    assert_eq!(code(&made), 0, "{}", stderr(&made));
+
+    let listed = zalt(&["archive", "list", &archive]);
+    assert_eq!(code(&listed), 0, "{}", stderr(&listed));
+    assert_eq!(
+        stdout(&listed).lines().collect::<Vec<_>>(),
+        [
+            "proj",
+            "proj/b.bin",
+            "proj/latest",
+            "proj/src",
+            "proj/src/a.txt"
+        ]
+    );
+    assert_eq!(code(&zalt(&["a", "v", "-q", &archive])), 0);
+
+    let out = t.s("out");
+    let x = zalt(&["archive", "extract", "-q", &archive, "-C", &out]);
+    assert_eq!(code(&x), 0, "{}", stderr(&x));
+    assert_eq!(
+        fs::read(t.0.join("out/proj/src/a.txt")).unwrap(),
+        compressible()
+    );
+    assert_eq!(
+        fs::read_link(t.0.join("out/proj/latest")).unwrap(),
+        Path::new("src/a.txt")
+    );
+
+    // A plain zstd stream too: the CLI's own decompress reads it whole, which
+    // it could not before a stream ending in skippable frames was accepted.
+    let stream = zalt(&["d", "-q", &archive]);
+    assert_eq!(code(&stream), 0, "{}", stderr(&stream));
+    assert_eq!(stream.stdout.len() % 512, 0, "a tar stream");
+}
+
+/// macOS metadata through the CLI, inspected by the system's own `xattr(1)`.
+#[cfg(target_os = "macos")]
+#[test]
+fn archive_metadata_and_quarantine_through_the_cli() {
+    let t = TempDir::new("archmeta");
+    tree(&t.0);
+    let xattr = |args: &[&str]| {
+        let out = Command::new("/usr/bin/xattr").args(args).output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        )
+    };
+    let a = t.s("proj/src/a.txt");
+    assert!(xattr(&["-w", "com.zalt.note", "kept", &a]).0);
+
+    let make = |name: &str, extra: &[&str]| {
+        let archive = t.s(name);
+        let made = Command::new(ZALT)
+            .args(["a", "c", "-q", "-o", &archive])
+            .args(extra)
+            .arg("proj")
+            .current_dir(&t.0)
+            .output()
+            .unwrap();
+        assert_eq!(code(&made), 0, "{}", stderr(&made));
+        archive
+    };
+    let with = make("with.tar.zst", &[]);
+    let without = make("without.tar.zst", &["--no-xattrs"]);
+    // The archive is quarantined, as a download would be.
+    assert!(xattr(&["-w", "com.apple.quarantine", "0081;zalt;test", &with]).0);
+
+    let out = t.s("out");
+    let x = zalt(&["a", "x", "-q", &with, "-C", &out]);
+    assert_eq!(code(&x), 0, "{}", stderr(&x));
+    let got = t.s("out/proj/src/a.txt");
+    assert_eq!(xattr(&["-p", "com.zalt.note", &got]), (true, "kept".into()));
+    assert_eq!(
+        xattr(&["-p", "com.apple.quarantine", &got]),
+        (true, "0081;zalt;test".into())
+    );
+
+    let bare = t.s("bare");
+    let x = zalt(&["a", "x", "-q", &without, "-C", &bare]);
+    assert_eq!(code(&x), 0, "{}", stderr(&x));
+    assert!(!xattr(&["-p", "com.zalt.note", &t.s("bare/proj/src/a.txt")]).0);
+}
+
+#[test]
+fn extracting_named_members_takes_them_and_what_is_under_them() {
+    let t = TempDir::new("archsel");
+    tree(&t.0);
+    let archive = t.s("a.tar.zst");
+    let made = Command::new(ZALT)
+        .args(["a", "c", "-q", "-o", &archive, "proj"])
+        .current_dir(&t.0)
+        .output()
+        .unwrap();
+    assert_eq!(code(&made), 0);
+    let out = t.s("out");
+    let x = zalt(&["a", "x", "-q", &archive, "-C", &out, "proj/src"]);
+    assert_eq!(code(&x), 0, "{}", stderr(&x));
+    assert!(t.0.join("out/proj/src/a.txt").exists());
+    assert!(!t.0.join("out/proj/b.bin").exists());
+
+    let missing = zalt(&["a", "x", "-q", &archive, "-C", &out, "proj/nope"]);
+    assert_eq!(code(&missing), EXIT_INPUT);
+    assert!(stderr(&missing).contains("not in the archive"));
+}
+
+#[test]
+fn archive_commands_refuse_what_does_not_apply() {
+    let t = TempDir::new("archref");
+    for (args, code_wanted, wanted) in [
+        (vec!["archive", "create", "proj"], EXIT_USAGE, "-o"),
+        (
+            vec!["archive", "create", "-o", "x"],
+            EXIT_USAGE,
+            "at least one path",
+        ),
+        (
+            vec!["archive", "list", "-9", "x"],
+            EXIT_USAGE,
+            "does not apply",
+        ),
+        (
+            vec!["archive", "extract", "x", "--threads", "2"],
+            EXIT_USAGE,
+            "does not apply",
+        ),
+        (
+            vec!["archive", "create", "-0", "-o", "x", "p"],
+            EXIT_USAGE,
+            "1..=19",
+        ),
+        (
+            vec!["archive", "frobnicate"],
+            EXIT_USAGE,
+            "unknown archive command",
+        ),
+        (
+            vec!["archive", "list", "/nonexistent/x.tar.zst"],
+            EXIT_INPUT,
+            "nonexistent",
+        ),
+    ] {
+        let out = Command::new(ZALT)
+            .args(&args)
+            .current_dir(&t.0)
+            .output()
+            .unwrap();
+        assert_eq!(code(&out), code_wanted, "{args:?}: {}", stderr(&out));
+        assert!(stderr(&out).contains(wanted), "{args:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn a_plain_zstd_file_is_not_mistaken_for_an_archive() {
+    let t = TempDir::new("archnot");
+    let plain = t.s("plain.zst");
+    fs::write(&plain, HELLO_ZST).unwrap();
+    let out = zalt(&["archive", "list", &plain]);
+    assert_eq!(code(&out), EXIT_INPUT);
+    assert!(
+        stderr(&out).contains("not a valid ZSTA archive"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn create_will_not_overwrite_an_archive_without_force() {
+    let t = TempDir::new("archforce");
+    tree(&t.0);
+    fs::write(t.0.join("a.tar.zst"), b"precious").unwrap();
+    let out = Command::new(ZALT)
+        .args(["a", "c", "-q", "-o", "a.tar.zst", "proj"])
+        .current_dir(&t.0)
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), EXIT_INPUT);
+    assert_eq!(fs::read(t.0.join("a.tar.zst")).unwrap(), b"precious");
+}

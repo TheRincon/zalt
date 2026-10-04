@@ -197,6 +197,14 @@ impl Decoder {
         self.inner.decoded_len()
     }
 
+    /// Whether the decoder sits between frames with nothing buffered: the
+    /// state in which the end of the input is a clean end of stream. See
+    /// [`zalt_codec::Decoder::is_between_frames`] for why the last status is not
+    /// enough to tell.
+    pub fn is_between_frames(&self) -> bool {
+        self.inner.is_between_frames()
+    }
+
     /// Return to the initial state, keeping allocations and the lease.
     ///
     /// Reuse is the intended pattern: a pooled decoder should not re-allocate
@@ -287,6 +295,16 @@ pub fn decompress(input: &[u8], policy: Policy) -> Result<Vec<u8>> {
         match progress.status {
             Status::FrameComplete if cursor >= input.len() => return Ok(out),
             Status::FrameComplete => continue,
+            // A stream that ended on a skippable frame — see
+            // `zalt_codec::Decoder::is_between_frames`.
+            Status::NeedMoreInput
+                if progress.consumed == 0
+                    && cursor == input.len()
+                    && cursor > 0
+                    && decoder.is_between_frames() =>
+            {
+                return Ok(out);
+            }
             Status::NeedMoreInput if progress.consumed == 0 => {
                 return Err(Error::Codec(zalt_codec::Error::Truncated));
             }

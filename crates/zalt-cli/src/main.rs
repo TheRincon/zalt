@@ -34,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+mod archive;
 mod args;
 mod inspect;
 
@@ -50,6 +51,25 @@ use args::{Args, Command, USAGE, human};
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // `zalt archive …` has its own arguments; see `archive.rs` for why it is a
+    // separate parser rather than more flags on this one.
+    if let Some((first, rest)) = argv.split_first()
+        && matches!(first.as_str(), "archive" | "a")
+    {
+        return match archive::run(rest) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(archive::Outcome::Usage(archive::Usage(msg))) => {
+                eprintln!("zalt archive: {msg}");
+                eprintln!("try 'zalt archive help'");
+                ExitCode::from(2)
+            }
+            Err(archive::Outcome::Failed(archive::Failed(msg))) => {
+                eprintln!("zalt archive: {msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let args = match Args::parse(&argv) {
         Ok(a) => a,
@@ -304,7 +324,6 @@ impl<'a> Session<'a> {
         // two reads lives here until the rest of it arrives.
         let mut carry: Vec<u8> = Vec::new();
         let mut decoded: Vec<u8> = Vec::new();
-        let mut ended_cleanly = false;
 
         loop {
             let n = input.read(&mut chunk)?;
@@ -331,12 +350,8 @@ impl<'a> Session<'a> {
                 }
                 stats.peak_footprint = stats.peak_footprint.max(decoder.footprint());
 
-                match progress.status {
-                    Status::FrameComplete => {
-                        stats.frames += 1;
-                        ended_cleanly = true;
-                    }
-                    Status::NeedMoreInput => ended_cleanly = false,
+                if progress.status == Status::FrameComplete {
+                    stats.frames += 1;
                 }
 
                 // No forward progress means the decoder is waiting on bytes that
@@ -348,7 +363,12 @@ impl<'a> Session<'a> {
             carry.drain(..cursor);
         }
 
-        if !carry.is_empty() || (!ended_cleanly && stats.read > 0) {
+        // The decoder's own state decides, not the last status it returned: a
+        // stream that ends on a skippable frame — every ZSTA archive does, and
+        // so does anything carrying a seekable-format seek table — finishes
+        // with `NeedMoreInput`, and is complete. Judging by the last status
+        // reported those as truncated.
+        if !carry.is_empty() || (stats.read > 0 && !decoder.is_between_frames()) {
             return Err(failed("truncated input: the last frame does not end"));
         }
         Ok(stats)

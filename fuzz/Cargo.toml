@@ -18,6 +18,9 @@ zalt-codec = { path = "../crates/zalt-codec" }
 zalt-neon = { path = "../crates/zalt-neon" }
 # The dcz header is untrusted wire input; its parser is fuzzed like any other.
 zalt-recipe = { path = "../crates/zalt-recipe", default-features = false, features = ["parse"] }
+# ZSTA archives: the trailer, the Central Index and VarInt are untrusted input
+# (spec §13, §14.3).
+zalt-archive = { path = "../crates/zalt-archive" }
 
 # The oracle. A C dependency, which is acceptable in a dev-only crate and would
 # not be anywhere else — the layering forbids it below L3. `zstd-sys` here
@@ -81,6 +84,34 @@ bench = false
 [[bin]]
 name = "encode_decode"
 path = "fuzz_targets/encode_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_open"
+path = "fuzz_targets/archive_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_index"
+path = "fuzz_targets/archive_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_varint"
+path = "fuzz_targets/archive_varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_meta"
+path = "fuzz_targets/archive_meta.rs"
 test = false
 doc = false
 bench = false

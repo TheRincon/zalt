@@ -125,6 +125,8 @@ zalt/
     ├── zalt-recipe/            # L3 mechanism. Generic. Manifest + dict loading.
     ├── zalt-recipe-train/      # L3 dev tool. Dictionary training, param search.
     ├── zalt-ztml/              # L3 instance. Mostly DATA. Depends on nothing above.
+    ├── zalt-archive/           # ZSTA archives: a .tar.zst that is also random-access
+    ├── zsta-seekable-probe/    # test-only oracle: libzstd's seekable reader, zstd(1), tar
     ├── zalt-ffi/               # C API, hand-written header + ABI drift check
     ├── zalt-cli/               # zalt(1): decompress, info, check
     ├── zalt-fuzz/              # cargo-fuzz targets
@@ -1205,6 +1207,21 @@ one actually wants open beside RFC 8878.
 Zero dependencies, so the argument parser is hand-written. A CLI with four flags
 does not need a derive macro and a dependency tree.
 
+**`compress` came with M5's levels.** `zalt c -19 file -o file.zst`, zstd's own
+spelling of a level because muscle memory is a real interface, as the parser
+argues for `-d`. Three choices differ from the library on purpose. **A content
+checksum is written by default**, as `zstd(1)` writes one: a file at rest is
+where corruption goes unnoticed, while the library's default serves a wire that
+has its own integrity. **A level the build does not implement is refused**, not
+clamped as the library clamps it: someone typing `-22` expects libzstd's 22,
+with its 128 MiB window, and would otherwise get level 19 with no sign of the
+substitution. **Compressed bytes are not written to a terminal**, as `zstd(1)`
+refuses too. `--max-window-log` means the same ceiling in both directions, and
+a decode-only flag given to `compress` (or the reverse) is an error rather than
+silently ignored. Each input is read whole — the encoder is one-shot — and
+several inputs to stdout become frames back to back, which every conformant
+decoder reads as their concatenation.
+
 **Known gap.** The C ABI exposes `zalt_decoder_footprint` but no `Budget`,
 `DecoderPool` or `BufferSource` — a C host can *observe* what a decoder holds
 and account for it, but cannot hand zalt a ceiling or an arena. That matches the
@@ -1212,6 +1229,80 @@ boundary's stated philosophy for threading ("the host already has a model and
 does not need ours"), and it is defensible for footprint too. It is recorded
 here rather than assumed, because a Mac app embedding this in-process is exactly
 the host the allocator seam was built for, and it currently cannot reach it.
+
+#### The threading model, decided — and the pool measured under it
+
+§11's open question four asked *"one decoder per response, or a shared pool?"*
+on GRAZER's behalf. Since zalt and GRAZER have one author, it is now decided:
+**multithreaded, both shapes supported.** zalt still starts no threads — the
+host owns the threading model — but every type a host would move or share is
+asserted `Send`, and the pool and budget `Sync`, in
+`crates/zalt-embed/tests/thread_safety.rs`. All of it held *incidentally*
+before, with no `unsafe impl` anywhere, which is another word for undefended.
+
+**A single frame cannot be decoded in parallel, and that is the format's
+decision, not ours.** Matches reach back across block boundaries, so block N
+needs block N−1; libzstd has no multithreaded decoder for one frame either. The
+parallelism available is *across* resources, which is exactly §8's push model.
+
+`zalt-bench concurrent` measures it, running the same work two ways — through
+the shared pool, and with one decoder per thread sharing nothing — so the gap
+between them at a given thread count is the cost of sharing and nothing else.
+Every thread count and both shapes alternate inside one loop.
+
+**It needs a quiet machine in a way no other measurement here does.**
+Interleaving rescues a comparison between two implementations, because a
+disturbance lands on both and cancels. It cannot rescue a comparison between
+thread counts: with no idle cores, an added thread has nowhere to run and the
+row measures the scheduler. The first attempts produced 113% and 119%
+"efficiency" — arithmetically impossible — with the swap file 94% full, so the
+harness now **voids its own run** when any row is superlinear, rather than
+printing an impossible number beside plausible ones. §9's rule about a guard
+that skips a check on absent data applies to benchmarks too.
+
+On a quiet machine (fresh boot, language servers suspended), the small `.zdoc`
+documents:
+
+| idle set | pooled, 1 thread | pooled, 8 threads | against one decoder per thread |
+|---|---:|---:|---:|
+| one `Mutex<Vec<Decoder>>` | ~158 MB/s | ~946 MB/s | 0.84x at 8 threads |
+| sharded per thread | ~159 MB/s | ~1 038 MB/s | 0.92x |
+| sharded, decoders boxed | **~170 MB/s** | **~1 123 MB/s** | **1.00x** |
+
+**+19% at eight threads, and the pool now costs nothing.** What made the
+measurement useful was that the pool trailed the control by ~7% **at one
+thread**, where nothing contends. That split the cost into two parts of
+different kinds:
+
+- **Contention**, which grew with thread count. Each thread now has a shard it
+  reaches for first; a miss falls through to the others with `try_lock` and
+  never blocks. `max_idle` stays one exact global cap in an atomic, because a
+  per-shard cap would be a memory ceiling that moves with how many threads
+  touched the pool. A test returns 32 decoders from eight threads at once and
+  requires exactly `max_idle` parked and exactly that many reservations
+  charged; it was checked against a mutant that drops the cap (32 parked).
+- **Copying**, which was flat. Profiled side by side, the pooled and unpooled
+  runs differed in one line: 14% more `_platform_memmove`. A `Decoder` carries
+  its entropy tables inline and is **13 944 bytes**, and a checkout moved it by
+  value four to six times — on few-kilobyte resources, more bytes copied than
+  decoded. Boxing makes each move a pointer, for one allocation per decoder
+  created rather than per resource served.
+
+**The first guess about the one-thread cost was wrong**, and worth recording
+because it was plausible. The pool shrinks a returning decoder above 256 KiB,
+and the corpus holds one 219 KB document, so the suspicion was a reallocation
+on every reuse. Removing that document made the cost *worse* (0.92x, and 0.82x
+at eight threads) — the overhead was per checkout, so it weighed more on
+smaller resources. One control falsified it; the profile then found the copy.
+
+**Two smaller results.** The control itself scales to 3.9x on four threads
+(98%) and 6.7x on eight (84%) on this 4P+4E machine. An earlier reading of
+5.42x at eight threads looked like an exact match for the efficiency-core
+split, and was not: it came from the noisy machine, and the quiet one gives
+6.68x. And a first attempt at sharding was **reverted** for measuring nothing —
+on the 94%-full swap file. On the quiet machine the same change reproduces to
+about 1%. Neither result was wrong as a statement about its measurement; the
+measurement was wrong about the machine.
 
 ### M3 — Apple Silicon — in progress
 - [x] `zalt-neon`: wildcopy, `vqtbl1q_u8` small-offset overlap (M0).
@@ -2196,6 +2287,11 @@ decoder that allocates nothing per frame, because that is the deployed shape.
 allocation harder than any of this shows. That is an argument for measuring the
 pool under concurrency, not for a Darwin VM layer.
 
+> **Measured since.** The pool under concurrency cost 16% at eight threads on
+> small documents, from lock contention and from copying a 14 KB decoder by
+> value — both portable fixes, and neither an OS cost. See M2's threading notes.
+> The `zalt-darwin` verdict stands.
+
 *(A false start worth recording: the first attempt attributed 35% to the OS,
 because the symbol filter matched "kernel" and `zalt::kernels` is the
 accelerated copy module. The figure was nonsense and looked entirely
@@ -3046,6 +3142,13 @@ something saying so.
       *detector*, after the measurement below contradicted the premise. Worth
       1.6% on separable content and exactly nothing, at no cost, on everything
       else.
+- [x] **Compression levels 1–19**, after the correctness and throughput work
+      above, as this list asked. Level 19 lands within **0.2%** of `zstd -19`
+      on the ZTML documents and **0.3%** on large input, from 1.7% and 64%, at
+      1.1x its time on large input once a binary-tree finder replaced the
+      chain for 16–19. The M5 configuration survives as an exact fixed point.
+      Levels 20–22 deferred deliberately — see below. `zalt compress` exposes
+      them at the shell.
 - [ ] Ratio work only after correctness.
 
 #### The stored encoder, and three decoders
@@ -3563,6 +3666,8 @@ because nothing else in §10 would catch them:
 
 - **`zstd -3` beats zalt on ratio on large, varied input.** On 4 MB of mixed
   source text zalt produces 662 766 bytes against `-3`'s 510 872 — 30% larger.
+  *(Fixed by the compression levels below, and the cause was one parameter:
+  the window was 128 KiB at every size.)*
   M5's "better than `zstd -3` on every file measured" is true of the files it
   measured, all of which are documents under 220 KB. The claim should not be
   carried past that corpus.
@@ -3579,7 +3684,9 @@ because nothing else in §10 would catch them:
 libzstd through its CLI. `just interop` runs the actual `zstd` executable over
 files on disk, in four directions — zalt to zstd, zalt to `ruzstd`, zstd to
 zalt at four levels, and zalt to zalt — across both strategies, with and
-without a checksum, including an empty file and a single byte. 112 checks.
+without a checksum, including an empty file and a single byte. 112 checks —
+322 since the compression levels, which added one level from each way of
+parsing (1, 5, 9, 16, 19) to the encoding side.
 
 Two decoders and not one, for the reason §9 gives for `ruzstd` on the decode
 side: libzstd is the reference and its refusal is our bug, but a *shared*
@@ -3587,6 +3694,289 @@ misreading between our encoder and our decoder would be invisible to a round
 trip, and `ruzstd` shares code with neither. The in-process tests assert the
 same properties; the script is what an ecosystem would actually do with our
 bytes, and if the two ever disagree the disagreement is the finding.
+
+#### Compression levels, 1 to 19
+
+Until here `EncodeParams::level` was carried for the recipe plumbing and
+ignored: one configuration — depth-32 hash chains, one lazy step, a 128 KiB
+window — served every request. The ZTML recipe has declared `level = 9` since
+M4 and received that configuration regardless.
+
+**The level-against-level baseline**, from the new `zalt-bench encode-levels`,
+which compares zalt at level *N* to libzstd at level *N* on size and on time,
+both as zalt divided by zstd, so that below 1.00 is better:
+
+| corpus | zalt (every level) | `zstd -1` | `-3` | `-9` | `-19` | zalt against `-19` |
+|---|---:|---:|---:|---:|---:|---:|
+| ZTML documents (6, 44 KB) | 17 261 | 18 239 | 17 895 | 17 153 | 16 970 | 1.017x |
+| large (3 files, 4.5 MB) | 699 679 | 776 929 | 555 978 | 474 129 | 426 296 | **1.641x** |
+
+On §8's workload there was almost nothing to win — libzstd's *entire* range
+spans 7% on these documents, and zalt already sat inside it. On large input
+zalt was 64% behind `-19` and 26% behind `-3`.
+
+**One parameter was most of that.** Before designing anything, the window alone
+was varied on the large set: 17 → 699 679 bytes, 19 → 623 978, **21 → 487 672**,
+and no further gain at 22 or 23. A 128 KiB window on multi-megabyte input was
+30% of the output, and is the whole cause of the "`zstd -3` beats zalt on large
+input" finding above.
+
+##### The table, and what a window now means
+
+`encode/level.rs` maps each level to a window, a hash size, a search depth and a
+way of choosing: **greedy** (1–3), **one-step lazy** (4–6, the M5 behaviour),
+**two-step lazy** (7–15) and **optimal parsing** (16–19). The *shape* follows
+libzstd's `clevels.h`, read from the vendored 1.5.7 source rather than recalled.
+The *values* were set by measurement against libzstd at the same level, because
+zalt has one hash-chain finder where libzstd has six strategies, and the same
+numbers do not mean the same work.
+
+**`window_log` became a ceiling**, and its default moved from 17 to **23**.
+The window is decoder memory, so it is the receiver's to bound: the parameter
+now says how much history the other end has agreed to hold, the level picks a
+window within it, and the frame declares no more than the content needs — a
+10 KB document declares a 16 KB window at any level. 23 (8 MiB) is RFC 8878's
+interop floor and §6's untrusted-decode ceiling, so a default frame is one
+every browser accepts. The ZTML recipe's `window_log = 17` now caps it at
+128 KiB, which its documents never approach. A test checks every level, from
+−3 to 25, against every size class from empty to a gigabyte, for all three
+bounds at once.
+
+**Levels 20–22 are deferred, and the reason is §6.** libzstd's 20, 21 and 22
+differ from 19 chiefly by declaring 32, 64 and 128 MiB windows — frames every
+browser must refuse, from a codec whose first consumer is a browser. For now a
+level above 19 is treated as 19, as libzstd treats a level above its own
+maximum. When they are built, the natural form is the one libzstd's CLI
+already uses: an explicit opt-in past the ceiling, not a level number alone.
+
+**The M5 configuration is kept as a fixed point.** `Matcher::new` still builds
+it, for the tests, and with a level temporarily pointed at the same knobs the
+whole pipeline — window clamp included — reproduces the M5 table to the byte:
+2 920, 10 188, 25 172, 11 741. The refactor changed nothing it was not asked to.
+
+Levels 1–15, against libzstd's same level:
+
+| level | parse | ZTML documents, size | large input, size |
+|---:|---|---:|---:|
+| 1 | greedy | **0.975x** | **0.972x** |
+| 3 | greedy | **0.979x** | **0.960x** |
+| 5 | lazy | 1.002x | **0.992x** |
+| 9 | lazy ×2 | 1.005x | 1.013x |
+| 12 | lazy ×2 | 1.009x | 1.017x |
+| 15 | lazy ×2 | 1.013x | 1.029x |
+
+**Speed is the honest half of the table.** Levels 9–15 *outrun* libzstd on the
+ZTML documents (0.25x–0.76x its time) and level 15 is at parity on large input.
+But **levels 1–3 are 4–6x slower than `zstd -1` to `-3`**: zalt runs at about
+45 MB/s on small documents whatever the search depth, so the cost is per
+position and per frame, not in the search. libzstd's `fast` and `dfast`
+strategies skip work zalt's single finder always does — inserting every
+position, building entropy tables per block — and closing that is its own
+project, not a table entry.
+
+**What changed for a caller who sets nothing.** The default is level 3, as in
+libzstd, and level 3 is now greedy where every call used to get the M5
+configuration. Alternating the two binaries, each against `zstd -3` in the same
+run:
+
+| default, level 3 | ZTML documents | large input |
+|---|---|---|
+| size | 17 511 against 17 261 — **1.4% larger** | 533 907 against 699 679 — **24% smaller** |
+| time against `zstd -3` | 4.4x against 5.2x — **about 15% faster** | 5.3x against 10.7x — **twice as fast** |
+
+So the default gives up 1.4% on small documents for speed and wins outright on
+large ones. The ZTML recipe is unaffected in the direction that matters: it asks
+for level 9, which now comes out *smaller* than the old configuration did
+(17 240), so the browser's own frames improve.
+
+##### Optimal parsing, for 16 to 19
+
+The lazy parse takes the longest match it can find, a byte or two of lookahead
+aside. An optimal parser instead prices *every* way of covering a stretch of
+input — each literal, each length of each candidate match — and keeps the
+cheapest path. What it can do and the lazy parse cannot is give up a long match
+for a shorter one that leaves the input better placed: a repeat offset two
+bytes on, a literal now so that the next match is cheap.
+
+`encode/optimal.rs` is the price model; `Matcher::parse_optimal` is the search.
+Both follow libzstd's `btopt` closely in shape: a forward table of the cheapest
+known cost to reach each position, filled from every match found along the way
+until the paths converge, the 4 096-position table fills, or a match is long
+enough to take outright; then a walk back along the cheapest path, which is
+committed. Two departures are deliberate:
+
+- **First on hash chains, then a tree.** libzstd's top levels find matches
+  with a binary tree that yields every useful length without walking hundreds
+  of candidates. The first version walked zalt's existing chain instead,
+  keeping each candidate longer than the last — a finder with two milestones
+  of tests behind it — and the ablation below found exactly that to be where
+  it was slow. The tree came next, and is its own subsection.
+- **Prices are allowed to be wrong.** Each table entry carries its own copy of
+  the decoder's repeat-offset state, so a repeat match is priced by the path
+  that reaches it — two paths to one position can disagree about which offsets
+  are cheap, and should. But nothing the parser assumes is *written*. Every
+  committed match still goes through `choose_offset_value`, which asks the
+  decoder's `resolve_offset`, and through the same sequence writer every level
+  shares. A price that is wrong costs bytes. It cannot cost correctness, and
+  that property is what made a new parser safe to build in one sitting.
+
+The price model is transcribed from libzstd's `zstd_opt.c`, and the reason
+differs from the decoder's: these are heuristics nothing reads back, so a
+mature encoder's converged values are a better starting point than new ones.
+It is fixed point, because `core` has no logarithm — `log2` as highest set bit
+plus a linear fraction, exact at powers of two and within a tenth of a bit
+between.
+
+**The lookup tables are derived, not transcribed.** The parser needs a
+literals-length and match-length *code* in constant time, hundreds of times per
+byte. The small tables are computed at build time by a `const fn` searching the
+decoder's own baselines — M5's rule for this module's neighbour — and longer
+lengths use libzstd's highest-bit shortcut, which a test then checks against
+the decoder's tables **at every legal length**. That test failed on its first
+run, at exactly one value: a literals length of 131 072, where the shortcut
+computed code 36 — a code that does not exist, and an index past the end of the
+price table. 131 071 is the longest literals length the format can express, so
+no real sequence reaches it; the clamp is there anyway, because the parser
+prices long literal runs one byte at a time and a panic there would be
+reachable from content.
+
+Results of the first version, on hash chains, against libzstd's same level:
+
+| level | ZTML documents, size | time | large input, size | time |
+|---:|---:|---:|---:|---:|
+| 16 | 1.005x | **0.67x** | 1.032x | 1.31x |
+| 17 | 1.005x | **0.68x** | 1.030x | 1.50x |
+| 18 | 1.003x | 1.45x | 1.025x | 1.87x |
+| 19 | **1.002x** | 1.69x | 1.012x | 3.80x |
+
+Level 19 within 0.2% of `zstd -19` on the ZTML documents and 1.2% on large
+input, from 1.7% and 64% — but at nearly four times libzstd's time on large
+input. On `showcase.zdoc` alone it is 2 882 bytes against `zstd -19`'s 2 885.
+
+##### What level 19's settings were chosen from
+
+| level 19 variant | ZTML documents | large input | time against `-19`, large |
+|---|---:|---:|---:|
+| depth 128 | 17 008 | 434 038 | 2.4x |
+| **depth 256 (chosen)** | 17 010 | 431 361 | 3.8x |
+| depth 512 | 17 009 | 429 613 | 5.7x |
+| one pass instead of two | +0.15% | +0.03% | about half |
+| target length 999 | 0 | −0.08% | — |
+| 3-byte matches at repeat offsets | +2 bytes | −21 bytes | — |
+
+- **Search depth is the lever, and a hash chain makes it expensive.** Past 256,
+  each further 0.4% costs twice the time. A binary-tree finder is the way to
+  have both — built next, below.
+- **The scout pass buys little.** libzstd's `btultra2` parses the first block
+  once purely to learn its statistics; here that is worth 0.15% on small
+  documents for roughly double the time. Kept at 19, the level that promises
+  maximum effort, and removed from 18.
+- **Three-byte matches were tried and dropped.** libzstd's top levels accept
+  them; the version that costs nothing to search for — at repeat offsets,
+  which need no hash — moved sizes by noise in both directions. Code that buys
+  nothing does not stay.
+
+##### The binary tree, for 16 to 19
+
+libzstd's `bt` finders, in shape (`ZSTD_insertBtAndGetAllMatches`). Each hash
+bucket is a binary search tree of earlier positions, ordered by the bytes that
+follow them, newest at the root. Inserting a position *is* searching from it: one
+descent compares it against a node at a time, hangs each node above or below it,
+and steps toward where it belongs — and since the tree is ordered, the nodes it
+passes are the ones nearest it in sort order, which is to say the longest
+matches. Because searching inserts, a tree serves only the optimal parser; the
+lazy parse searches positions it may not then insert, which a tree cannot do.
+
+The results moved the top of the table onto it — level 16 to 19, against
+libzstd's same level:
+
+| level | ZTML documents, size | time | large input, size | time |
+|---:|---:|---:|---:|---:|
+| 16 | 1.004x | 0.77x | **0.990x** | 1.53x |
+| 17 | 1.004x | 0.72x | **0.997x** | 1.38x |
+| 18 | 1.004x | 0.74x | 1.001x | 1.23x |
+| 19 | **1.002x** | 1.44x | **1.003x** | **1.13x** |
+
+**Level 19 went from 3.8x libzstd's time to 1.1x, and from 1.012x its size to
+1.003x.** Levels 16 and 17 come out *smaller* than libzstd's on large input.
+
+**Departure from libzstd, on purpose: the tree navigates, it never measures.** A
+node's place implies it shares at least `min(common_below, common_above)` bytes
+with the position being inserted, and libzstd skips comparing those. So does
+zalt — to steer. But a match is *reported* only after a full comparison from
+its first byte. A tree made inconsistent by something unforeseen (a slot reused
+after the window wraps, an ordering decided under a different limit) would
+otherwise report a length the bytes do not support, and the frame would decode
+wrong with nothing to say so. Reports happen only on an improvement, a handful
+per search, so the check is cheap. It is tested the only way it can be: a test
+overwrites every child link with an arbitrary older position — an ordering the
+invariants forbid and libzstd would trust — and requires every match reported
+afterwards to be real, byte for byte. Without the verification, that test
+fails.
+
+**Depth hardly matters to a tree** — 32 to 256 compares measured within 0.05%,
+because a descent reaches a leaf long before the budget. **What mattered was how
+far it compares** before giving up on ordering two positions. Two that agree all
+the way to the limit cannot be ordered, so the tree forgets one of them and
+everything below it. At 4 KiB, libzstd's `ZSTD_OPT_NUM`, level 19 was 432 266
+bytes on large input; at 64 KiB, **429 181** — text with long duplicated
+stretches had been making the tree forget constantly.
+
+A longer compare reopens what the limit guarded against: inserting a long
+duplicated region costs the square of its length. libzstd's answer, adopted with
+its numbers, is to **skip inserting** positions deep inside a long or
+self-overlapping match (`ZSTD_insertBt1`'s return value: up to 192 after a match
+past 384 bytes, or to the end of a run whose period is shorter than itself).
+That *also* improved the ratio — 429 181 to **427 735** — presumably because
+positions deep inside a long match had been crowding the trees with sources
+nothing would choose. One thing zalt adds: a skip is clamped so it can never
+pass the position the parser will search next. In a tree, searching inserts, so
+a skip past that position would insert it *after* newer ones — at a root, in a
+tree that must be ordered by age. A test checks the cursor never overshoots.
+
+The quadratic case, checked directly: 2 MB of one 100 KB chunk repeated, a 1 MB
+zero run, 2 MB of a 1 000-byte period and ten verbatim copies of RFC 8878 encode
+at level 19 at 19.7 MB/s, within 0.2% of `zstd -19`'s size.
+
+The chain–optimal pairing is no longer in the table and is still tested, every
+shape through both finders: it is the simpler of the two, and the one a tree bug
+would be bisected against.
+
+##### Why this is safe
+
+- **Every level through three decoders.** `tests/encode.rs`'s differential
+  matrix gained every level from 1 to 19, plus level 19 under a 1 KiB window
+  with small blocks and with a checksum, and an input built for the match
+  finder — structured text past a block boundary, with matches at every
+  distance — since every other input there is a header boundary, a run or
+  noise, none of which gives an optimal parser a real choice to get wrong.
+  libzstd, `ruzstd` and zalt read every frame.
+- **The parser alone.** Unit tests replay its sequences over every shape the
+  lazy parse is tested on, resolve every offset *value* it wrote through the
+  decoder's rule, and check that it reaches across blocks and refuses offsets
+  past a 1 KiB window.
+- **One size assertion, mutation-checked.** Level 19 must be no larger than
+  level 15 on structured text. Not a theorem — prices are estimates — but a
+  broken price model is invisible to every correctness test, the M5 notes
+  record two bugs of exactly that kind, and making literals free (so the
+  parser stops matching) fails it.
+- **Interop:** 322 checks against the real `zstd` binary, from 112 — and
+  since `zalt compress` exists, written by it rather than by the example
+  program that stood in for it.
+- **Fuzzing:** the `encode_decode` target hard-coded `level: 3`, so it had never
+  reached any parser but one. It now takes the level from the fuzzer's input.
+  A campaign of 15 minutes on six workers ran **1 116 832** encodes at fuzzer-
+  chosen levels under ASan, every frame decoded by libzstd as the oracle and
+  then by zalt: no crashes, no disagreements. After the binary tree replaced
+  the chain for 16–19, a second campaign of the same size ran **1 083 648**
+  more: none either.
+
+**One build-configuration change came with it.** Debug-mode optimal parsing is
+some thirty times slower than optimised, and the differential suite went from
+about two seconds to fourteen. `zalt-codec` now builds at `opt-level = 1` in
+the dev profile; `debug-assertions` and overflow checks are separate keys and
+stay on, so every `debug_assert!` still runs. The suite is back to about four
+seconds.
 
 ### M6 container header — design note
 
@@ -3651,6 +4041,225 @@ against a local attacker needs a MAC keyed to something unreadable by them,
 which is a browser threat-model decision with a real cost, not a container
 format decision.
 
+### M7 — ZSTA archives: portable R1
+
+`doc/zstd-archives_new.md` (draft 0.2) specifies **ZSTA**: a multi-file archive
+built entirely from standard zstd frames, at once a valid `.tar.zst` —
+`zstd -dc a.tar.zst | tar -x` extracts it — and randomly accessible, through a
+trailing seek table and a Central Index that list the contents and locate any
+member without decoding anything else. `crates/zalt-archive` implements the
+first milestone: the **portable profile** and an **R1 reader** (spec §14.2).
+
+- [x] Format core: VarInt (§2), the Archive Header (§4), the seek table in its
+      §8.2 profile, and the Central Index (§7), each with a strict parser.
+- [x] Writer: pax-over-ustar tar (§9.1), §12's frame policy — solid groups,
+      single frames, chunked large files — and frames compressed in parallel.
+- [x] R1 reader: indexed open with every §11.1 check, listing, extracting one
+      member or all of them, frames decoded in parallel, and `verify`.
+- [x] Extraction under §13: paths, links, special files, limits.
+- [x] `zalt archive create | list | extract | verify`.
+- [x] The probe imported as the oracle; three fuzz targets (§14.3).
+- [ ] macOS metadata (§9.3), dictionaries (§6), entry hashes (§7.3), append and
+      recovery (R2, §10–§11.3), FIFOs and device nodes.
+
+#### Where it sits
+
+Above the codec, and the only crate that knows the ZSTA layout exists.
+`zalt-codec` writes and reads frames and has never heard of tar; the dependency
+rule of §1 holds in the usual direction. The crate is `forbid(unsafe_code)`,
+which is exactly why §9.3's macOS metadata is not in this milestone — extended
+attributes, ACLs and BSD flags all need system calls `std` does not expose.
+
+#### Written from the spec, judged by others
+
+**The index and tar code were written from the spec without reading the
+probe's.** The probe then stands as an independent second reading of §7 — the
+role `ruzstd` plays for the codec — so a misreading would have to be made twice,
+independently, to pass.
+
+The spec defines conformance by what *other* software accepts (§14.1), so the
+tests do too. Every archive the writer produces is judged by three things that
+are not `zalt-archive`:
+
+| judge | what it checks | result |
+|---|---|---|
+| libzstd's reference seekable reader | the same frame map from the same table; the whole tar stream; every frame; 200 random ranges | agrees, at levels 3 and 19 and empty |
+| the probe's §7 decoder | every Central Index field | agrees |
+| `zstd -t`, `zstd -dc \| tar -t`, `tar -x` | stock-tool compatibility | GNU tar lists and extracts identically, NFD path included |
+
+And before any of that, the probe's own suite — written for libzstd as the
+encoder — passes **16/16 with zalt as the encoder** at levels 1, 3, 9, 16 and
+19, including §5.2's frame conformance at every level it checks. zalt was a
+conformant ZSTA encoder before a line of `zalt-archive` existed.
+
+#### Safety, and the tests that can fail
+
+Two defenses against writing outside the destination, each sufficient alone:
+**symlinks are created last**, so nothing this extraction makes can redirect a
+later write; and **every parent directory is checked to be a real directory**
+before anything is created in it, which also covers a symlink that was already
+there. Each was mutation-checked: removing the parent check fails the
+pre-existing-symlink test; removing *both* lets the planted-symlink test's write
+escape the root and fail it. Neither test is a formality.
+
+Other properties checked by breaking them: a member present in the tar stream
+but **hidden from the index** opens and lists cleanly — the index is
+self-consistent — and `verify` catches it, because the members no longer tile
+the stream; an index that lies about a member's path is caught when the member
+is read, since the tar header is compared before content is returned (§7.5);
+flipping one byte anywhere in an index fails its checksum; a corrupted data
+frame fails the entries in it and no others.
+
+What `std` cannot give is stated in the module rather than glossed: checks are
+made by path and acted on by path, so a process writing to the destination
+*during* extraction could race them. §13 names the fix — `openat`-style,
+descriptor-relative creation — and `std` does not expose it. A fresh, private
+destination closes the race in practice.
+
+**Output does not depend on the thread count.** Frames are compressed
+independently and written in order, so one thread and eight produce identical
+bytes — §12.4's reproducibility at any parallelism, asserted by a test.
+
+#### What ZSTA found in the codec
+
+**zalt could not decode a stream that ends in a skippable frame.** Every ZSTA
+archive ends in two — the Central Index and the seek table — and so does any
+file carrying zstd's seekable-format seek table; `zstd(1)` reads them.
+
+After a skippable frame the decoder steps over it and waits for the next magic
+number, reporting `NeedMoreInput`, which is right mid-stream. But the one-shot
+decoder, the embed layer, the CLI *and the streaming tests' own helper* all
+judged the end of input by the last status returned, so all four reported
+these streams as truncated. No test noticed because **every skippable-frame
+test put the skippable frame before a real one**; none put it last.
+
+The decoder now answers the question directly — `is_between_frames()`: between
+frames with nothing buffered — and all four use it. The new test was checked by
+putting the old rule back, under which it fails; a stream cut inside a trailing
+skippable frame, a partial magic number after a frame, and empty input are all
+still refused. A stream of only skippable frames now decodes to nothing, as
+libzstd's `ZSTD_decompress` does.
+
+**Left open:** the C ABI reports status per call and has no way to say "between
+frames", so a C host still cannot tell a stream that ended on a skippable frame
+from a truncated one. Fixing that is an ABI addition, and is recorded here
+rather than made unasked.
+
+#### Fuzzing
+
+| target | property | runs | result |
+|---|---|---:|---|
+| `archive_open` | arbitrary bytes opened, verified and read: no panic, hang or unbounded allocation | 34.1 M | clean |
+| `archive_index` | the fuzzer's bytes as the *decoded* index body, wrapped and signed as a writer would — past the checksum — and anything accepted re-encodes to itself | 3.7 M | clean |
+| `archive_varint` | anything accepted is the one canonical spelling of its value | 258 M | clean |
+
+`archive_open` was seeded with three real archives and grew from 1 124 coverage
+edges to 1 761; `archive_index` from 19 to 1 982.
+
+#### Findings for the spec
+
+Recorded here for the next draft; `doc/zstd-archives_new.md` is unchanged.
+
+- **macOS's `tar` is bsdtar, and it lists NFD paths in NFC.** The probe's
+  `stock_cli_zstd_and_tar` fails under it *with libzstd as the encoder*: every
+  path matches except `données/résumé.txt`, decomposed in the archive, listed
+  precomposed. The archive is right — §9.3 stores paths as given — but §14.1
+  requires listings to pass "with bsdtar", so either it needs a
+  normalization-insensitive comparison for bsdtar or the requirement needs a
+  note. A second bsdtar difference is *not* a ZSTA property, and is recorded so
+  it is not mistaken for one: `--use-compress-program zstd` fails on **any**
+  `.tar.zst` under bsdtar, a plain `gtar | zstd` one included, because GNU tar
+  appends `-d` when reading through the program and bsdtar does not. The
+  probe's test used GNU's spelling; it now passes `zstd -d` to bsdtar, and
+  prefers GNU tar where it is installed.
+- **§5.2's 2^27 window ceiling is above zalt's untrusted decode ceiling of
+  2^23.** A reader must opt into 2^27 to read conformant archives written by
+  `zstd --ultra -22`, and with parallel decode that is 128 MiB per frame in
+  flight. `zalt-archive` reads to 2^27, deliberately.
+- **`Frame_Content_Size` is present in zalt's frames only by coupling.** zalt's
+  writer omits it for some frames under 256 bytes; ZSTA's data frames are
+  always at least 512 and its index bodies single-segment, so it holds — and
+  the archive writer now checks it on every frame rather than relying on that.
+- **`Path_Shared` need not be maximal.** §7.1 does not say a writer must share
+  the longest prefix, so two byte-different indexes can describe the same
+  members — the ambiguity §2.1 forbids for VarInt. Worth a MUST, or a note.
+- **Frame boundaries cost ratio exactly where files repeat each other.**
+  Archiving `crates/` at level 19: **949 567 bytes against `tar | zstd -19`'s
+  615 264, 54% larger** — and zalt's encoder is not why: it matches `zstd -19`
+  on every frame (1.00x) and on the whole stream as one frame. The difference
+  is two test fixtures, a 300 KB random file and its zstd-compressed form,
+  which stores the random bytes nearly verbatim. In one stream the second
+  matches the first; §12.1 gives every file over 256 KiB its own frame, so it
+  cannot. That is the price of random access, and this tree is its worst case.
+  §12.2's grouping advice could say so; a policy that lets medium files join
+  solid groups trades a larger decode per extraction for exactly this.
+
+#### macOS metadata and descriptor-relative extraction (`native-fs`)
+
+The `fs` module now sits behind the `native-fs` feature (zalt-cli turns it
+on). Without it, the format, writer, reader and the metadata text forms
+(`meta`) build with no new dependencies — the fuzz targets use it that way, and
+`just clippy` checks both.
+
+| dependency | for | instead of |
+|---|---|---|
+| `cap-std`, `cap-fs-ext` 4 | every extraction step relative to an open directory: `O_NOFOLLOW` per component, `O_EXCL`, `symlinkat`, `linkat`, `renameat` | path checks followed by path actions |
+| `rustix` 1 (already in the tree under cap-std) | xattrs through the descriptor | the `xattr` crate — see below |
+| `nix` 0.31 (`fs`, `user`) | owner names, `fchownat`/`fchmodat`, `chflags`, `mkfifo`/`mknod` | hand-written FFI |
+| `exacl` 0.13 (macOS) | NFSv4 ACLs | hand-written FFI |
+
+What is archived and restored: xattrs (resource forks included,
+`com.apple.decmpfs` never, `com.apple.provenance` only with
+`--keep-provenance`), ACLs as `SCHILY.acl.ace`, BSD flags as `SCHILY.fflags`
+(`UF_COMPRESSED` and system-managed bits never), birth time as
+`LIBARCHIVE.creationtime`, uname/gname, FIFOs, and device nodes (extraction
+only with `--devices`). A quarantined archive passes its quarantine on (§9.3).
+Every spelling was taken from bsdtar 3.7.4's output, and `tests/oracle.rs`
+checks both directions: bsdtar restores what zalt archives, and zalt reads
+what bsdtar archives, both xattr forms included.
+
+**Extraction no longer has the race the M7 notes above conceded.** Every
+directory is opened from its parent's descriptor with `O_NOFOLLOW`, every entry
+created by a single name in it, and metadata applied through the file's own
+descriptor. Flags and ACLs have only path-based calls on macOS; they go
+through `/dev/fd/N`, which the kernel resolves to the descriptor's vnode — a
+file renamed away from its name still receives them, and a unit test pins it.
+The one path-based step left is creating a FIFO or device node (macOS has
+`mkfifoat`/`mknodat`, but neither nix nor rustix exposes them there): the node
+is made under an unguessable name, found through the parent's descriptor or
+refused, and moved into place with `renameat`. That path for device nodes
+needs root, so the test suite covers it only through FIFOs; it was checked by
+hand (2026-10-04): `/dev/null` and `/dev/zero` archived from the live system,
+extracted with `sudo zalt archive extract --devices`, came back as character
+devices 3,2 and 3,3 that behave as the originals.
+
+The race test swaps a directory for a symlink with `renameatx_np(RENAME_SWAP)`
+— atomic, so the directory is never missing — holding each state 30 µs. A
+path-based control extractor under the same swapper **escapes within 1–5
+attempts**; the cap-std extractor, 30 attempts under ~100 swaps, **never**.
+The first swapper used two renames and was too weak to break even the control
+on a quiet machine (the directory was *missing* in 70% of the control's
+checks); the control is what caught that.
+
+**The `xattr` crate truncates resource forks to 4 KiB on macOS.** Its reader
+tries a 4 KiB buffer first and assumes a value that does not fit fails with
+`ERANGE`. Ordinary xattrs do; `com.apple.ResourceFork` is read like a file and
+*succeeds short*. A 5 MB fork archived through it came back as 4 096 bytes,
+with no error. zalt reads every value as size query → read → size query again,
+retrying on change and failing on a short read of an unchanged size, and caps
+one entry's xattrs at 48 MiB so the writer never produces a header its own
+reader (64 MiB) refuses. rustix was then checked call by call, in source and on
+this machine: NULL for an empty get buffer (macOS returns `ERANGE` otherwise),
+size-0 list queries, `XATTR_NOFOLLOW` on the `l*` calls, `ENOATTR`, exact 4096
+and 4097-byte values, and forks of 5, 80 and 300 MiB read whole in one call.
+No defect found. The round-trip test compares forks through
+`..namedfork/rsrc`, which goes through neither implementation, and fails
+against a reintroduced 4 KiB read.
+
+A new fuzz target, `archive_meta`, feeds the ACL, flag, base64 and `%XX`
+parsers directly — random bytes rarely get a tar header past its checksum:
+2.5 M runs clean, 77 of its 821 corpus entries ACL-shaped.
+
 ### M6 — `zalt::native` cache codec (gated)
 - [ ] Design: interleaved rANS (8/16 lanes matching NEON width), NEON-friendly
       match encoding, incompressibility detector.
@@ -3673,8 +4282,11 @@ format decision.
 3. **Is WEFT ever fetched standalone?** If the data layer can be requested
    separately from the document, it is a distinct content type with very
    different statistics and deserves its own recipe entry.
-4. **Threading model.** One decoder per response, or a shared pool? Determines
-   whether instances must be `Send` and whether the budget is per-thread or global.
+4. ~~**Threading model.** One decoder per response, or a shared pool? Determines
+   whether instances must be `Send` and whether the budget is per-thread or global.~~
+   **Answered:** multithreaded, both shapes, one global budget. Every type is
+   `Send` and the pool and budget `Sync`, now asserted; the pool measures at
+   parity with a decoder per thread. See M2's threading notes.
 5. **Dictionary adoption path.** Given §7's caveat, is there a plan for origins
    to compress with a well-known ZTML dictionary ID — or should the effort go to
    `dcz` negotiation instead?

@@ -89,6 +89,9 @@ fmt-check:
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+    @# The workspace build turns `native-fs` on (zalt-cli asks for it); the
+    @# format layer must also stand without it — the fuzz targets use it so.
+    cargo clippy -p zalt-archive --all-targets -- -D warnings
 
 clippy-fix:
     cargo clippy --fix --workspace --all-targets --allow-dirty -- -D warnings
@@ -455,6 +458,20 @@ _canary-frame:
 #   just baseline corpus/
 baseline DIR="corpus":
     cargo run --release -p zalt-bench -- baseline {{DIR}}
+
+# Every compression level against libzstd's *same* level.
+#
+#   just encode-levels corpus/ztml
+#   just encode-levels corpus/ztml 1,9,19 --time
+#
+# Size is deterministic and exact; add `--time` for speed, interleaved with
+# libzstd per level, which needs the same quiet machine every timing does. Each
+# row is zalt at level N divided by zstd at level N on both axes, so below 1.00
+# is better — a level has not matched libzstd's level until both columns say
+# so. Every frame at every level is decoded and compared before it is counted.
+[doc("Each compression level against libzstd's same level: size, and with --time, speed.")]
+encode-levels DIR="corpus" *ARGS="":
+    cargo run --release -p zalt-bench -- encode-levels {{DIR}} {{ARGS}}
 
 # Encode throughput against libzstd, over a corpus directory.
 #
