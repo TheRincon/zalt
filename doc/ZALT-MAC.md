@@ -4194,6 +4194,38 @@ Recorded here for the next draft; `doc/zstd-archives_new.md` is unchanged.
   §12.2's grouping advice could say so; a policy that lets medium files join
   solid groups trades a larger decode per extraction for exactly this.
 
+  **Measured and decided (2026-10-05): the writer's defaults are now 8 MiB /
+  8 MiB** — every entry under 8 MiB may join a solid group, and groups close
+  at 8 MiB — instead of §12.1's 256 KiB / 4 MiB. Sizes against zstd on the
+  *identical* tar stream in one frame (so only frame boundaries differ), and
+  the bytes a one-file extraction decodes:
+
+  | policy (threshold / group) | `crates/` L19 | registry 146 MiB L19 | registry L3 | mean / worst decode (registry) |
+  |---|---:|---:|---:|---|
+  | 256K / 4M (§12.1) | 1.515x | 1.323x | 1.019x | 3.6 / 4 MiB |
+  | 4M / 4M | 1.009x | 1.308x | 1.015x | 3.9 / 4 MiB |
+  | 256K / 8M | 1.515x | 1.248x | 0.982x | 6.6 / 8 MiB |
+  | **8M / 8M (new default)** | **1.009x** | **1.215x** | **0.975x** | 7.9 / 8 MiB |
+  | 4M / 16M | 1.009x | 1.124x | 0.959x | 15.6 / 16 MiB |
+  | 4M / 32M | 1.009x | 1.065x | 0.950x | 30.4 / 32 MiB |
+  | one frame (zalt's floor) | 1.009x | 1.030x | 0.929x | everything |
+
+  Two separate effects. Letting medium files join removes the near-duplicate
+  case outright (`crates/`). Group size governs broadly redundant trees, with
+  **no knee at the 8 MiB match window**: each doubling roughly halves the
+  overhead above the floor and doubles the decode per extraction, because
+  every frame starts cold. 8 MiB is a middle setting chosen for now, to be
+  revisited with timing. At level 3 zalt already writes archives smaller than
+  `tar | zstd -3` here, partly because its level 3 out-compresses zstd's by ~7%
+  on this data. End to end, `zalt a c -19` on `crates/` went from 1.515x to
+  **1.007x** of `zstd -19` on the same stream.
+
+  Not measured: extraction *time* (swap was at 92%; bytes decoded stand in),
+  and a typical macOS corpus — the registry holds several versions of each
+  crate side by side, which flatters bigger groups. For the spec: §12.1's
+  256 KiB threshold costs more than it buys whenever files near each other
+  resemble each other.
+
 #### macOS metadata and descriptor-relative extraction (`native-fs`)
 
 The `fs` module now sits behind the `native-fs` feature (zalt-cli turns it

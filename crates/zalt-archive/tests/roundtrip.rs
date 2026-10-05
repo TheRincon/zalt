@@ -323,7 +323,7 @@ fn a_policy_that_cannot_describe_a_valid_archive_is_refused() {
             ..FramePolicy::default()
         },
         FramePolicy {
-            small_file_threshold: 8 << 20,
+            small_file_threshold: FramePolicy::default().solid_target + 512,
             ..FramePolicy::default()
         },
         FramePolicy {

@@ -2,18 +2,41 @@
 //!
 //! ## Where entries go
 //!
-//! §5.3 and §12.1 together decide the frame layout, and the writer follows
-//! them literally. An entry — its headers and padded content — that is:
+//! §5.3 decides how an entry may be split; §12.1 suggests the sizes, and the
+//! defaults depart from it on purpose (below). An entry — its headers and
+//! padded content — that is:
 //!
-//! - **small** (below `small_file_threshold`, 256 KiB) joins the current
-//!   *solid group*, which is closed once the next entry would take it past
-//!   `solid_target` (4 MiB). Small files compress far better together, and
-//!   extracting one still decodes at most one group.
-//! - **medium** (up to `solid_target`) gets a frame of its own. §5.3: a writer
-//!   should not split an entry that fits a solid frame.
-//! - **large** is split into `large_chunk` (32 MiB) frames at 512-byte
+//! - **below `small_file_threshold`** joins the current *solid group*, which
+//!   is closed once the next entry would take it past `solid_target`. Files
+//!   compress far better together, and extracting one still decodes at most
+//!   one group.
+//! - **up to `solid_target`** gets a frame of its own. §5.3: a writer should
+//!   not split an entry that fits a solid frame. With the defaults, where the
+//!   threshold *is* the group size, this only happens to an entry of exactly
+//!   that size.
+//! - **larger** is split into `large_chunk` (32 MiB) frames at 512-byte
 //!   boundaries, headers in the first, so that reading part of a big file
 //!   decodes only the chunks that hold it — and the chunks decode in parallel.
+//!
+//! ## Why the defaults are 8 MiB / 8 MiB, not §12.1's 256 KiB / 4 MiB
+//!
+//! Every frame boundary costs ratio: the next frame starts with no history
+//! and fresh statistics. Measured on 2026-10-05 against `tar | zstd` of the
+//! identical tar stream, at level 19:
+//!
+//! - **`crates/` (2.3 MiB): §12.1's policy was 1.52x the size; with medium
+//!   files allowed into groups it is 1.01x.** Two near-identical 300 KB test
+//!   fixtures sat in frames of their own, so neither could match the other.
+//! - **A 146 MiB slice of the cargo registry: 1.32x at 4 MiB groups, 1.22x at
+//!   8 MiB, 1.12x at 16 MiB, 1.07x at 32 MiB.** No knee at the 8 MiB match
+//!   window: each doubling roughly halves the overhead and doubles what a
+//!   one-file extraction decodes (3.6 → 7.9 → 15.6 → 30.4 MiB on average).
+//!
+//! 8 MiB is a middle setting, not an optimum; there is none, only the trade.
+//! At the default level 3 it already writes archives no larger than
+//! `tar | zstd -3` (0.98x on the registry slice). Extraction time was not
+//! measured, only bytes decoded; a reader that wants faster single-file
+//! access writes smaller groups through [`FramePolicy`].
 //!
 //! ## Parallel, and still deterministic
 //!
@@ -43,7 +66,8 @@ use crate::{Error, Result, frames};
 /// The most uncompressed bytes a batch holds before it is compressed.
 pub const BATCH_BYTES: u64 = 256 << 20;
 
-/// §12.1's frame policy.
+/// Where frame boundaries go (§12.1's settings). The defaults, and why they
+/// differ from §12.1's suggestion, are in the module notes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramePolicy {
     /// Entries below this go into solid groups.
@@ -57,8 +81,8 @@ pub struct FramePolicy {
 impl Default for FramePolicy {
     fn default() -> Self {
         Self {
-            small_file_threshold: 256 << 10,
-            solid_target: 4 << 20,
+            small_file_threshold: 8 << 20,
+            solid_target: 8 << 20,
             large_chunk: 32 << 20,
         }
     }
