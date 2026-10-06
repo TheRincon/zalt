@@ -21,11 +21,13 @@
 //! ## What this milestone covers
 //!
 //! The *portable* profile (§1.1: stock-tool compatible, no dictionaries) and
-//! an R1 reader (§14.2): indexed open, listing, extracting one entry or all of
-//! them, with §13's path, link and resource rules; and the macOS metadata of
-//! §9.1–§9.3 — extended attributes (resource forks included), ACLs, BSD file
-//! flags, birth time, owner names, FIFOs and device nodes. Not yet:
-//! dictionary mode, append and recovery (R2), and entry hashes.
+//! an **R2** reader (§14.2): indexed open, listing, extracting one entry or
+//! all of them, with §13's path, link and resource rules (R1); appending to a
+//! finished archive (§10, [`append`](fn@append)); and rebuilding the trailer of one that
+//! lost it (§11.3, [`recover`](fn@recover)). Also the macOS metadata of §9.1–§9.3 —
+//! extended attributes (resource forks included), ACLs, BSD file flags, birth
+//! time, owner names, FIFOs and device nodes. Not yet: dictionary mode and
+//! entry hashes.
 //!
 //! ## Features
 //!
@@ -46,6 +48,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod append;
 pub mod frames;
 #[cfg(all(unix, feature = "native-fs"))]
 pub mod fs;
@@ -53,12 +56,15 @@ pub mod index;
 pub mod layout;
 pub mod meta;
 pub mod read;
+pub mod recover;
 pub mod tar;
 pub mod varint;
 pub mod write;
 
+pub use append::append;
 pub use index::{Entry, Kind};
 pub use read::{Archive, ReadLimits};
+pub use recover::{Recovered, recover};
 pub use write::{FramePolicy, Writer, WriterOptions};
 
 use core::fmt;

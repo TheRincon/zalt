@@ -383,12 +383,20 @@ fn parse_pax_time(value: &[u8]) -> Result<(i64, u32)> {
 /// `stream` must extend at least through the member's headers; its content is
 /// not read.
 pub fn parse_member(stream: &[u8]) -> Result<Member> {
+    parse_member_prefix(stream)?
+        .ok_or_else(|| Error::Format("tar stream ends inside a header".into()))
+}
+
+/// [`parse_member`] for a stream that arrives in pieces: `Ok(None)` when
+/// `stream` ends before the member's headers do, so the caller can append the
+/// next piece and ask again. Any other problem is an error as before.
+pub fn parse_member_prefix(stream: &[u8]) -> Result<Option<Member>> {
     let mut pos = 0usize;
     let mut pax: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     loop {
-        let block = stream
-            .get(pos..pos + BLOCK)
-            .ok_or_else(|| Error::Format("tar stream ends inside a header".into()))?;
+        let Some(block) = stream.get(pos..pos + BLOCK) else {
+            return Ok(None);
+        };
         if block.iter().all(|&b| b == 0) {
             return format_err("an end-of-archive block where a member was expected");
         }
@@ -402,9 +410,10 @@ pub fn parse_member(stream: &[u8]) -> Result<Member> {
         let size = parse_octal(&block[SIZE])?;
         match typeflag {
             b'x' => {
-                let records = stream
-                    .get(pos + BLOCK..pos + BLOCK + size as usize)
-                    .ok_or_else(|| Error::Format("pax header runs past the stream".into()))?;
+                let end = (pos + BLOCK).checked_add(usize::try_from(size).unwrap_or(usize::MAX));
+                let Some(records) = end.and_then(|end| stream.get(pos + BLOCK..end)) else {
+                    return Ok(None);
+                };
                 parse_pax_records(records, &mut pax)?;
                 pos += BLOCK + pad(size) as usize;
                 continue;
@@ -517,7 +526,7 @@ pub fn parse_member(stream: &[u8]) -> Result<Member> {
             m.size = 0;
         }
         validate_path(&m.path)?;
-        return Ok(m);
+        return Ok(Some(m));
     }
 }
 

@@ -100,6 +100,15 @@ fn the_reference_seekable_reader_reads_every_archive() {
         ("empty", vec![], 3),
     ] {
         let bytes = write(&members, options(level));
+        reference_reader_agrees(name, &bytes);
+    }
+}
+
+/// libzstd's reference seekable reader and ours derive the same frame map
+/// from `bytes`, and read the same tar stream from it, three ways.
+fn reference_reader_agrees(name: &str, bytes: &[u8]) {
+    {
+        let bytes = bytes.to_vec();
         let ours = open(&bytes);
         let mut theirs = RefSeekable::open(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
 
@@ -163,14 +172,18 @@ fn the_reference_seekable_reader_reads_every_archive() {
 
 #[test]
 fn an_independent_reading_of_section_7_agrees_with_our_index() {
-    let members = members();
-    let bytes = write(&members, options(9));
-    let ours = open(&bytes);
+    index_agrees("tree, level 9", &write(&members(), options(9)));
+}
+
+/// The probe's independent decoder of §7 reads the same records from
+/// `bytes`'s Central Index as ours does.
+fn index_agrees(name: &str, bytes: &[u8]) {
+    let ours = open(bytes);
     let last = *ours.frames().last().unwrap();
     let frame =
         &bytes[last.file_offset as usize..(last.file_offset + last.compressed_size) as usize];
-    let theirs =
-        probe_index::decode(&frame[8..], 64 << 20).expect("the probe reads our Central Index");
+    let theirs = probe_index::decode(&frame[8..], 64 << 20)
+        .unwrap_or_else(|e| panic!("{name}: the probe cannot read our Central Index: {e}"));
 
     assert_eq!(theirs.tar_stream_size, ours.tar_stream_size());
     assert_eq!(theirs.entries.len(), ours.entries().len());
@@ -492,4 +505,160 @@ mod bsdtar_metadata {
         let inherit = meta::parse_acl(shared.acl.as_deref().unwrap()).unwrap();
         assert_eq!(inherit[0].flags & 0b11, 0b11, "file and directory inherit");
     }
+}
+
+// ------------------------------------------------------- R2: append, recover
+
+/// `members` written, then `more` appended through a real file.
+fn appended(members: &[(Entry, Vec<u8>)], more: &[(Entry, Vec<u8>)], level: i32) -> Vec<u8> {
+    let path =
+        std::env::temp_dir().join(format!("zalt-oracle-append-{}-{level}", std::process::id()));
+    std::fs::write(&path, write(members, options(level))).unwrap();
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut w = zalt_archive::append(file, options(level)).unwrap();
+    for (e, content) in more {
+        w.add(e.clone(), &mut content.as_slice()).unwrap();
+    }
+    let (out, _) = w.finish().unwrap();
+    drop(out);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    bytes
+}
+
+/// `bytes` with its trailer cut off at the Central Index, recovered.
+fn recovered(bytes: &[u8]) -> Vec<u8> {
+    let a = open(bytes);
+    let index = a.frames()[a.frames().len() - 1].file_offset as usize;
+    let (fixed, report) = zalt_archive::recover(&bytes[..index], Vec::new(), options(3)).unwrap();
+    assert!(report.terminator_found, "{report:?}");
+    fixed
+}
+
+#[test]
+fn appended_and_recovered_archives_satisfy_the_reference_reader() {
+    let all = members();
+    let (first, rest) = all.split_at(all.len() / 2);
+    let grown = appended(first, rest, 19);
+    reference_reader_agrees("appended", &grown);
+    index_agrees("appended", &grown);
+    let fixed = recovered(&grown);
+    reference_reader_agrees("recovered", &fixed);
+    index_agrees("recovered", &fixed);
+    assert_eq!(open(&fixed).entries(), open(&grown).entries());
+}
+
+/// An archive libzstd wrote, with vendor frames between its data frames (Q7),
+/// as the probe's own writer lays it out.
+fn libzstd_archive() -> (Vec<u8>, usize) {
+    let mut t = zsta_seekable_probe::tar::TarWriter::new();
+    t.add_dir("lib", 0o755, 1_700_000_000);
+    for i in 0..12 {
+        t.add_file(
+            &format!("lib/f{i:02}.dat"),
+            &pseudo(700 * i + 100, i as u32),
+            0o644,
+            1_700_000_000,
+        );
+    }
+    t.add_file("lib/big.dat", &pseudo(40_000, 99), 0o644, 1_700_000_000);
+    t.add_symlink("lib/latest", "f00.dat", 1_700_000_000);
+    let (body, entries) = t.finish();
+    let opts = zsta_seekable_probe::archive::WriterOptions {
+        solid_target: 4096,
+        chunk: 8192,
+        vendor_every: Some(2),
+        ..Default::default()
+    };
+    let mut enc = zsta_seekable_probe::encoder::ReferenceEncoder::new(19);
+    let a = zsta_seekable_probe::archive::write(&body, &entries, &mut enc, &opts).unwrap();
+    (a.bytes, entries.len())
+}
+
+#[test]
+fn archives_libzstd_wrote_can_be_recovered_and_appended_to() {
+    let (bytes, count) = libzstd_archive();
+    let theirs = open(&bytes);
+    assert_eq!(theirs.entries().len(), count);
+    let vendor = theirs
+        .frames()
+        .iter()
+        .filter(|f| f.magic == 0x184D_2A5F)
+        .count();
+    assert!(vendor > 0, "the vendor frames are there to be walked past");
+
+    let fixed = recovered(&bytes);
+    let a = open(&fixed);
+    a.verify().unwrap();
+    assert_eq!(a.entries().len(), count);
+    for (x, y) in a.entries().iter().zip(theirs.entries()) {
+        assert_eq!(
+            a.entry_bytes(x).unwrap(),
+            theirs.entry_bytes(y).unwrap(),
+            "{}",
+            x.path_lossy()
+        );
+    }
+    reference_reader_agrees("libzstd archive, recovered", &fixed);
+
+    let path = std::env::temp_dir().join(format!("zalt-oracle-libzstd-{}", std::process::id()));
+    std::fs::write(&path, &bytes).unwrap();
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut w = zalt_archive::append(file, options(3)).unwrap();
+    for (e, content) in members().iter().take(4) {
+        w.add(e.clone(), &mut content.as_slice()).unwrap();
+    }
+    drop(w.finish().unwrap());
+    let grown = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    open(&grown).verify().unwrap();
+    reference_reader_agrees("libzstd archive, appended", &grown);
+}
+
+/// zalt-codec's frame walk against libzstd's `ZSTD_findFrameCompressedSize`,
+/// on every frame of archives both encoders wrote — whole, and cut short.
+#[test]
+fn frame_lengths_agree_with_libzstd() {
+    let all = members();
+    let (first, rest) = all.split_at(all.len() / 2);
+    let archives = [
+        write(&all, options(3)),
+        write(&all, options(19)),
+        appended(first, rest, 1),
+        libzstd_archive().0,
+    ];
+    let mut checked = 0;
+    for bytes in &archives {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let (_, theirs) = zsta_seekable_probe::frame::inspect(&bytes[off..]).unwrap();
+            let ours = zalt_codec::frame::compressed_size(&bytes[off..]).unwrap();
+            assert_eq!(ours as u64, theirs, "frame at {off}");
+            let end = off + ours;
+            for cut in [end - 1, end - 2, off + 4, off + 6, off + (ours / 2)] {
+                if cut <= off || cut >= end {
+                    continue;
+                }
+                assert!(
+                    zalt_codec::frame::compressed_size(&bytes[off..cut]).is_err(),
+                    "cut {cut}"
+                );
+                assert!(
+                    zsta_seekable_probe::frame::inspect(&bytes[off..cut]).is_err(),
+                    "cut {cut}"
+                );
+            }
+            off = end;
+            checked += 1;
+        }
+    }
+    assert!(checked > 40, "{checked} frames");
 }

@@ -338,3 +338,40 @@ fn a_policy_that_cannot_describe_a_valid_archive_is_refused() {
         assert!(Writer::new(Vec::new(), o).is_err(), "{policy:?}");
     }
 }
+
+/// §7.2 makes the metadata fields optional and §7.5 makes the index a cache:
+/// an index that leaves one out describes the member no less truly, and its
+/// members must still read. One that records a *different* value is wrong.
+/// (Found by the oracle: the probe's writer omits `NAMES` while its tar
+/// headers carry uname/gname, and a strict comparison refused every member.)
+#[test]
+fn optional_index_fields_may_be_omitted_but_not_contradict_the_tar_headers() {
+    let mut e = Entry::new(Kind::File, "f");
+    e.size = 3;
+    e.names = Some((b"dan".to_vec(), b"staff".to_vec()));
+    e.btime = Some((1_600_000_000, 5));
+    e.fflags = Some(0x8000);
+    let mut w = Writer::new(Vec::new(), options(1)).unwrap();
+    w.add(e, &mut &b"abc"[..]).unwrap();
+    let bytes = w.finish().unwrap().0;
+
+    let omitted = with_index(&bytes, |idx| {
+        let e = &mut idx.entries[0];
+        (e.names, e.btime, e.fflags) = (None, None, None);
+    });
+    let a = open(omitted).unwrap();
+    assert_eq!(a.entry_bytes(&a.entries()[0]).unwrap(), b"abc");
+
+    let doctors: [fn(&mut Entry); 3] = [
+        |e| e.names = Some((b"eve".to_vec(), b"staff".to_vec())),
+        |e| e.btime = Some((1, 0)),
+        |e| e.fflags = Some(0x2),
+    ];
+    for doctor in doctors {
+        let a = open(with_index(&bytes, |idx| doctor(&mut idx.entries[0]))).unwrap();
+        assert!(matches!(
+            a.entry_bytes(&a.entries()[0]),
+            Err(Error::Inconsistent(_))
+        ));
+    }
+}

@@ -115,3 +115,10 @@ path = "fuzz_targets/archive_meta.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "archive_recover"
+path = "fuzz_targets/archive_recover.rs"
+test = false
+doc = false
+bench = false

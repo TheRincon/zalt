@@ -4183,6 +4183,25 @@ Recorded here for the next draft; `doc/zstd-archives_new.md` is unchanged.
 - **`Path_Shared` need not be maximal.** §7.1 does not say a writer must share
   the longest prefix, so two byte-different indexes can describe the same
   members — the ambiguity §2.1 forbids for VarInt. Worth a MUST, or a note.
+- **End of archive: §11.3 and §5.4 need one rule for where the tar stream
+  ends.** §11.3 says recovery should "treat the last data frame that decodes
+  to only zero bytes as the Terminator". A large all-zero file split across
+  frames (§5.3) has middle chunks that also decode to only zeros, so taken
+  literally the rule cuts such a file in half whenever the real Terminator is
+  missing — the very case recovery exists for. What actually ends a tar
+  stream is two zero blocks *where a member header is expected*, and §7.5
+  already makes the tar stream authoritative. Suggested wording for §11.3
+  step 4: *"The Terminator is the first data frame that begins at a member
+  boundary and decodes to only zero bytes. If there is none, the archive was
+  cut short: it ends at the last frame boundary that is also a member
+  boundary."* Two related gaps: §5.4 says the Terminator holds no entry data
+  but not that it must *start* at a member boundary, which the rule above
+  relies on and every conformant writer satisfies; and nothing says what a
+  reader does with end-of-archive blocks found *inside* a data frame rather
+  than in a Terminator of their own (zalt's recovery treats them as the end of
+  what it can trust). `zalt-archive` implements the suggested rule; the test
+  `an_all_zero_chunk_is_not_mistaken_for_the_terminator` fails under the
+  literal one.
 - **Frame boundaries cost ratio exactly where files repeat each other.**
   Archiving `crates/` at level 19: **949 567 bytes against `tar | zstd -19`'s
   615 264, 54% larger** — and zalt's encoder is not why: it matches `zstd -19`
@@ -4225,6 +4244,113 @@ Recorded here for the next draft; `doc/zstd-archives_new.md` is unchanged.
   crate side by side, which flatters bigger groups. For the spec: §12.1's
   256 KiB threshold costs more than it buys whenever files near each other
   resemble each other.
+
+#### R2: append (§10) and recovery (§11.3)
+
+`zalt-archive` is now an R2 reader. Both operations end the same way — a
+known-good prefix of the file, then a new Terminator, Central Index and seek
+table — so both are one mechanism: a writer *resumed* from existing state
+(`Writer::resume`, crate-private). `append` builds that state from the index;
+`recover` builds it from a walk of the file.
+
+- **Append** opens by the index, checks the Terminator is whole zero blocks
+  (§5.4), cuts the file there and resumes. Old records and every byte before
+  the old Terminator are unchanged (tested). The Archive Header is never
+  rewritten. A seek table without checksums is refused, since its old frames
+  would be listed with checksum 0. `zalt archive append` works on a copy in
+  the same directory and renames it into place, as §10 recommends; a refused
+  append leaves the archive byte-identical (tested).
+- **Recovery** walks frames from offset 0 with a new codec function,
+  `zalt_codec::frame::compressed_size` — the frame's length from its headers
+  and block headers, libzstd's `ZSTD_findFrameCompressedSize`, which zalt did
+  not have — decodes each data frame, and parses the tar stream across them.
+  It keeps the longest prefix that is a valid archive body, copies it byte for
+  byte, and writes a new trailer. The damaged file is only read.
+- **Duplicate paths are now refused by the writer**, new archives and appends
+  alike, before anything is written. §10 rules out replacing a member, and an
+  index looked up by path cannot hold two. Tar's own rule is "last one
+  wins"; **decided 2026-10-06: keep refusing for now.**
+
+**Spec finding — §11.3's Terminator rule** (also in *Findings for the spec*
+above). "Treat the last data frame that
+decodes to only zero bytes as the Terminator" also matches a middle chunk of
+a large all-zero file, so recovering an archive that lost its Terminator by
+that rule cuts that file in half. zalt follows the tar stream instead, which
+§7.5 makes authoritative: the archive ends at a frame that starts at a member
+boundary and is all zero blocks, and with no such frame, at the last frame
+boundary that is also a member boundary. The two rules agree whenever a real
+Terminator exists. Suggested wording: "the first data frame that begins at a
+member boundary and decodes to only zero bytes".
+
+**Bug found by the oracle, from the metadata round.** The reader compared the
+index's optional metadata (names, birth time, flags, devices, xattrs) with the
+tar headers strictly, so an index that *omits* one — as the probe's writer
+does for owner names — failed every member. §7.2 makes them optional and §7.5
+makes the index a cache: now only a field the index has must match. A
+regression test pins both halves.
+
+Evidence:
+
+- `tests/r2.rs` (12): append keeps old bytes and records; append to an empty
+  archive, twice, at another level; recovery at every frame boundary ±9 bytes
+  and a 61-byte stride yields a verifying archive whose members are a prefix
+  of the original's, never shrinking as more survives; damaged index and
+  footer rebuilt whole; a corrupt data frame keeps exactly the members before
+  it; a crash anywhere in an append keeps every old member; the all-zero
+  chunk case. Two mutants — §11.3's literal rule, and cutting without regard
+  to member boundaries — each fail tests.
+- `tests/oracle.rs`: appended and recovered archives match libzstd's
+  reference seekable reader frame by frame and the probe's independent §7
+  decoder; a **libzstd-written** archive with vendor frames between its data
+  frames (Q7) is recovered and appended to; `compressed_size` equals
+  `ZSTD_findFrameCompressedSize` on every frame of four archives, and both
+  refuse every cut tried.
+- Fuzz `archive_recover`: arbitrary bytes, and whenever recovery succeeds
+  the result must open and verify. 81 k runs from three seeds, clean.
+
+**Salvage past damage (2026-10-06).** Recovery no longer stops at the first
+damaged frame. Two passes: frame extents (from the seek table if it
+survived — it gives a damaged frame's length even when the frame's own block
+headers are gone — else by walking headers), then decode and tar walk. A
+damaged frame's share of the tar stream is still known (seek table, or its
+`Frame_Content_Size`), so:
+
+- damage inside one member's content costs only that member — its header,
+  read before the damage, says where the next begins;
+- damage that took member headers loses the thread; a surviving Central
+  Index picks it up again at the next member it says starts at a frame
+  boundary, once the tar header there names that member. Without an index
+  the walk stops — see the open question below.
+
+Output is the intact *runs* — stretches between member boundaries that are
+also frame boundaries; with zalt's writer one solid group, one file, or one
+chunked file — written through byte for byte, never re-encoded, offsets
+shifted. A run is kept only if all its frames decode and its members tile it
+exactly. `Recovered` names the members lost (from the index when there is one,
+since the walk cannot name members whose headers it never read).
+
+Tested in `tests/r2.rs` (16): a flipped byte at every 7th position of every
+data frame, trailer intact — every member the damaged frame does not touch
+comes back byte for byte, those after it included, and exactly the touched
+ones are reported lost; a reserved block type making a frame's length
+unreadable, bridged by the seek table; damage inside a file with no trailer
+costs that file alone; lost headers stop the walk without an index and resync
+with one; and a **libzstd-written** archive whose frames decode but hold a bad
+tar header (damage before compression), built with the probe since our writer
+cannot write one — its run is dropped whole. Mutants: no gap bridging (1
+test fails), no index resync (3), no tiling check (1, and only after the test
+was moved to the second member of a frame — the first version put the bad
+header first, where an emptiness check already caught it, and the mutant
+survived). Fuzz `archive_recover`: 147 k more runs, clean, now also asserting
+no member is both kept and lost.
+
+**Open question for the user:** with headers lost and *no* index, the only way
+on is to search later frames for something that parses as a tar header. It
+works for archives of ordinary files, but an archived `.tar` holds valid tar
+headers in its content, which would be misread as members. Not implemented.
+
+Not done: frames are decoded sequentially in both passes; parallel decode
+would speed up large archives.
 
 #### macOS metadata and descriptor-relative extraction (`native-fs`)
 

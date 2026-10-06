@@ -197,6 +197,11 @@ impl<S: Source + ?Sized> Archive<S> {
         })
     }
 
+    /// The index's `Hash_Algorithm` (§7.3).
+    pub fn hash_algorithm(&self) -> u8 {
+        self.index.hash_algorithm
+    }
+
     pub fn header(&self) -> &Header {
         &self.header
     }
@@ -220,7 +225,7 @@ impl<S: Source + ?Sized> Archive<S> {
     }
 
     /// Decode one data frame, checked against the seek table.
-    fn decode_frame(&self, i: usize) -> Result<Vec<u8>> {
+    pub(crate) fn decode_frame(&self, i: usize) -> Result<Vec<u8>> {
         let f = self.frames[i];
         let bytes = self
             .source
@@ -353,26 +358,26 @@ impl<S: Source + ?Sized> Archive<S> {
             return disagree("the link target");
         }
         // The metadata the index summarises, so that listing by the index
-        // tells the truth about it. Flags compare as the bits both sides can
-        // spell; xattrs by name and size, in order.
-        if m.btime != e.btime {
+        // tells the truth about it. Each field is optional (§7.2) — the index
+        // is a cache (§7.5), and a writer may leave any of them out — so only
+        // a field the index *has* must match; one it omits contradicts
+        // nothing. Flags compare as the bits both sides can spell; xattrs by
+        // name and size, in order.
+        if e.btime.is_some() && m.btime != e.btime {
             return disagree("the birth time");
         }
-        if m.names != e.names {
+        if e.names.is_some() && m.names != e.names {
             return disagree("the owner names");
         }
-        if m.fflags.filter(|&f| f != 0)
-            != e.fflags
-                .map(|f| f & meta::RECORDED_FLAGS)
-                .filter(|&f| f != 0)
-        {
+        let spelled = |f: Option<u64>| f.unwrap_or(0) & meta::RECORDED_FLAGS;
+        if e.fflags.is_some() && spelled(m.fflags) != spelled(e.fflags) {
             return disagree("the file flags");
         }
-        if m.device != e.device {
+        if e.device.is_some() && m.device != e.device {
             return disagree("the device numbers");
         }
         let sizes = m.xattrs.iter().map(|(n, v)| (n.as_slice(), v.len() as u64));
-        if !sizes.eq(e.xattrs.iter().map(|(n, s)| (n.as_slice(), *s))) {
+        if !e.xattrs.is_empty() && !sizes.eq(e.xattrs.iter().map(|(n, s)| (n.as_slice(), *s))) {
             return disagree("the extended attributes");
         }
         Ok(m)

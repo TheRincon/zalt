@@ -52,6 +52,7 @@
 //! total, so a writer's peak is bounded by those, not by the archive. Large
 //! files are read a chunk at a time and never held whole.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 
 use crate::index::{Entry, Index, Kind};
@@ -160,6 +161,30 @@ pub struct Writer<W: Write> {
     batch: Vec<Vec<u8>>,
     batch_bytes: u64,
     data_frames: u64,
+    /// Every path in the archive so far, to refuse a second member with one.
+    paths: HashSet<Vec<u8>>,
+    /// The index's `Hash_Algorithm`: 0 for a new archive, an appended
+    /// archive's own otherwise.
+    hash_algorithm: u8,
+}
+
+/// Where a resumed [`Writer`] picks up: an archive up to, and not including,
+/// its Terminator. Built by [`crate::append`](fn@crate::append) from an archive's index, and by
+/// [`crate::recover`](fn@crate::recover) from a walk of a damaged one.
+#[derive(Debug, Clone)]
+pub(crate) struct Resume {
+    /// Seek table entries for every frame before the Terminator, in order —
+    /// the Archive Header first.
+    pub seek: Vec<SeekEntry>,
+    /// Index records for every member before the Terminator.
+    pub entries: Vec<Entry>,
+    /// Stream offset where the next data frame starts.
+    pub stream: u64,
+    /// File offset where the next frame starts: the length of what is kept.
+    pub written: u64,
+    /// Data frames kept.
+    pub data_frames: u64,
+    pub hash_algorithm: u8,
 }
 
 impl<W: Write> Writer<W> {
@@ -182,6 +207,8 @@ impl<W: Write> Writer<W> {
             batch: Vec::new(),
             batch_bytes: 0,
             data_frames: 0,
+            paths: HashSet::new(),
+            hash_algorithm: 0,
         };
         let mut header = Header::default();
         if let Some(creator) = &w.options.creator {
@@ -193,7 +220,77 @@ impl<W: Write> Writer<W> {
         Ok(w)
     }
 
-    /// Add one member. A regular file's `entry.size` bytes are read from
+    /// Continue an archive whose first `resume.written` bytes are already in
+    /// `out`, ending just before where its Terminator was. The Archive Header
+    /// is not rewritten, so `options.creator` is not used.
+    pub(crate) fn resume(out: W, options: WriterOptions, resume: Resume) -> Result<Self> {
+        options.policy.validate()?;
+        let threads = match options.threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        };
+        let paths = resume.entries.iter().map(|e| e.path.clone()).collect();
+        Ok(Self {
+            out,
+            options,
+            threads,
+            written: resume.written,
+            stream: resume.stream,
+            seek: resume.seek,
+            entries: resume.entries,
+            group: Vec::new(),
+            batch: Vec::new(),
+            batch_bytes: 0,
+            data_frames: resume.data_frames,
+            paths,
+            hash_algorithm: resume.hash_algorithm,
+        })
+    }
+
+    /// Where the next data frame starts in the tar stream.
+    pub(crate) fn stream_position(&self) -> u64 {
+        self.stream + self.group.len() as u64
+    }
+
+    /// Write `frame` exactly as given — recovery's way of keeping an archive's
+    /// undamaged frames byte for byte. `content_len` and `checksum` describe
+    /// its decoded content for the seek table; a skippable frame has
+    /// `content_len` 0 and is listed as §8.2 requires.
+    pub(crate) fn splice_frame(
+        &mut self,
+        frame: &[u8],
+        content_len: u64,
+        checksum: u32,
+    ) -> Result<()> {
+        self.close_group()?;
+        self.compress_batch()?;
+        let size =
+            |n: u64| u32::try_from(n).map_err(|_| Error::Refused("a frame over 4 GiB".into()));
+        let entry = SeekEntry {
+            compressed_size: size(frame.len() as u64)?,
+            decompressed_size: size(content_len)?,
+            checksum: Some(if content_len == 0 { 0 } else { checksum }),
+        };
+        self.write(frame, "a kept frame")?;
+        self.seek.push(entry);
+        if content_len > 0 {
+            self.stream += content_len;
+            self.data_frames += 1;
+        }
+        Ok(())
+    }
+
+    /// Record a member held by frames [`Writer::splice_frame`] writes. Its
+    /// offsets are the caller's to have set. A path seen before is recorded
+    /// again rather than refused: recovery reproduces what an archive holds,
+    /// and a member left out of the index would break §7's one record per
+    /// member.
+    pub(crate) fn splice_entry(&mut self, entry: Entry) {
+        self.paths.insert(entry.path.clone());
+        self.entries.push(entry);
+    }
+
+    /// Add one member. A regular file's `entry.size` bytes are read from    /// Add one member. A regular file's `entry.size` bytes are read from
     /// `content`; for every other kind it is not read.
     ///
     /// `header_offset` and `data_offset` are the writer's to fill and are
@@ -240,6 +337,15 @@ impl<W: Write> Writer<W> {
         if let Some(acl) = &extras.acl {
             meta::parse_acl(acl)?;
         }
+        // One member per path: the index looks entries up by path, and §10
+        // has no replacing. Checked before anything is written, so a refused
+        // member leaves the archive as it was.
+        if self.paths.contains(&entry.path) {
+            return Err(Error::Refused(format!(
+                "{} is already in the archive; members cannot be replaced (§10)",
+                entry.path_lossy()
+            )));
+        }
         if matches!(entry.kind, Kind::Symlink | Kind::HardLink) && entry.link.is_none() {
             return Err(Error::Refused(format!(
                 "{} has no link target",
@@ -248,6 +354,7 @@ impl<W: Write> Writer<W> {
         }
         let mut headers = Vec::with_capacity(BLOCK * 2);
         let header_len = tar::write_headers(&mut headers, &entry, extras)?;
+        self.paths.insert(entry.path.clone());
         let total = header_len + pad(entry.size);
         let policy = self.options.policy;
 
@@ -305,7 +412,7 @@ impl<W: Write> Writer<W> {
         self.compress_batch()?;
 
         let index = Index {
-            hash_algorithm: 0,
+            hash_algorithm: self.hash_algorithm,
             tar_stream_size: self.stream,
             entries: std::mem::take(&mut self.entries),
         };

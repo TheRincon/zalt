@@ -921,6 +921,101 @@ fn archive_metadata_and_quarantine_through_the_cli() {
 }
 
 #[test]
+fn appending_through_the_cli_and_a_refused_append_changes_nothing() {
+    let t = TempDir::new("archapp");
+    tree(&t.0);
+    fs::create_dir_all(t.0.join("more")).unwrap();
+    fs::write(t.0.join("more/new.txt"), b"appended\n").unwrap();
+    let archive = t.s("a.tar.zst");
+    let run = |args: &[&str]| {
+        Command::new(ZALT)
+            .args(args)
+            .current_dir(&t.0)
+            .output()
+            .unwrap()
+    };
+    let made = run(&["a", "c", "-q", "-o", &archive, "proj"]);
+    assert_eq!(code(&made), 0, "{}", stderr(&made));
+
+    let grown = run(&["a", "r", "-q", &archive, "more"]);
+    assert_eq!(code(&grown), 0, "{}", stderr(&grown));
+    assert_eq!(code(&zalt(&["a", "v", "-q", &archive])), 0);
+    let listed = stdout(&zalt(&["a", "t", &archive]));
+    assert!(listed.lines().any(|l| l == "proj/src/a.txt"), "{listed}");
+    assert!(listed.lines().any(|l| l == "more/new.txt"), "{listed}");
+
+    // Appending what is already there is refused, and the archive is
+    // byte-for-byte what it was, with no copy left beside it.
+    let before = fs::read(&archive).unwrap();
+    let again = run(&["a", "r", "-q", &archive, "more"]);
+    assert_eq!(code(&again), EXIT_INPUT, "{}", stderr(&again));
+    assert!(
+        stderr(&again).contains("already in the archive"),
+        "{}",
+        stderr(&again)
+    );
+    assert_eq!(fs::read(&archive).unwrap(), before);
+    let leftovers: Vec<_> = fs::read_dir(&t.0)
+        .unwrap()
+        .map(|d| d.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("zalt-append"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn recovering_through_the_cli() {
+    let t = TempDir::new("archrec");
+    tree(&t.0);
+    let archive = t.s("a.tar.zst");
+    let made = Command::new(ZALT)
+        .args(["a", "c", "-q", "-o", &archive, "proj"])
+        .current_dir(&t.0)
+        .output()
+        .unwrap();
+    assert_eq!(code(&made), 0);
+
+    // Intact: said so, and nothing written.
+    let fixed = t.s("fixed.tar.zst");
+    let r = zalt(&["a", "recover", &archive, "-o", &fixed]);
+    assert_eq!(code(&r), 0, "{}", stderr(&r));
+    assert!(stderr(&r).contains("intact"), "{}", stderr(&r));
+    assert!(!t.0.join("fixed.tar.zst").exists());
+
+    // The trailer cut off, as a crash or a short copy leaves it.
+    let bytes = fs::read(&archive).unwrap();
+    let cut = t.s("cut.tar.zst");
+    fs::write(&cut, &bytes[..bytes.len() - 200]).unwrap();
+    assert_ne!(code(&zalt(&["a", "v", "-q", &cut])), 0);
+    let r = zalt(&["a", "recover", &cut, "-o", &fixed]);
+    assert_eq!(code(&r), 0, "{}", stderr(&r));
+    assert!(stderr(&r).contains("members recovered"), "{}", stderr(&r));
+    assert_eq!(code(&zalt(&["a", "v", "-q", &fixed])), 0);
+    assert_eq!(
+        stdout(&zalt(&["a", "t", &fixed])),
+        stdout(&zalt(&["a", "t", &archive]))
+    );
+    assert_eq!(
+        fs::read(&cut).unwrap(),
+        &bytes[..bytes.len() - 200],
+        "input untouched"
+    );
+
+    // An output that exists is not overwritten without -f.
+    let r = zalt(&["a", "recover", &cut, "-o", &fixed]);
+    assert_eq!(code(&r), EXIT_INPUT);
+    // And something that is not an archive at all leaves no output behind.
+    let junk = t.s("junk");
+    fs::write(&junk, b"not an archive").unwrap();
+    let nothing = t.s("nothing.tar.zst");
+    assert_eq!(
+        code(&zalt(&["a", "recover", &junk, "-o", &nothing])),
+        EXIT_INPUT
+    );
+    assert!(!t.0.join("nothing.tar.zst").exists());
+}
+
+#[test]
 fn extracting_named_members_takes_them_and_what_is_under_them() {
     let t = TempDir::new("archsel");
     tree(&t.0);
