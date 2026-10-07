@@ -4344,13 +4344,53 @@ header first, where an emptiness check already caught it, and the mutant
 survived). Fuzz `archive_recover`: 147 k more runs, clean, now also asserting
 no member is both kept and lost.
 
-**Open question for the user:** with headers lost and *no* index, the only way
-on is to search later frames for something that parses as a tar header. It
-works for archives of ordinary files, but an archived `.tar` holds valid tar
-headers in its content, which would be misread as members. Not implemented.
+**Search, opt-in (decided 2026-10-06).** With headers lost and *no* index,
+`RecoverOptions::search` (`zalt archive recover --search`) resumes at the next
+frame that *starts* with a valid tar header. It is a guess an archived `.tar`
+can fool — its content is full of valid headers — so every member found that
+way is listed in `Recovered::found_by_search` and printed in full. Two tests
+pin both sides: search recovers what the index-less walk cannot, and when it
+is fooled by an inner tar the invented members are all in `found_by_search`
+(and never appear without `--search`). Disabling the search fails both.
 
-Not done: frames are decoded sequentially in both passes; parallel decode
-would speed up large archives.
+#### Large archives (2026-10-06)
+
+Measured deterministically, since swap stood at 93% and timing would mean
+nothing: `Archive::bytes_decoded()` counts content decoded, so what an
+operation costs is a number a test can assert.
+
+- **Reading decoded each solid group once per member, twice when
+  extracting.** `verify` checked every member's headers by decoding the frame
+  holding them; extraction did that and decoded it again for the content. On
+  400 small files in one group: **`verify` decoded 400x the tar stream,
+  reading every member 799x** — members × group size, which on a real tree is
+  hundreds of times the archive. A 64 MiB LRU of decoded frames, shared by an
+  open `Archive` and handed out as `Arc`s, brings both to **1.0x** (cold,
+  each on a fresh open; regression test in `tests/roundtrip.rs`). The
+  filesystem extractor read directories' and symlinks' headers again in its
+  final passes, after their frames had left the cache; it now reads them in
+  the main pass and keeps the parsed headers (≤1.5x test in `tests/fs.rs`).
+- Recovery's index lookup per frame was a linear scan and its lost-list
+  de-duplication quadratic; now a binary search and a set.
+- **Members past 4 GiB and 8 GiB** round-trip — 5 GiB (165 frames) and 9 GiB
+  (293 frames, with the pax `size` record §9.1 requires past the octal field),
+  built in memory from zeros and checked through a counting sink: 382 MB peak
+  RSS, bounded by the decode batch and the cache, not the archive.
+  `just archive-huge`; ignored by `just test`.
+- **Creating is bounded by the encoder, not the archive layer.** On `crates/`
+  (2.4 MB of tar), `zalt archive create` takes ~8 ms more than `zalt c -3` on
+  the same stream, and `zalt c -3` ran at 0.15x `zstd -3 -T1` (interleaved,
+  best of 7; noisy machine) — consistent with the 4–6x gap at levels 1–3
+  recorded above. Metadata capture costs nothing measurable (87–92 ms with
+  every combination of `--no-acls/--no-xattrs/--no-fflags`). Closing the
+  low-level encoder gap is the lever for large archives.
+- `just archive-bench [CORPUS] [ROUNDS]` (`ci/archive-bench.py`): create,
+  verify, list, extract all, extract one against `gtar | zstd -T0`,
+  interleaved, best-of, as ratios; append and recover against zalt's own
+  verify. Refuses above 75% swap and suspends the language servers itself.
+  Not yet run on a quiet machine.
+
+Not done: recovery decodes frames sequentially in both passes.
 
 #### macOS metadata and descriptor-relative extraction (`native-fs`)
 

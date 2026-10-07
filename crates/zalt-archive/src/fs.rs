@@ -973,7 +973,9 @@ pub fn extract<S: Source + ?Sized>(
                     }
                     Err(_) => dir.create_dir(name).map_err(|err| io(&at, err))?,
                 }
-                directories.push(e);
+                // The headers now, while their frame is fresh: directories
+                // are finished last, by when it may long be out of the cache.
+                directories.push((e, archive.member(e)?));
             }
             Kind::File => {
                 make_room(&dir, name, &at, options.overwrite)?;
@@ -1020,7 +1022,7 @@ pub fn extract<S: Source + ?Sized>(
             Kind::Symlink => {
                 // Deferred, so no write this extraction makes can pass through
                 // a symlink it made.
-                symlinks.push(e);
+                symlinks.push((e, archive.member(e)?));
                 continue;
             }
             Kind::Fifo | Kind::CharDevice | Kind::BlockDevice => {
@@ -1044,10 +1046,9 @@ pub fn extract<S: Source + ?Sized>(
         (warnings.report)(e, Report::Extracted);
     }
 
-    for e in symlinks {
+    for (e, member) in symlinks {
         let (dir, name) = tree.parent(&e.path)?.expect("a symlink is never the root");
         let at = tree.shown(&components(&e.path));
-        let member = archive.member(e)?;
         make_room(&dir, name, &at, options.overwrite)?;
         let target = member.link.as_deref().unwrap_or_default();
         // `symlink_contents`, not `symlink`: cap-std's `symlink` refuses
@@ -1067,13 +1068,12 @@ pub fn extract<S: Source + ?Sized>(
 
     // Directories last, deepest first: their modes may forbid writing into
     // them, and writing their contents would move their mtimes.
-    for e in directories.into_iter().rev() {
+    for (e, member) in directories.into_iter().rev() {
         let (dir, name) = tree.parent(&e.path)?.expect("checked when created");
         let at = tree.shown(&components(&e.path));
         let handle = cap_fs_ext::DirExt::open_dir_nofollow(&dir, name)
             .map_err(|err| io(&at, err))?
             .into_std_file();
-        let member = archive.member(e)?;
         apply(&handle, e, &member, &at, options, false, &mut warnings)?;
     }
     summary.warnings = warnings.count;

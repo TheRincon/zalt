@@ -13,7 +13,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use zalt_archive::read::Archive;
-use zalt_archive::{FramePolicy, ReadLimits, WriterOptions, recover};
+use zalt_archive::{FramePolicy, ReadLimits, RecoverOptions, WriterOptions, recover_with};
 
 fuzz_target!(|data: &[u8]| {
     let options = WriterOptions {
@@ -22,7 +22,12 @@ fuzz_target!(|data: &[u8]| {
         threads: 1,
         creator: None,
     };
-    let Ok((fixed, report)) = recover(data, Vec::new(), options) else {
+    // Both modes: the search guesses where members start, so it is the one
+    // most able to assemble something that does not hold together.
+    let how = RecoverOptions {
+        search: data.len() % 2 == 1,
+    };
+    let Ok((fixed, report)) = recover_with(data, Vec::new(), options, &how) else {
         return;
     };
     assert_eq!(report.kept + report.dropped, data.len() as u64);

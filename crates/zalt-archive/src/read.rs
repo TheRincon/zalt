@@ -131,6 +131,51 @@ pub struct Archive<S: Source + ?Sized> {
     data: Vec<usize>,
     threads: usize,
     max_header_bytes: u64,
+    /// Content bytes decoded so far, by every operation: what reading costs,
+    /// as a number a test can hold to account.
+    decoded: std::sync::atomic::AtomicU64,
+    /// Recently decoded frames. A solid group holds many members, and reading
+    /// each of them — its headers, then its content — would otherwise decode
+    /// the whole group again every time: members × group size, which on a
+    /// real tree is hundreds of times the archive.
+    cache: std::sync::Mutex<FrameCache>,
+}
+
+/// Most bytes of decoded frames kept for reuse. Enough for a solid group and
+/// the large-file chunks around it; bounded, so memory does not grow with the
+/// archive.
+const CACHE_BYTES: u64 = 64 << 20;
+
+/// Least recently used first.
+#[derive(Default)]
+struct FrameCache {
+    frames: std::collections::VecDeque<(usize, std::sync::Arc<Vec<u8>>)>,
+    bytes: u64,
+}
+
+impl FrameCache {
+    fn get(&mut self, i: usize) -> Option<std::sync::Arc<Vec<u8>>> {
+        let at = self.frames.iter().position(|(j, _)| *j == i)?;
+        let hit = self.frames.remove(at)?;
+        let content = hit.1.clone();
+        self.frames.push_back(hit);
+        Some(content)
+    }
+
+    fn put(&mut self, i: usize, content: std::sync::Arc<Vec<u8>>) {
+        let size = content.len() as u64;
+        if size > CACHE_BYTES || self.frames.iter().any(|(j, _)| *j == i) {
+            return;
+        }
+        self.frames.push_back((i, content));
+        self.bytes += size;
+        while self.bytes > CACHE_BYTES {
+            let Some((_, old)) = self.frames.pop_front() else {
+                break;
+            };
+            self.bytes -= old.len() as u64;
+        }
+    }
 }
 
 impl<S: Source + ?Sized> std::fmt::Debug for Archive<S> {
@@ -194,6 +239,8 @@ impl<S: Source + ?Sized> Archive<S> {
             data,
             threads,
             max_header_bytes: limits.max_header_bytes,
+            decoded: std::sync::atomic::AtomicU64::new(0),
+            cache: std::sync::Mutex::new(FrameCache::default()),
         })
     }
 
@@ -225,8 +272,38 @@ impl<S: Source + ?Sized> Archive<S> {
     }
 
     /// Decode one data frame, checked against the seek table.
-    pub(crate) fn decode_frame(&self, i: usize) -> Result<Vec<u8>> {
+    /// Content bytes this archive has decoded so far, across every
+    /// operation. Decoding is where reading spends its time, so this is the
+    /// deterministic measure of what an operation costs.
+    pub fn bytes_decoded(&self) -> u64 {
+        self.decoded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn cached(&self, i: usize) -> Option<std::sync::Arc<Vec<u8>>> {
+        self.cache.lock().ok()?.get(i)
+    }
+
+    fn remember(&self, i: usize, content: &std::sync::Arc<Vec<u8>>) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.put(i, content.clone());
+        }
+    }
+
+    /// Data frame `i`'s content, decoded and checked — or reused, if it was
+    /// decoded recently.
+    pub(crate) fn decode_frame(&self, i: usize) -> Result<std::sync::Arc<Vec<u8>>> {
+        if let Some(content) = self.cached(i) {
+            return Ok(content);
+        }
+        let content = std::sync::Arc::new(self.decode_uncached(i)?);
+        self.remember(i, &content);
+        Ok(content)
+    }
+
+    fn decode_uncached(&self, i: usize) -> Result<Vec<u8>> {
         let f = self.frames[i];
+        self.decoded
+            .fetch_add(f.decompressed_size, std::sync::atomic::Ordering::Relaxed);
         let bytes = self
             .source
             .read_at(f.file_offset, f.compressed_size as usize)?;
@@ -241,31 +318,41 @@ impl<S: Source + ?Sized> Archive<S> {
     }
 
     /// Decode several data frames at once, `self.threads` at a time.
-    fn decode_frames(&self, which: &[usize]) -> Result<Vec<Vec<u8>>> {
-        if which.len() <= 1 || self.threads <= 1 {
-            return which.iter().map(|&i| self.decode_frame(i)).collect();
-        }
-        let mut out = Vec::with_capacity(which.len());
-        for batch in which.chunks(self.threads) {
-            let decoded: Vec<Result<Vec<u8>>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = batch
-                    .iter()
-                    .map(|&i| scope.spawn(move || self.decode_frame(i)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join().unwrap_or_else(|_| {
-                            Err(Error::Refused("a decoding thread panicked".into()))
+    /// Several frames' content, in order: reused where cached, the rest
+    /// decoded in parallel, a batch of `threads` at a time.
+    fn decode_frames(&self, which: &[usize]) -> Result<Vec<std::sync::Arc<Vec<u8>>>> {
+        let mut out: Vec<Option<std::sync::Arc<Vec<u8>>>> =
+            which.iter().map(|&i| self.cached(i)).collect();
+        let missing: Vec<usize> = (0..which.len()).filter(|&k| out[k].is_none()).collect();
+        for batch in missing.chunks(self.threads.max(1)) {
+            let decoded: Vec<Result<Vec<u8>>> = if batch.len() == 1 {
+                vec![self.decode_uncached(which[batch[0]])]
+            } else {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = batch
+                        .iter()
+                        .map(|&k| scope.spawn(move || self.decode_uncached(which[k])))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                Err(Error::Refused("a decoding thread panicked".into()))
+                            })
                         })
-                    })
-                    .collect()
-            });
-            for d in decoded {
-                out.push(d?);
+                        .collect()
+                })
+            };
+            for (&k, content) in batch.iter().zip(decoded) {
+                let content = std::sync::Arc::new(content?);
+                self.remember(which[k], &content);
+                out[k] = Some(content);
             }
         }
-        Ok(out)
+        Ok(out
+            .into_iter()
+            .map(|c| c.expect("every frame filled"))
+            .collect())
     }
 
     /// The data frames whose content intersects `[start, end)` of the stream.

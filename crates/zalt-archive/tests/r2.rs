@@ -593,3 +593,112 @@ fn a_bad_tar_header_inside_a_good_frame_drops_its_run() {
         "and after it, through the index"
     );
 }
+
+// ------------------------------------------------------------------ search
+
+fn search() -> zalt_archive::RecoverOptions {
+    zalt_archive::RecoverOptions { search: true }
+}
+
+/// Headers lost, no trailer, no index: without search the walk stops; with
+/// it, the walk resumes at the next frame that starts with a tar header, and
+/// says which members it found that way.
+#[test]
+fn search_resumes_where_there_is_no_index_and_says_what_it_found() {
+    let bytes = write(&first_batch());
+    let original = open(&bytes);
+    let data: Vec<_> = original
+        .frames()
+        .iter()
+        .filter(|f| f.is_data())
+        .copied()
+        .collect();
+    let victim = data[0];
+    let index = original.frames()[original.frames().len() - 1].file_offset as usize;
+    let mut bad = bytes[..index].to_vec();
+    bad[(victim.file_offset + victim.compressed_size / 2) as usize] ^= 0xff;
+    let touched = touched_by(&original, &victim);
+
+    let (kept, _) = salvaged(&bad, &original);
+    assert!(kept.is_empty());
+
+    let (fixed, report) =
+        zalt_archive::recover_with(bad.as_slice(), Vec::new(), options(), &search()).unwrap();
+    let a = open(&fixed);
+    a.verify().unwrap();
+    let kept: Vec<_> = a.entries().iter().map(|e| e.path.clone()).collect();
+    assert_eq!(kept.len(), original.entries().len() - touched.len());
+    for e in a.entries() {
+        let o = original.find(&e.path).unwrap();
+        assert_eq!(a.entry_bytes(e).unwrap(), original.entry_bytes(o).unwrap());
+    }
+    assert_eq!(
+        report.found_by_search, kept,
+        "everything after the damage was a guess"
+    );
+}
+
+/// Why search is opt-in. An archived `.tar` has valid tar headers in its
+/// content; when the member holding it loses its own header, search takes
+/// up the thread *inside* it, and the inner tar's files come back as if they
+/// were the archive's. They are always in `found_by_search`, so a caller can
+/// tell — this test pins that, and pins that without search they never
+/// appear.
+#[test]
+fn search_can_be_fooled_by_an_archived_tar_and_reports_what_it_found() {
+    // An inner tar of empty files: one header block each, so every block is
+    // a header and every chunk of it starts with one.
+    let mut inner = Vec::new();
+    for i in 0..40 {
+        let e = Entry::new(Kind::File, format!("inner/e{i:02}").into_bytes());
+        zalt_archive::tar::write_headers(&mut inner, &e, &Default::default()).unwrap();
+    }
+    inner.extend_from_slice(&[0u8; 1024]);
+    let members = vec![
+        file("x.txt", b"before\n".to_vec()),
+        file("pkg/inner.tar", inner),
+    ];
+    let bytes = write(&members);
+    let original = open(&bytes);
+    let tarball = original.find(b"pkg/inner.tar").unwrap();
+    // Damage the frame holding the inner tar's own header.
+    let first_chunk = *original
+        .frames()
+        .iter()
+        .find(|f| f.is_data() && f.stream_offset == tarball.header_offset)
+        .unwrap();
+    let index = original.frames()[original.frames().len() - 1].file_offset as usize;
+    let mut bad = bytes[..index].to_vec();
+    bad[(first_chunk.file_offset + first_chunk.compressed_size / 2) as usize] ^= 0xff;
+
+    let (fixed, _) = recover(bad.as_slice(), Vec::new(), options()).unwrap();
+    let plain: Vec<_> = open(&fixed)
+        .entries()
+        .iter()
+        .map(|e| e.path.clone())
+        .collect();
+    assert_eq!(
+        plain,
+        vec![b"x.txt".to_vec()],
+        "without search: nothing invented"
+    );
+
+    let (fixed, report) =
+        zalt_archive::recover_with(bad.as_slice(), Vec::new(), options(), &search()).unwrap();
+    let a = open(&fixed);
+    a.verify().unwrap();
+    let invented: Vec<_> = a
+        .entries()
+        .iter()
+        .filter(|e| e.path.starts_with(b"inner/"))
+        .map(|e| e.path.clone())
+        .collect();
+    assert!(!invented.is_empty(), "the hazard this test exists to show");
+    for p in &invented {
+        assert!(
+            report.found_by_search.contains(p),
+            "{}",
+            String::from_utf8_lossy(p)
+        );
+    }
+}

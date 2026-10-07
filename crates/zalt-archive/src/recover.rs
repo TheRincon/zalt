@@ -32,9 +32,13 @@
 //!   chunk of a file — loses the thread. If the Central Index survived, the
 //!   walk picks it up again at the next member the index says starts at a
 //!   frame boundary, after checking the tar header there names that member.
-//!   Without an index the walk stops: finding the next member by searching
-//!   for something that looks like a tar header would be a guess, and an
-//!   archived `.tar` file is full of things that look like tar headers.
+//!   Without an index the walk stops — unless the caller asks for a
+//!   **search** ([`RecoverOptions::search`]): the walk then takes up the
+//!   thread at the next frame that *starts* with a valid tar header. That is
+//!   a guess, and can be fooled: an archived `.tar` file is full of valid tar
+//!   headers, and a frame that begins with one of them is indistinguishable
+//!   from a frame that begins a member. So it is opt-in, and every member it
+//!   finds is reported in [`Recovered::found_by_search`].
 //!
 //! ## What is kept
 //!
@@ -68,6 +72,17 @@ use crate::tar::{self, BLOCK, Member, pad};
 use crate::write::{Resume, Summary, Writer, WriterOptions};
 use crate::{Error, Result};
 
+/// How hard [`recover_with`] tries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoverOptions {
+    /// Where damage took member headers and no Central Index survived to say
+    /// where the next member starts, resume at the next frame that begins
+    /// with a valid tar header. Off by default: it can mistake the content of
+    /// an archived `.tar` for members. What it finds is listed in
+    /// [`Recovered::found_by_search`].
+    pub search: bool,
+}
+
 /// What [`recover`](fn@recover) found, kept and wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recovered {
@@ -86,6 +101,10 @@ pub struct Recovered {
     /// Whether the walk lost the tar stream at damage and found it again
     /// through the Central Index.
     pub resynced_by_index: bool,
+    /// Members kept that were found by [`RecoverOptions::search`] rather than
+    /// by following the tar stream or the index: probably members, possibly
+    /// the content of an archived `.tar`. Check them.
+    pub found_by_search: Vec<Vec<u8>>,
     /// Bytes of the damaged file written through unchanged.
     pub kept: u64,
     /// The rest of it: damage, an old trailer, incomplete members.
@@ -103,6 +122,8 @@ struct Found {
     entry: Entry,
     end: u64,
     damaged: bool,
+    /// Found after a search resync, so only probably a member.
+    searched: bool,
 }
 
 /// The tar stream, parsed a frame at a time, with gaps where frames were
@@ -118,6 +139,8 @@ struct TarWalk {
     members: Vec<Found>,
     /// Why the tar stream cannot be followed further, until a resync.
     broken: Option<String>,
+    /// Whether the thread was last picked up by a search.
+    searched: bool,
 }
 
 impl TarWalk {
@@ -178,6 +201,7 @@ impl TarWalk {
                 entry: entry_from(m, start),
                 end: start + total,
                 damaged: false,
+                searched: self.searched,
             });
             self.at += total;
             let available = self.pending.len() as u64;
@@ -212,12 +236,14 @@ impl TarWalk {
         ));
     }
 
-    /// Pick the stream up again at `at`, where a member is known to start.
-    fn resync(&mut self, at: u64) {
+    /// Pick the stream up again at `at`, where a member is known — or, after
+    /// a search, believed — to start.
+    fn resync(&mut self, at: u64, searched: bool) {
         self.pending.clear();
         self.skip = 0;
         self.at = at;
         self.broken = None;
+        self.searched = searched;
     }
 }
 
@@ -417,6 +443,16 @@ pub fn recover<S: Source + ?Sized, W: Write>(
     out: W,
     options: WriterOptions,
 ) -> Result<(W, Recovered)> {
+    recover_with(damaged, out, options, &RecoverOptions::default())
+}
+
+/// [`recover`](fn@recover), with [`RecoverOptions`].
+pub fn recover_with<S: Source + ?Sized, W: Write>(
+    damaged: &S,
+    out: W,
+    options: WriterOptions,
+    how: &RecoverOptions,
+) -> Result<(W, Recovered)> {
     let len = damaged.len();
     let max_header = ReadLimits::default().max_header_bytes;
 
@@ -494,14 +530,30 @@ pub fn recover<S: Source + ?Sized, W: Write>(
         // starts here: take it up again, if the tar header agrees.
         if tar.broken.is_some() {
             if let (Some(index), Ok(content)) = (&index, &decoded) {
-                let named = index.entries.iter().find(|e| e.header_offset == stream);
+                // Entries are in stream order (§7.1), so this is a search, not
+                // a scan per frame.
+                let named = index
+                    .entries
+                    .binary_search_by_key(&stream, |e| e.header_offset)
+                    .ok()
+                    .map(|k| &index.entries[k]);
                 let agrees = named.is_some_and(|e| {
                     matches!(tar::parse_member_prefix(content), Ok(Some(m)) if m.path == e.path)
                 });
                 if agrees {
-                    tar.resync(stream);
+                    tar.resync(stream, false);
                     boundary = true;
                     resynced = true;
+                }
+            }
+        }
+        // No index to ask: if asked to, guess that a frame starting with a
+        // valid tar header starts a member.
+        if tar.broken.is_some() && how.search {
+            if let Ok(content) = &decoded {
+                if matches!(tar::parse_member_prefix(content), Ok(Some(_))) {
+                    tar.resync(stream, true);
+                    boundary = true;
                 }
             }
         }
@@ -605,8 +657,9 @@ pub fn recover<S: Source + ?Sized, W: Write>(
             .filter(|e| !kept.contains(e.path.as_slice()))
             .map(|e| e.path.clone())
             .collect();
+        let listed: std::collections::HashSet<Vec<u8>> = named.iter().cloned().collect();
         for p in lost.drain(..) {
-            if !named.contains(&p) {
+            if !listed.contains(&p) {
                 named.push(p);
             }
         }
@@ -619,6 +672,12 @@ pub fn recover<S: Source + ?Sized, W: Write>(
         }
         keep[i] = true;
     }
+
+    let kept_paths_searched: Vec<Vec<u8>> = kept_members
+        .iter()
+        .filter(|(_, m)| m.searched)
+        .map(|(_, m)| m.entry.path.clone())
+        .collect();
 
     // Write: the header, then every kept frame as it was, then the trailer.
     let mut out = out;
@@ -657,6 +716,7 @@ pub fn recover<S: Source + ?Sized, W: Write>(
         writer.splice_frame(&frame, w.content_len, w.checksum)?;
         kept_bytes += w.extent.size;
     }
+    let found_by_search = kept_paths_searched;
     let (out, summary) = writer.finish()?;
     Ok((
         out,
@@ -666,6 +726,7 @@ pub fn recover<S: Source + ?Sized, W: Write>(
             damaged_frames,
             terminator_found: terminator,
             resynced_by_index: resynced,
+            found_by_search,
             kept: kept_bytes,
             dropped: len - kept_bytes,
             stopped,

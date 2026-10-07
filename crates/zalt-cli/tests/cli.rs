@@ -1001,6 +1001,14 @@ fn recovering_through_the_cli() {
         "input untouched"
     );
 
+    // --search is accepted here, and has nothing to guess on clean damage.
+    let searched = t.s("searched.tar.zst");
+    let r = zalt(&["a", "recover", "--search", &cut, "-o", &searched]);
+    assert_eq!(code(&r), 0, "{}", stderr(&r));
+    assert!(!stderr(&r).contains("found by --search"), "{}", stderr(&r));
+    // ...and refused where it means nothing.
+    assert_eq!(code(&zalt(&["a", "v", "--search", &archive])), EXIT_USAGE);
+
     // An output that exists is not overwritten without -f.
     let r = zalt(&["a", "recover", &cut, "-o", &fixed]);
     assert_eq!(code(&r), EXIT_INPUT);

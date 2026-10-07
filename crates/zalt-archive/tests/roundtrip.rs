@@ -375,3 +375,102 @@ fn optional_index_fields_may_be_omitted_but_not_contradict_the_tar_headers() {
         ));
     }
 }
+
+/// Reading a whole archive should decode each frame about once. A solid
+/// group holds many members; decoding the group again for every one of them
+/// — once for its headers, once for its content — costs members × group size,
+/// which on a real tree is hundreds of times the archive.
+#[test]
+fn reading_everything_decodes_each_frame_about_once() {
+    let mut w = Writer::new(Vec::new(), WriterOptions::default()).unwrap();
+    for i in 0..400 {
+        let mut e = Entry::new(Kind::File, format!("many/f{i:04}").into_bytes());
+        let content = pseudo(900, i);
+        e.size = content.len() as u64;
+        w.add(e, &mut content.as_slice()).unwrap();
+    }
+    let bytes = w.finish().unwrap().0;
+    let a = open(bytes.clone()).unwrap();
+    let stream = a.tar_stream_size();
+    a.verify().unwrap();
+    let verify = a.bytes_decoded();
+    // Each measured on a freshly opened archive, so neither rides on the
+    // other's decoding.
+    let b = open(bytes).unwrap();
+    for e in b.entries() {
+        b.entry_bytes(e).unwrap();
+    }
+    let extract = b.bytes_decoded();
+    eprintln!(
+        "tar stream {stream} B: verify decoded {:.1}x, reading every member {:.1}x",
+        verify as f64 / stream as f64,
+        extract as f64 / stream as f64
+    );
+    assert!(verify <= 3 * stream, "verify decoded {verify} for {stream}");
+    assert!(
+        extract <= 3 * stream,
+        "reading every member decoded {extract} for {stream}"
+    );
+}
+
+/// Counts what is written to it and checks it is all zeros, holding nothing.
+struct ZeroSink(u64);
+impl std::io::Write for ZeroSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "content that should be zeros is not"
+        );
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Members past 4 GiB (32-bit sizes) and past 8 GiB (tar's octal size field;
+/// §9.1 requires a pax `size` record), written and read back whole — in
+/// memory, since zeros compress to almost nothing, and checked through a sink
+/// so nothing that size is ever held. Ignored by default: it decodes ~14 GiB.
+/// `just archive-huge` runs it.
+#[test]
+#[ignore = "encodes and decodes ~14 GiB; run with `just archive-huge`"]
+fn members_past_4_and_8_gib_round_trip() {
+    use std::io::Read;
+    for size in [(5u64 << 30) + 123, (9u64 << 30) + 3 * 512 + 7] {
+        let options = WriterOptions {
+            level: 1,
+            threads: 2,
+            ..WriterOptions::default()
+        };
+        let mut w = Writer::new(Vec::new(), options).unwrap();
+        let mut huge = Entry::new(Kind::File, "huge.bin");
+        huge.size = size;
+        w.add(huge, &mut std::io::repeat(0).take(size)).unwrap();
+        let mut after = Entry::new(Kind::File, "after.txt");
+        after.size = 6;
+        w.add(after, &mut &b"after\n"[..]).unwrap();
+        let bytes = w.finish().unwrap().0;
+
+        let a = open(bytes).unwrap();
+        let e = a.find(b"huge.bin").unwrap().clone();
+        assert_eq!(e.size, size);
+        let mut sink = ZeroSink(0);
+        let member = a.copy_entry(&e, &mut sink).unwrap();
+        assert_eq!((sink.0, member.size), (size, size));
+        if size >= 8 << 30 {
+            assert!(
+                member.header_len > 512,
+                "past 8 GiB the size needs a pax record"
+            );
+        }
+        let after = a.find(b"after.txt").unwrap();
+        assert_eq!(a.entry_bytes(after).unwrap(), b"after\n");
+        eprintln!(
+            "{size} B member: archive {} B, {} frames",
+            a.frames().iter().map(|f| f.compressed_size).sum::<u64>(),
+            a.frames().len()
+        );
+    }
+}

@@ -96,6 +96,18 @@ clippy:
 clippy-fix:
     cargo clippy --fix --workspace --all-targets --allow-dirty -- -D warnings
 
+# ZSTA archives at size, against `gtar | zstd`, interleaved; ratios only mean
+# anything on a quiet machine (it refuses above 75% swap). CORPUS defaults to
+# ~/.cargo/registry/src/<index>.
+#   just archive-bench ~/some/dir 5
+archive-bench CORPUS="" ROUNDS="3":
+    python3 ci/archive-bench.py {{CORPUS}} {{ROUNDS}}
+
+# ZSTA members past 4 GiB and 8 GiB, round-tripped in memory (~14 GiB of
+# zeros encoded and decoded; ignored by `just test`).
+archive-huge:
+    cargo test --release -p zalt-archive --test roundtrip members_past_4_and_8_gib -- --ignored --nocapture
+
 # Enforce the layering contract from doc/ZALT-MAC.md §1.
 layering:
     @bash ci/layering.sh

@@ -73,6 +73,11 @@ APPEND
 RECOVER
     -o, --output PATH     where to write the recovered archive (required)
     -f, --force           overwrite an existing output
+    --search              where damage took member headers and no index
+                          survives, resume at the next frame that starts with
+                          a tar header. A guess: an archived .tar's own
+                          contents can be mistaken for members, so everything
+                          found this way is listed for you to check.
     Rebuilds an archive that lost its index and seek table — a write cut
     short — or has damaged frames, keeping every member the damage did not
     touch, byte for byte. Lists the members it could not keep. The damaged
@@ -121,6 +126,7 @@ struct Opts {
     no_acls: bool,
     no_fflags: bool,
     keep_provenance: bool,
+    search: bool,
     paths: Vec<String>,
 }
 
@@ -173,6 +179,7 @@ fn parse(argv: &[String], allowed: &[&str]) -> Result<Opts, Outcome> {
             "--no-acls" => o.no_acls = true,
             "--no-fflags" => o.no_fflags = true,
             "--keep-provenance" => o.keep_provenance = true,
+            "--search" => o.search = true,
             "--threads" => {
                 let raw = take(&mut it, arg)?;
                 o.threads = raw.parse().map_err(|_| {
@@ -241,7 +248,7 @@ pub fn run(argv: &[String]) -> Result<(), Outcome> {
                 "--keep-provenance",
             ],
         )?),
-        "recover" => recover_cmd(parse(rest, &["-o", "-f", "-q"])?),
+        "recover" => recover_cmd(parse(rest, &["-o", "-f", "-q", "--search"])?),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
@@ -418,7 +425,9 @@ fn recover_cmd(o: Opts) -> Result<(), Outcome> {
         level: o.level.unwrap_or(zalt_codec::encode::level::LEVEL_DEFAULT),
         ..WriterOptions::default()
     };
-    let (out, report) = match zalt_archive::recover(&file, BufWriter::new(out), options) {
+    let how = zalt_archive::RecoverOptions { search: o.search };
+    let (out, report) = match zalt_archive::recover_with(&file, BufWriter::new(out), options, &how)
+    {
         Ok(r) => r,
         Err(e) => {
             let _ = std::fs::remove_file(&output);
@@ -448,6 +457,17 @@ fn recover_cmd(o: Opts) -> Result<(), Outcome> {
             }
             if report.lost.len() > SHOWN {
                 eprintln!("    … and {} more", report.lost.len() - SHOWN);
+            }
+        }
+        if !report.found_by_search.is_empty() {
+            // Shown in full, not truncated: these are the ones to check.
+            eprintln!(
+                "  {} member(s) found by --search — probably members, possibly the \
+                 contents of an archived .tar; check them:",
+                report.found_by_search.len()
+            );
+            for path in &report.found_by_search {
+                eprintln!("    {}", String::from_utf8_lossy(path));
             }
         }
         if report.resynced_by_index {

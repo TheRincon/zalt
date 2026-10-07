@@ -64,7 +64,7 @@ pub mod write;
 pub use append::append;
 pub use index::{Entry, Kind};
 pub use read::{Archive, ReadLimits};
-pub use recover::{Recovered, recover};
+pub use recover::{RecoverOptions, Recovered, recover, recover_with};
 pub use write::{FramePolicy, Writer, WriterOptions};
 
 use core::fmt;

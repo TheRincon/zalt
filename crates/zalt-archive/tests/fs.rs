@@ -804,3 +804,30 @@ fn swapping_a_directory_for_a_symlink_mid_extraction_never_escapes() {
     assert!(swaps > 0, "the swapper never ran");
     eprintln!("cap-std extractor: 30 attempts under {swaps} swaps, 0 files escaped");
 }
+
+/// Extracting everything decodes each frame about once — files, and the
+/// directories and symlinks finished after them included.
+#[test]
+fn extracting_everything_decodes_each_frame_about_once() {
+    let mut members = Vec::new();
+    for d in 0..30 {
+        let mut dir = Entry::new(Kind::Directory, format!("t/d{d:02}").into_bytes());
+        dir.mode = 0o755;
+        members.push((dir, vec![]));
+        for f in 0..10 {
+            members.push(file(&format!("t/d{d:02}/f{f}"), &vec![b'a' + f as u8; 700]));
+        }
+        members.push(symlink(&format!("t/d{d:02}/link"), "f0"));
+    }
+    let mut top = Entry::new(Kind::Directory, "t");
+    top.mode = 0o755;
+    members.insert(0, (top, vec![]));
+    let archive = archive_of(members);
+    let dest = Scratch::new("decode-once");
+    extract_all(&archive, &dest.0, &ExtractOptions::default()).unwrap();
+    let ratio = archive.bytes_decoded() as f64 / archive.tar_stream_size() as f64;
+    assert!(
+        ratio <= 1.5,
+        "extraction decoded {ratio:.1}x the tar stream"
+    );
+}
