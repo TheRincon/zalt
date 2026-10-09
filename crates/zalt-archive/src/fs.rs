@@ -955,8 +955,18 @@ pub fn extract<S: Source + ?Sized>(
     let mut symlinks = Vec::new();
     let mut directories = Vec::new();
     let mut held_flags: Vec<(&Entry, std::fs::File, u64)> = Vec::new();
+    // Extracting everything reads the stream in order, so decode a window of
+    // frames ahead, in parallel, whenever the next member lies past the last
+    // one; the filesystem work then finds its frames already decoded. A
+    // selection skips this: the frames between chosen members would be
+    // decoded for nothing.
+    let read_ahead = chosen.len() == archive.entries().len();
+    let mut decoded_until = 0u64;
 
     for e in chosen {
+        if read_ahead && e.data_offset + e.size > decoded_until {
+            decoded_until = archive.prefetch(e.header_offset)?;
+        }
         let Some((dir, name)) = tree.parent(&e.path)? else {
             continue; // "." as a directory entry: the destination itself
         };

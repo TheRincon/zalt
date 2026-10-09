@@ -68,13 +68,27 @@ def fresh(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("corpus", nargs="?", help="directory to archive")
-    ap.add_argument("rounds", nargs="?", type=int, default=3)
+    # Up to two positionals, in either order, either omitted: a bare number is
+    # the round count, anything else the corpus. Two fixed slots meant that
+    # `archive-bench.py 3` — and `just archive-bench` with its empty default
+    # corpus — took the 3 for a directory.
+    ap.add_argument("positional", nargs="*", metavar="[CORPUS] [ROUNDS]",
+                    help="directory to archive (default: the cargo registry); rounds (default 3)")
+    ap.add_argument("--rounds", type=int, help="rounds, as a flag")
     ap.add_argument("--level", type=int, default=3)
     ap.add_argument("--no-suspend", action="store_true",
                     help="leave the language servers running (smoke runs only)")
     ap.add_argument("--force", action="store_true", help="measure even with swap above 75%%")
     args = ap.parse_args()
+
+    numbers = [p for p in args.positional if p.isdigit()]
+    paths = [p for p in args.positional if p and not p.isdigit()]
+    if len(numbers) > 1 or len(paths) > 1:
+        ap.error("expected at most one corpus and one round count")
+    args.corpus = paths[0] if paths else None
+    args.rounds = args.rounds or (int(numbers[0]) if numbers else 3)
+    if args.rounds < 1:
+        ap.error("rounds must be at least 1")
 
     if args.corpus:
         corpus = Path(args.corpus).expanduser().resolve()

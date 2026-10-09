@@ -7,10 +7,12 @@
 //! libzstd's `clevels.h` (1.5.7, read from the vendored source, not recalled):
 //! wider windows and deeper searches as the level rises, greedy parsing at the
 //! bottom, lazy evaluation in the middle, and optimal parsing at the top. The
-//! *values* do not transfer, because the strategies behind them differ — zalt
-//! has one hash-chain finder where libzstd has six — so they were set by
-//! measuring this encoder against libzstd at the same level (`zalt-bench
-//! encode-levels`), not copied.
+//! *values* mostly do not transfer, because the strategies behind them differ —
+//! zalt has four finders where libzstd has six — so they were set by measuring
+//! this encoder against libzstd at the same level (`zalt-bench encode-levels`),
+//! not copied. Levels 1–4 are the exception: they *are* libzstd's `fast` and
+//! `dfast`, with its parameters for large input, because there the algorithm is
+//! the level — see [`Finder::Fast`].
 //!
 //! ## Levels 1 to 19
 //!
@@ -68,6 +70,39 @@ pub enum Finder {
     /// search, so it reaches the longest matches in far fewer steps; it costs a
     /// tree update on every position. Optimal parsing only.
     Tree,
+    /// libzstd's `fast`: one hash table with a single slot per hash, keyed on
+    /// `min_match` bytes, and no chain. Positions are hashed only where they
+    /// are searched, the search steps further the longer it goes without a
+    /// match, and a match's interior is not indexed — two positions per match
+    /// are. Measured before it existed, levels 1–3 on hash chains spent more
+    /// time indexing match interiors and encoding sequences than searching.
+    /// Greedy only.
+    Fast {
+        /// Bytes hashed: 5 to 8. Longer keys collide less on large input.
+        min_match: u8,
+    },
+    /// libzstd's `dfast`: two single-slot tables, one keyed on eight bytes
+    /// (`hash_log` bits) and one on `min_match` (`short_log` bits). A long
+    /// match is preferred; a short one is only taken after checking for a
+    /// long one a byte later. Greedy only.
+    DoubleFast {
+        /// Bytes the short table hashes.
+        min_match: u8,
+        /// Bits of the short table.
+        short_log: u32,
+    },
+    /// libzstd's row-hash finder (`zstd_lazy.c`, 1.5.7), which it uses for its
+    /// greedy to lazy2 levels. Each hash bucket is a row of the `2^row_log`
+    /// most recent positions with that hash, each with a one-byte tag of
+    /// further hash bits; a search compares its tag against the whole row at
+    /// once and fully compares only the positions whose tags match, newest
+    /// first. No chain to chase. A row holds at most 64, so the search depth
+    /// is capped there — which is why libzstd moves to a binary tree above
+    /// its level 12. Greedy and lazy only.
+    Row {
+        /// 4, 5 or 6: rows of 16, 32 or 64 positions.
+        row_log: u8,
+    },
 }
 
 /// The knobs one level sets.
@@ -110,6 +145,47 @@ const fn t(
     }
 }
 
+/// libzstd's `fast`, with its parameters: window, hash bits, bytes hashed.
+const fn fast(window_log: u8, hash_log: u32, min_match: u8) -> Tuning {
+    Tuning {
+        window_log,
+        hash_log,
+        search_depth: 1,
+        parse: Parse::Greedy,
+        finder: Finder::Fast { min_match },
+        target_length: NO_TARGET,
+    }
+}
+
+/// libzstd's `dfast`: window, long-table bits, short-table bits, bytes the
+/// short table hashes.
+const fn dfast(window_log: u8, long_log: u32, short_log: u32, min_match: u8) -> Tuning {
+    Tuning {
+        window_log,
+        hash_log: long_log,
+        search_depth: 1,
+        parse: Parse::Greedy,
+        finder: Finder::DoubleFast {
+            min_match,
+            short_log,
+        },
+        target_length: NO_TARGET,
+    }
+}
+
+/// libzstd's row-hash finder: window, table bits (all rows together), rows of
+/// `2^row_log`, `attempts` candidates per search, and the parse.
+const fn row(window_log: u8, hash_log: u32, row_log: u8, attempts: usize, parse: Parse) -> Tuning {
+    Tuning {
+        window_log,
+        hash_log,
+        search_depth: attempts,
+        parse,
+        finder: Finder::Row { row_log },
+        target_length: NO_TARGET,
+    }
+}
+
 /// The same knobs, searched with a binary tree.
 const fn tree(tuning: Tuning) -> Tuning {
     Tuning {
@@ -141,19 +217,30 @@ const NO_TARGET: usize = usize::MAX;
 ///   effort.
 /// - **Small documents barely care**: every variant tried came within about
 ///   0.3% of the others on the ZTML corpus.
+/// - **5 to 12 search rows** (libzstd's row-hash finder), PROVISIONALLY all
+///   rows of 64 with 64 attempts: on `corpus/` that is 5.7% smaller than the
+///   chains at level 5 and 1.0% at level 9, 1.1% larger at 12 (chains went to
+///   depth 128). libzstd's own row sizes (16–64, 8–64 attempts) cost 2–7%.
+///   The per-level speed/size dial is set once it can be timed on a quiet
+///   machine — see `doc/ZALT-MAC.md`, "Row-hash finder".
+/// - **1 to 4 are libzstd's `fast` and `dfast`**, with the parameters
+///   `clevels.h` gives for input over 256 KB (1.5.7, read from the vendored
+///   copy): windows 19–21, hash bits 14/16 and 17+16/18+18, keys of 7, 6, 5
+///   and 5 bytes. Until 2026-10 these were greedy hash-chain levels running
+///   10–11x libzstd's time on `corpus/`.
 const TABLE: [Tuning; 19] = [
-    t(19, 14, 2, Parse::Greedy, NO_TARGET),                  //  1
-    t(20, 16, 4, Parse::Greedy, NO_TARGET),                  //  2
-    t(21, 17, 6, Parse::Greedy, NO_TARGET),                  //  3
-    t(21, 18, 8, Parse::Lazy(1), NO_TARGET),                 //  4
-    t(21, 18, 12, Parse::Lazy(1), NO_TARGET),                //  5
-    t(21, 19, 16, Parse::Lazy(1), NO_TARGET),                //  6
-    t(21, 19, 24, Parse::Lazy(2), NO_TARGET),                //  7
-    t(21, 20, 32, Parse::Lazy(2), NO_TARGET),                //  8
-    t(22, 20, 48, Parse::Lazy(2), NO_TARGET),                //  9
-    t(22, 21, 64, Parse::Lazy(2), NO_TARGET),                // 10
-    t(22, 21, 96, Parse::Lazy(2), NO_TARGET),                // 11
-    t(22, 22, 128, Parse::Lazy(2), NO_TARGET),               // 12
+    fast(19, 14, 7),                                         //  1
+    fast(20, 16, 6),                                         //  2
+    dfast(21, 17, 16, 5),                                    //  3
+    dfast(21, 18, 18, 5),                                    //  4
+    row(21, 19, 6, 64, Parse::Lazy(1)),                      //  5
+    row(21, 19, 6, 64, Parse::Lazy(1)),                      //  6
+    row(21, 20, 6, 64, Parse::Lazy(2)),                      //  7
+    row(21, 20, 6, 64, Parse::Lazy(2)),                      //  8
+    row(22, 21, 6, 64, Parse::Lazy(2)),                      //  9
+    row(22, 22, 6, 64, Parse::Lazy(2)),                      // 10
+    row(22, 22, 6, 64, Parse::Lazy(2)),                      // 11
+    row(22, 23, 6, 64, Parse::Lazy(2)),                      // 12
     t(22, 22, 192, Parse::Lazy(2), NO_TARGET),               // 13
     t(22, 22, 256, Parse::Lazy(2), NO_TARGET),               // 14
     t(22, 22, 384, Parse::Lazy(2), NO_TARGET),               // 15

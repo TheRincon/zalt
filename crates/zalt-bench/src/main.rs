@@ -128,9 +128,10 @@ fn main() {
             Some(file) => profile_encode(
                 Path::new(file),
                 args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20),
+                args.get(4).and_then(|s| s.parse().ok()),
             ),
             None => {
-                eprintln!("usage: zalt-bench profile-encode <file> [seconds]");
+                eprintln!("usage: zalt-bench profile-encode <file> [seconds] [level]");
                 std::process::exit(2);
             }
         },
@@ -1784,7 +1785,7 @@ fn profile_decode(file: &Path, seconds: u64, force_scalar: bool) {
 /// matcher's allocation. That is not overhead to be hoisted out: §8's workload
 /// is many small resources, one frame each, so per-frame setup is the cost that
 /// dominates and hiding it would profile a function nobody calls.
-fn profile_encode(file: &Path, seconds: u64) {
+fn profile_encode(file: &Path, seconds: u64, level: Option<i32>) {
     let raw = match fs::read(file) {
         Ok(d) => d,
         Err(e) => {
@@ -1792,7 +1793,7 @@ fn profile_encode(file: &Path, seconds: u64) {
             std::process::exit(1);
         }
     };
-    let params = encode_params();
+    let params = level.map_or_else(encode_params, encode_params_at);
 
     // Fail out here rather than once per iteration under the profiler.
     let size = match zalt_codec::encode::compress(&raw, &params) {
@@ -1804,8 +1805,9 @@ fn profile_encode(file: &Path, seconds: u64) {
     };
 
     eprintln!(
-        "profiling encode of {} — {} -> {size} bytes, {seconds}s",
+        "profiling encode of {} at level {} — {} -> {size} bytes, {seconds}s",
         file.display(),
+        params.level,
         raw.len(),
     );
     eprintln!("attach with:  sample {} {seconds}", std::process::id());

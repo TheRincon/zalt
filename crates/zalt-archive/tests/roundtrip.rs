@@ -474,3 +474,45 @@ fn members_past_4_and_8_gib_round_trip() {
         );
     }
 }
+
+/// The same, for an archive many times larger than the frame cache — the
+/// case the first version of the test above missed, because its archive fit
+/// in the cache whole. `verify` then decoded every frame in a parallel pass
+/// and *again*, one thread, to check headers: 2x, found by `just
+/// archive-bench` on a 578 MB tree as 0.30x of `zstd -t`.
+#[test]
+fn verify_decodes_each_frame_once_when_the_archive_outgrows_the_cache() {
+    let options = WriterOptions {
+        policy: FramePolicy {
+            small_file_threshold: 32 << 10,
+            solid_target: 64 << 10,
+            large_chunk: 64 << 10,
+        },
+        ..WriterOptions::default()
+    };
+    let mut w = Writer::new(Vec::new(), options).unwrap();
+    for i in 0..600 {
+        let mut e = Entry::new(Kind::File, format!("many/f{i:04}").into_bytes());
+        let content = pseudo(1500 + (i as usize % 7) * 3000, i);
+        e.size = content.len() as u64;
+        w.add(e, &mut content.as_slice()).unwrap();
+    }
+    let bytes = w.finish().unwrap().0;
+    let limits = ReadLimits {
+        cache_bytes: 160 << 10, // two or three frames
+        ..ReadLimits::default()
+    };
+    let a = Archive::open(bytes.into_boxed_slice(), limits).unwrap();
+    let stream = a.tar_stream_size();
+    assert!(
+        stream > 20 * limits.cache_bytes,
+        "the point is an archive that does not fit"
+    );
+    a.verify().unwrap();
+    let ratio = a.bytes_decoded() as f64 / stream as f64;
+    eprintln!(
+        "verify decoded {ratio:.2}x of a {stream} B stream with a {} B cache",
+        limits.cache_bytes
+    );
+    assert!(ratio <= 1.1, "verify decoded {ratio:.2}x");
+}

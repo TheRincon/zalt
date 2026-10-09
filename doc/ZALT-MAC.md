@@ -3978,6 +3978,111 @@ the dev profile; `debug-assertions` and overflow checks are separate keys and
 stay on, so every `debug_assert!` still runs. The suite is back to about four
 seconds.
 
+##### Encode speed, levels 1 to 19 (2026-10-08)
+
+The baseline, on a quiet machine (`just encode-levels corpus --time`, 61.7 MB,
+mostly `varied.txt`), had levels 1–3 at **10–11x libzstd's time** — not the
+4.4–5.3x quoted above, which was measured on a 4.5 MB "large" set whose
+location was never recorded and is gone. The encoder code had not changed
+since; the gap depends on the corpus.
+
+**The profile overturned the explanation above.** It was not per-position
+search: `Matcher::insert` was 1.5% and entropy-table builds under 1%. At level
+1, `Matcher::parse`'s own loop was 35% (indexing every byte of every match
+interior, inlined), the search 18%, sequence coding ~30%, `offset_code_for`
+8% — and, once those were visible, **three "build both and keep the smaller"
+choices** that the M5 profile, dominated then by the search, had cleared:
+
+1. **libzstd's `fast` and `dfast` for levels 1–4**, from the 1.5.7 source:
+   single-slot tables (one on 7/6 bytes; or 8 bytes + 5 bytes), no chain, two
+   (`fast`) or four (`dfast`) positions indexed per match, `kSearchStrength`
+   stepping, the `ip+1` repeat check and immediate repeats, with `clevels.h`'s
+   parameters for input over 256 KB. Offsets are still coded by asking the
+   decoder. Sizes come out at libzstd's own: the old chain levels were 7–16%
+   *smaller* than `zstd -1..-3`, bought with work libzstd does not do there.
+2. **`offset_code_for`'s shortcut**: an offset that is none of the repeats
+   (nor `repeats[0] − 1` with no literals) can only be a literal offset, so
+   the three trial decodes are skipped; a debug assertion still asks the
+   decoder, and a test checks it against the slow path over a grid.
+3. **The block splitter's second encode.** It encoded everything with fixed
+   strides, then again with the detector's split points wherever it proposed
+   any — which on real data is nearly always — keeping the smaller. Measured
+   on `corpus/` and on a 38 MB tar of 30 registry crates at levels 5, 9 and 19,
+   **the second encode chose the detector's boundaries every time**; encoding
+   once with them is byte-identical, at about half the time (level 5:
+   5.29x → 2.50x; level 9: 6.97x → 3.32x). The splitter is worth 0.013–0.020%
+   on `corpus/` and **~0.2% on the mixed tar** — kept, now at single-encode
+   cost. Given up: the guarantee that splitting can never lose to fixed
+   strides, which held by construction and now holds by measurement. Not at
+   levels 1–4, where the detector alone is ~10% of the time (libzstd does not
+   split there either).
+4. **Sequence tables chosen by estimate, per table, encoded once.** Every
+   block's sequence bitstream was encoded twice — predefined tables and fitted
+   ones, all three switched together — and the smaller kept. Now each of LL,
+   OF and ML picks its table from libzstd's cost estimate
+   (`count × (log − log2 n)` bits, plus the description) and the section is
+   encoded once. **Smaller at every level** (−0.002% to −0.042%), because
+   choosing per table finds mixes the all-or-nothing comparison could not.
+
+Time against libzstd at the same level, and size, before and after (same
+corpus, same machine; swap was higher for the second run, so read the times
+as ±10%):
+
+| level | time before | **time now** | size before | **size now** |
+|---:|---:|---:|---:|---:|
+| 1 | 11.08x | **2.17x** | 0.932x | 0.996x |
+| 2 | — | **2.02x** | — | 0.973x |
+| 3 | 10.12x | **1.91x** | 0.844x | 0.983x |
+| 4 | — | **1.85x** | — | 0.981x |
+| 5 | 5.46x | **2.77x** | 0.881x | 0.881x |
+| 7 | 4.96x | **2.51x** | 0.957x | 0.956x |
+| 9 | 6.88x | **3.34x** | 0.981x | 0.981x |
+| 12 | 7.30x | **4.34x** | 0.988x | 0.987x |
+| 15 | 2.29x | **1.24x** | 1.021x | 1.021x |
+| 17 | 3.09x | **1.45x** | 0.985x | 0.985x |
+| 19 | 2.27x | **1.07x** | 1.000x | 0.999x |
+
+What is left at level 1 (206 MB/s in the profiler): the `fast` loop itself
+39% (libzstd pipelines the hash and load of neighbouring positions; ours is
+serial and bounds-checked), sequence coding ~30%, `memmove` 6%, Huffman 6%.
+The worst remaining gap is the lazy chain levels, 9 and 12 at 3.3–4.3x —
+libzstd 1.5 searches those with its row-hash finder, not chains.
+
+##### Row-hash finder, levels 5 to 12 (2026-10-09, provisional)
+
+libzstd 1.5.7 searches its greedy-to-lazy2 levels (5–12) with a row-hash
+finder, and moves to binary trees at 13. Each hash bucket is a row of the
+16, 32 or 64 most recent positions with a one-byte tag each (8 more hash
+bits); a search compares its tag against the whole row at once and fully
+compares only matching positions, newest first. No chain to chase.
+`Finder::Row` is that, slotted into zalt's existing greedy/lazy loop — repeat
+checks, lazy steps and offset coding unchanged — through `find` and `insert`.
+
+**Tag matching is SWAR in safe Rust** (`tag_matches`: XOR with the tag
+repeated, an exact zero-byte test, a multiply to gather the flags), tested
+against byte-by-byte comparison at every width and on the tags that break
+cheaper tricks. **A NEON version belongs in `zalt-neon`** — the user asked for
+it to be noted; it is kept to that one function so the backend can replace it.
+
+Sizes on `corpus/` (deterministic; the machine was too loaded to time):
+
+| level | chains | rows, libzstd's parameters | same, no long-match skip | **rows of 64, 64 attempts, no skip** |
+|---:|---:|---:|---:|---:|
+| 5 | 3 846 022 | +7.1% | +0.26% | **3 625 273 (−5.7%; 0.830x zstd)** |
+| 9 | 3 485 299 | +6.8% | +3.0% | **3 449 287 (−1.0%; 0.971x)** |
+| 12 | 3 399 360 | +5.0% | +1.1% | **3 436 253 (+1.1%; 0.998x)** |
+
+- **libzstd's long-match rule is not taken.** Its row finder indexes only the
+  first 96 and last 32 positions of a match over 384 bytes; here that cost
+  5–7% of size, because repetitive input lives on exactly those candidates.
+- **Depth matters more than libzstd's row sizes suggest.** "Attempts" count
+  only tag matches, so a row of 64 with 64 attempts is mostly 8 SWAR steps per
+  search — likely cheap, but not yet timed.
+- **Provisional:** levels 5–12 are all rows of 64 with 64 attempts until the
+  per-level speed/size dial can be timed on a quiet machine. Levels 13–15 stay
+  on chains (libzstd uses `btlazy2` there; a tree-backed lazy parse is the
+  equivalent here).
+
 ### M6 container header — design note
 
 Recorded now because the reasoning is easy to lose, not because it is due.
@@ -4388,9 +4493,41 @@ operation costs is a number a test can assert.
   verify, list, extract all, extract one against `gtar | zstd -T0`,
   interleaved, best-of, as ratios; append and recover against zalt's own
   verify. Refuses above 75% swap and suspends the language servers itself.
-  Not yet run on a quiet machine.
 
-Not done: recovery decodes frames sequentially in both passes.
+**First quiet-machine run (2026-10-08), and three fixes it led to.** On a
+578 MB slice of the cargo registry (68 MB archive, 12.4% smaller than
+`gtar | zstd -3`), best of 3, zalt against the stock pipeline doing the same
+job (ratio above 1 is zalt faster):
+
+| operation | first run | after the fixes |
+|---|---:|---:|
+| create | 0.63x | 0.62x |
+| verify (against `zstd -t`) | 0.30x | **0.93x** |
+| list | 7.22x | 7.01x |
+| extract all | 0.58x | **0.72x** |
+| extract one | 10.29x | 10.18x |
+| recover (zalt alone) | 3.96 s | **0.37 s** |
+
+- **`verify` decoded everything twice once an archive outgrew the cache** —
+  a parallel pass over the frames, then a single-threaded one to check
+  headers, because the two checks were written separately and the test
+  archive fit in the cache, which hid the second pass. Now one pass: a
+  window of frames decoded in parallel (`Archive::prefetch`), then the
+  headers of the members it completes. `ReadLimits::cache_bytes` makes the
+  cache size settable, and the regression test now uses an archive forty
+  times its cache: 1.00x, against 2.00x for the old shape.
+- **Extraction decoded one frame at a time**; extracting everything now
+  decodes a window ahead in parallel. (A selection does not, so frames between
+  chosen members are not decoded for nothing.)
+- **Recovery's tar walk removed each member from the front of a frame-sized
+  buffer** — a shift of the rest of the frame per member, quadratic within a
+  solid group of thousands of files, and 90% of recovery's time. It now
+  parses members in place and carries over only a header split across
+  frames. Its decoding is also batched in parallel.
+
+What is left in `create` (0.62x) is the encoder's low-level speed — the
+fast/dfast work next — and in `extract all` (0.72x) the decoder's per-core
+gap to libzstd plus the filesystem work per file.
 
 #### macOS metadata and descriptor-relative extraction (`native-fs`)
 

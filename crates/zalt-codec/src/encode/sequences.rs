@@ -272,15 +272,59 @@ struct Chosen {
     mode: u8,
     /// The description to write, empty for predefined.
     description: Vec<u8>,
-    table: CTable,
+    /// What to build the coding table from, once this table is chosen.
+    table: Prebuilt,
+    /// Estimated bits of state transitions plus description, in
+    /// [`super::optimal::BIT`] units: what [`choose`] compares.
+    cost: u64,
+}
+
+/// A normalised distribution, not yet built into a coding table.
+enum Prebuilt {
+    Default(&'static [i16], u32),
+    Fitted(Vec<i16>, u32),
+}
+
+impl Prebuilt {
+    fn build(&self) -> CTable {
+        match self {
+            Prebuilt::Default(norm, log) => CTable::build(norm, *log),
+            Prebuilt::Fitted(norm, log) => CTable::build(norm, *log),
+        }
+    }
+}
+
+/// Estimated bits of state transitions for `counts` coded against a table
+/// normalised to `norm` at `log`, in [`super::optimal::BIT`] units — or `None`
+/// if the table cannot code a symbol that occurs.
+///
+/// libzstd's estimate (`ZSTD_fseBitCost`): a symbol with `n` of the table's
+/// `2^log` states costs about `log − log2 n` bits, and a less-than-one symbol
+/// (`-1`) costs `log`. FSE spends fractional bits, so this is close rather
+/// than exact — close enough to choose a table by, which is all it is for.
+fn transition_cost(counts: &[u32], norm: &[i16], log: u32) -> Option<u64> {
+    use super::optimal::{BIT, weight};
+    let mut total = 0u64;
+    for (symbol, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let per = match norm.get(symbol).copied().unwrap_or(0) {
+            0 => return None,
+            -1 => log * BIT,
+            n => (log * BIT + BIT).saturating_sub(weight(n as u32 - 1)),
+        };
+        total += u64::from(count) * u64::from(per);
+    }
+    Some(total)
 }
 
 /// Fit a table to this block's own code distribution, or keep the predefined one.
 ///
 /// Predefined tables cost nothing to describe and are tuned for "typical"
 /// data; a fitted table costs a description and pays for it whenever the block
-/// is not typical. Which wins is decided by measurement rather than estimate —
-/// see [`write_sequences`].
+/// is not typical. Which wins is decided by *estimate*, per field — see
+/// [`choose`] and [`write_sequences`].
 fn fit(
     counts: &[u32],
     max_accuracy: u32,
@@ -299,20 +343,48 @@ fn fit(
 
     let mut description = Vec::new();
     enc::write_table_description(&mut description, norm, accuracy);
-    let table = CTable::build(norm, accuracy);
+    let cost = transition_cost(counts, norm, accuracy)?
+        + description.len() as u64 * 8 * u64::from(super::optimal::BIT);
     let _ = (default_norm, default_accuracy);
     Some(Chosen {
         mode: 2,
         description,
-        table,
+        table: Prebuilt::Fitted(norm.to_vec(), accuracy),
+        cost,
     })
+}
+
+/// The cheaper, by estimate, of the predefined table and one fitted to
+/// `counts`. Built only once chosen: the table that loses is never built.
+fn choose(
+    counts: &[u32],
+    max_accuracy: u32,
+    default_norm: &'static [i16],
+    default_accuracy: u32,
+) -> Chosen {
+    let standard = transition_cost(counts, default_norm, default_accuracy).map(|cost| Chosen {
+        mode: 0,
+        description: Vec::new(),
+        table: Prebuilt::Default(default_norm, default_accuracy),
+        cost,
+    });
+    let fitted = fit(counts, max_accuracy, default_norm, default_accuracy);
+    match (standard, fitted) {
+        (Some(p), Some(f)) if f.cost < p.cost => f,
+        (Some(p), _) => p,
+        (None, Some(f)) => f,
+        // Every occurring symbol is coded by the predefined tables at the
+        // sizes this encoder emits; reaching here would be an encoder bug.
+        (None, None) => predefined(default_norm, default_accuracy),
+    }
 }
 
 fn predefined(norm: &'static [i16], accuracy: u32) -> Chosen {
     Chosen {
         mode: 0,
         description: Vec::new(),
-        table: CTable::build(norm, accuracy),
+        table: Prebuilt::Default(norm, accuracy),
+        cost: 0,
     }
 }
 
@@ -358,25 +430,31 @@ fn assemble(coded: &[Coded], ll: &Chosen, of: &Chosen, ml: &Chosen) -> Vec<u8> {
     out.extend_from_slice(&ll.description);
     out.extend_from_slice(&of.description);
     out.extend_from_slice(&ml.description);
-    out.extend_from_slice(&encode_bitstream(coded, &ll.table, &ml.table, &of.table));
+    out.extend_from_slice(&encode_bitstream(
+        coded,
+        &ll.table.build(),
+        &ml.table.build(),
+        &of.table.build(),
+    ));
     out
 }
 
 /// Write the sequences section, fitting tables to the block where that is
 /// smaller than using the predefined ones.
 ///
-/// **Both candidates are built and the smaller kept**, rather than choosing
-/// from an entropy estimate as libzstd does. An estimate has to model the
-/// description's cost as well as the bitstream's, and being wrong is invisible
-/// — it costs ratio, silently, which is the failure mode this encoder keeps
-/// tripping over. Encoding twice is a straightforward cost for an answer that
-/// cannot be worse than the predefined tables it replaces.
+/// **Chosen per table, by estimate, and encoded once** — libzstd's approach.
+/// For each of literals lengths, offsets and match lengths, the predefined
+/// table is set against one fitted to the block plus the cost of describing
+/// it, each priced by [`transition_cost`]; the value bits after each code are
+/// the same under either and do not enter into it.
 ///
-/// The refinement left on the table is choosing *per table* rather than for all
-/// three at once: the modes byte has independent fields, so a block could fit
-/// its literals lengths and keep the predefined offsets. That is eight
-/// candidates instead of two, and worth doing once there is a measurement
-/// asking for it.
+/// This replaced building all three both ways and keeping the smaller
+/// section. That was exact, and it was defended here on the grounds that an
+/// estimate's mistakes cost ratio invisibly. It also encoded every sequence
+/// twice, which once the fast levels' search had been made cheap was the
+/// largest single cost left in them; and it could not choose per table. The
+/// size the estimate costs, at every level, is measured in `doc/ZALT-MAC.md`
+/// (§10, fast levels) rather than assumed.
 pub fn write_sequences(out: &mut Vec<u8>, sequences: &[Sequence]) {
     write_count(out, sequences.len() as u32);
     if sequences.is_empty() {
@@ -396,37 +474,25 @@ pub fn write_sequences(out: &mut Vec<u8>, sequences: &[Sequence]) {
         of_counts[usize::from(c.of)] += 1;
     }
 
-    let baseline = assemble(
-        &coded,
-        &predefined(&fse::LL_DEFAULT, fse::LL_DEFAULT_ACCURACY),
-        &predefined(&fse::OF_DEFAULT, fse::OF_DEFAULT_ACCURACY),
-        &predefined(&fse::ML_DEFAULT, fse::ML_DEFAULT_ACCURACY),
-    );
-
-    let fitted = fit(
+    let ll = choose(
         &ll_counts,
         fse::LL_ACCURACY_MAX,
         &fse::LL_DEFAULT,
         fse::LL_DEFAULT_ACCURACY,
-    )
-    .zip(fit(
+    );
+    let of = choose(
         &of_counts,
         fse::OF_ACCURACY_MAX,
         &fse::OF_DEFAULT,
         fse::OF_DEFAULT_ACCURACY,
-    ))
-    .zip(fit(
+    );
+    let ml = choose(
         &ml_counts,
         fse::ML_ACCURACY_MAX,
         &fse::ML_DEFAULT,
         fse::ML_DEFAULT_ACCURACY,
-    ))
-    .map(|((ll, of), ml)| assemble(&coded, &ll, &of, &ml));
-
-    match fitted {
-        Some(f) if f.len() < baseline.len() => out.extend_from_slice(&f),
-        _ => out.extend_from_slice(&baseline),
-    }
+    );
+    out.extend_from_slice(&assemble(&coded, &ll, &of, &ml));
 }
 
 #[cfg(test)]

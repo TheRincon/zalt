@@ -89,6 +89,10 @@ pub struct ReadLimits {
     /// — are read whole, so this is §13's bound on xattr size; the default
     /// leaves room for a large resource fork.
     pub max_header_bytes: u64,
+    /// Most bytes of decoded frames kept for reuse. Members that share a
+    /// solid group share its decode through this, and sequential reads
+    /// decode a window of frames ahead, in parallel, into it.
+    pub cache_bytes: u64,
 }
 
 impl Default for ReadLimits {
@@ -98,6 +102,7 @@ impl Default for ReadLimits {
             max_frames: 1 << 24,
             threads: 0,
             max_header_bytes: 64 << 20,
+            cache_bytes: 64 << 20,
         }
     }
 }
@@ -131,6 +136,7 @@ pub struct Archive<S: Source + ?Sized> {
     data: Vec<usize>,
     threads: usize,
     max_header_bytes: u64,
+    cache_bytes: u64,
     /// Content bytes decoded so far, by every operation: what reading costs,
     /// as a number a test can hold to account.
     decoded: std::sync::atomic::AtomicU64,
@@ -141,16 +147,13 @@ pub struct Archive<S: Source + ?Sized> {
     cache: std::sync::Mutex<FrameCache>,
 }
 
-/// Most bytes of decoded frames kept for reuse. Enough for a solid group and
-/// the large-file chunks around it; bounded, so memory does not grow with the
-/// archive.
-const CACHE_BYTES: u64 = 64 << 20;
-
-/// Least recently used first.
+/// Least recently used first, at most `limit` bytes — bounded, so memory
+/// does not grow with the archive.
 #[derive(Default)]
 struct FrameCache {
     frames: std::collections::VecDeque<(usize, std::sync::Arc<Vec<u8>>)>,
     bytes: u64,
+    limit: u64,
 }
 
 impl FrameCache {
@@ -164,12 +167,12 @@ impl FrameCache {
 
     fn put(&mut self, i: usize, content: std::sync::Arc<Vec<u8>>) {
         let size = content.len() as u64;
-        if size > CACHE_BYTES || self.frames.iter().any(|(j, _)| *j == i) {
+        if size > self.limit || self.frames.iter().any(|(j, _)| *j == i) {
             return;
         }
         self.frames.push_back((i, content));
         self.bytes += size;
-        while self.bytes > CACHE_BYTES {
+        while self.bytes > self.limit {
             let Some((_, old)) = self.frames.pop_front() else {
                 break;
             };
@@ -239,8 +242,12 @@ impl<S: Source + ?Sized> Archive<S> {
             data,
             threads,
             max_header_bytes: limits.max_header_bytes,
+            cache_bytes: limits.cache_bytes,
             decoded: std::sync::atomic::AtomicU64::new(0),
-            cache: std::sync::Mutex::new(FrameCache::default()),
+            cache: std::sync::Mutex::new(FrameCache {
+                limit: limits.cache_bytes,
+                ..FrameCache::default()
+            }),
         })
     }
 
@@ -501,25 +508,39 @@ impl<S: Source + ?Sized> Archive<S> {
     /// missing from the index would leave a gap, and be caught here, where a
     /// stock `tar -x` would extract it without the index ever mentioning it.
     pub fn verify(&self) -> Result<()> {
-        for batch in self.data.chunks(self.threads.max(1)) {
-            self.decode_frames(batch)?;
+        // One pass in stream order: a window of frames decoded in parallel,
+        // then the headers of every member that window completes, checked
+        // while it is still in the cache. Decoding everything first and
+        // checking afterwards decoded every frame twice — the second time on
+        // one thread — once an archive outgrew the cache.
+        let mut entries = self.index.entries.iter().peekable();
+        let mut expected = 0u64;
+        let mut covered = 0u64;
+        while covered < self.index.tar_stream_size {
+            covered = self.prefetch(covered)?;
+            while let Some(e) = entries.next_if(|e| e.data_offset <= covered) {
+                if e.header_offset != expected {
+                    return Err(Error::Inconsistent(format!(
+                        "{} starts at {} but the previous member ended at {expected}",
+                        e.path_lossy(),
+                        e.header_offset
+                    )));
+                }
+                self.check_headers(e)?;
+                expected = e.data_offset + pad(e.size);
+            }
         }
-        let terminator = self.frames[*self.data.last().expect("open requires one")];
-        let zeros = self.decode_frame(*self.data.last().expect("open requires one"))?;
+        if let Some(e) = entries.next() {
+            return Err(Error::Inconsistent(format!(
+                "{} lies past the end of the tar stream",
+                e.path_lossy()
+            )));
+        }
+        let last = *self.data.last().expect("open requires one");
+        let terminator = self.frames[last];
+        let zeros = self.decode_frame(last)?;
         if zeros.len() < 2 * BLOCK || zeros.iter().any(|&b| b != 0) {
             return format_err("the Terminator is not at least 1024 zero bytes (§5.4)");
-        }
-        let mut expected = 0u64;
-        for e in &self.index.entries {
-            if e.header_offset != expected {
-                return Err(Error::Inconsistent(format!(
-                    "{} starts at {} but the previous member ended at {expected}",
-                    e.path_lossy(),
-                    e.header_offset
-                )));
-            }
-            self.check_headers(e)?;
-            expected = e.data_offset + pad(e.size);
         }
         if expected != terminator.stream_offset {
             return Err(Error::Inconsistent(format!(
@@ -529,6 +550,35 @@ impl<S: Source + ?Sized> Archive<S> {
             )));
         }
         Ok(())
+    }
+
+    /// Decode, in parallel, the frames from the one holding stream offset
+    /// `from` onward — as many as fit in half the cache, and at least one —
+    /// and return the stream offset where they end. Reading in stream order
+    /// calls this whenever it reaches the end of the last window, so the
+    /// frames it then reads are decoded already, on every core.
+    pub fn prefetch(&self, from: u64) -> Result<u64> {
+        let first = self.data.partition_point(|&i| {
+            let f = &self.frames[i];
+            f.stream_offset + f.decompressed_size <= from
+        });
+        let budget = (self.cache_bytes / 2).max(1);
+        let mut window = Vec::new();
+        let mut bytes = 0u64;
+        for &i in &self.data[first..] {
+            let size = self.frames[i].decompressed_size;
+            if !window.is_empty() && bytes + size > budget {
+                break;
+            }
+            window.push(i);
+            bytes += size;
+        }
+        let Some(&last) = window.last() else {
+            return Ok(self.index.tar_stream_size);
+        };
+        self.decode_frames(&window)?;
+        let f = self.frames[last];
+        Ok(f.stream_offset + f.decompressed_size)
     }
 }
 

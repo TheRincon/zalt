@@ -190,40 +190,40 @@ pub fn compress(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() + MAX_HEADER + 16);
     frame::write_header(&mut out, input.len() as u64, params);
 
-    let header_len = out.len();
-    block::write_all(
-        &mut out,
-        input,
-        &split::fixed(input.len(), block_size),
-        tuning,
-        params.window_log,
-    );
-
-    // Block splitting, §7 — attempted only where the content justifies it.
+    // Block boundaries: §7's split points where the content changes
+    // character, fixed strides otherwise — decided *before* encoding, and
+    // encoded once.
     //
-    // `transitions` returns nothing unless the byte distribution actually
-    // changes, which on measured corpora is every real file. So the common case
-    // never reaches this branch and never pays to encode twice; content that
-    // genuinely changes character partway through does, and keeps whichever
-    // came out smaller. That comparison is what makes the feature unable to
-    // regress: the fixed-stride blocks above are always the floor.
-    if compress {
-        let candidate = split::transitions(input, block_size);
-        if !candidate.is_empty() {
-            let mut alternative = Vec::with_capacity(out.len());
-            block::write_all(
-                &mut alternative,
-                input,
-                &candidate,
-                tuning,
-                params.window_log,
-            );
-            if alternative.len() < out.len() - header_len {
-                out.truncate(header_len);
-                out.extend_from_slice(&alternative);
-            }
-        }
-    }
+    // This used to encode with fixed strides, then — wherever the detector
+    // proposed split points — encode the whole input again with them and keep
+    // the smaller. That made the splitter unable to lose, and cost a second full
+    // encode wherever it fired, which on real data is nearly everywhere: about
+    // 2.1x the time at levels 5 and 9. Measured on `corpus/` and on a 38 MB tar
+    // of mixed crates, at levels 5, 9 and 19, the second encode chose the
+    // detector's boundaries *every time*; encoding once with them gives
+    // byte-identical output. The guarantee given up is that splitting can never
+    // come out larger than fixed strides — kept by measurement now, not by
+    // construction (doc/ZALT-MAC.md §10, "The splitter's second encode").
+    //
+    // Never at the fast levels: the detector alone is ~10% of their time for
+    // a few hundredths of a percent, and libzstd does not split there either.
+    let fast = tuning.is_some_and(|t| {
+        matches!(
+            t.finder,
+            level::Finder::Fast { .. } | level::Finder::DoubleFast { .. }
+        )
+    });
+    let proposed = if compress && !fast {
+        split::transitions(input, block_size)
+    } else {
+        Vec::new()
+    };
+    let boundaries = if proposed.is_empty() {
+        split::fixed(input.len(), block_size)
+    } else {
+        proposed
+    };
+    block::write_all(&mut out, input, &boundaries, tuning, params.window_log);
 
     frame::write_epilogue(&mut out, input, params);
     Ok(out)

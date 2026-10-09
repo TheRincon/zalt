@@ -158,10 +158,26 @@ impl TarWalk {
         if self.skip > 0 {
             return;
         }
-        self.pending.extend_from_slice(data);
+        // Members are parsed in place, from the frame itself. Only headers a
+        // frame ends in the middle of are carried over, to be joined with the
+        // next. (The first version copied every frame into a buffer and
+        // removed each member from its front — a shift of the rest of the
+        // frame per member, which on a solid group of thousands of small
+        // files made recovery ten times slower than `verify`.)
+        let joined;
+        let stream: &[u8] = if self.pending.is_empty() {
+            data
+        } else {
+            let mut carried = std::mem::take(&mut self.pending);
+            carried.extend_from_slice(data);
+            joined = carried;
+            &joined
+        };
         let limits = IndexLimits::default();
-        while !self.pending.is_empty() {
-            if self.pending.len() >= BLOCK && self.pending[..BLOCK].iter().all(|&b| b == 0) {
+        let mut pos = 0usize;
+        while pos < stream.len() {
+            let rest = &stream[pos..];
+            if rest.len() >= BLOCK && rest[..BLOCK].iter().all(|&b| b == 0) {
                 self.broken = Some(format!(
                     "end-of-archive blocks at stream offset {} are inside a data frame, \
                      not a Terminator of their own (§5.4)",
@@ -169,15 +185,17 @@ impl TarWalk {
                 ));
                 return;
             }
-            let m = match tar::parse_member_prefix(&self.pending) {
+            let m = match tar::parse_member_prefix(rest) {
                 Ok(Some(m)) => m,
                 Ok(None) => {
-                    if self.pending.len() as u64 > max_header {
+                    if rest.len() as u64 > max_header {
                         self.broken = Some(format!(
                             "the member at stream offset {} has over {max_header} bytes of headers",
                             self.at
                         ));
+                        return;
                     }
+                    self.pending = rest.to_vec();
                     return;
                 }
                 Err(e) => {
@@ -204,12 +222,11 @@ impl TarWalk {
                 searched: self.searched,
             });
             self.at += total;
-            let available = self.pending.len() as u64;
+            let available = rest.len() as u64;
             if available >= total {
-                self.pending.drain(..total as usize);
+                pos += total as usize;
             } else {
                 self.skip = total - available;
-                self.pending.clear();
                 return;
             }
         }
@@ -418,6 +435,53 @@ fn damaged_len(frame: &[u8], listed: Option<(u64, u32)>) -> Option<u64> {
         .filter(|&n| n > 0 && n % BLOCK as u64 == 0)
 }
 
+/// A frame read, and — if it is a data frame — decoded.
+struct Prepared {
+    frame: std::result::Result<Vec<u8>, String>,
+    decoded: Option<std::result::Result<Vec<u8>, String>>,
+}
+
+/// Read `batch` in order, and decode its data frames in parallel.
+fn prepare<S: Source + ?Sized>(src: &S, batch: &[Extent]) -> std::collections::VecDeque<Prepared> {
+    let frames: Vec<std::result::Result<Vec<u8>, String>> = batch
+        .iter()
+        .map(|x| {
+            src.read_at(x.offset, x.size as usize)
+                .map_err(|e| e.to_string())
+        })
+        .collect();
+    // What pass 2 will treat as a data frame: anything not skippable, or
+    // listed with content (a data frame whose magic was the damage).
+    let is_data = |x: &Extent, f: &[u8]| {
+        let magic = if f.len() >= 4 { le32(f) } else { 0 };
+        !zalt_codec::magic::is_zstd_skippable(magic) || x.listed.is_some_and(|(n, _)| n > 0)
+    };
+    let decoded: Vec<Option<std::result::Result<Vec<u8>, String>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = batch
+            .iter()
+            .zip(&frames)
+            .map(|(x, f)| match f {
+                Ok(f) if is_data(x, f) => Some(scope.spawn(move || decode_data_frame(f, x.listed))),
+                _ => None,
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("a decoding thread panicked".into()))
+                })
+            })
+            .collect()
+    });
+    frames
+        .into_iter()
+        .zip(decoded)
+        .map(|(frame, decoded)| Prepared { frame, decoded })
+        .collect()
+}
+
 /// One frame pass 2 went through.
 struct Walked {
     extent: Extent,
@@ -485,8 +549,21 @@ pub fn recover_with<S: Source + ?Sized, W: Write>(
     let mut terminator = false;
     let mut damaged_frames = 0u64;
     let mut resynced = false;
-    for x in &extents {
-        let frame = match damaged.read_at(x.offset, x.size as usize) {
+    // Frames are read in order and decoded a batch at a time, one per core;
+    // the walk below then takes them in order, exactly as before.
+    let threads = match options.threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    };
+    let mut ready: std::collections::VecDeque<Prepared> = std::collections::VecDeque::new();
+    for (k, x) in extents.iter().enumerate() {
+        if ready.is_empty() {
+            ready = prepare(damaged, &extents[k..extents.len().min(k + threads)]);
+        }
+        let Some(Prepared { frame, decoded }) = ready.pop_front() else {
+            break;
+        };
+        let frame = match frame {
             Ok(f) => f,
             Err(e) => {
                 stopped = Some(format!("unreadable at offset {}: {e}", x.offset));
@@ -524,7 +601,7 @@ pub fn recover_with<S: Source + ?Sized, W: Write>(
             }
         }
 
-        let decoded = decode_data_frame(&frame, x.listed);
+        let decoded = decoded.unwrap_or_else(|| decode_data_frame(&frame, x.listed));
         let mut boundary = tar.at_boundary();
         // Lost the thread at damage, and the index knows where a member
         // starts here: take it up again, if the tar header agrees.

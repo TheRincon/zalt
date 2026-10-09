@@ -82,6 +82,12 @@ const SEARCH_DEPTH: usize = 32;
 /// that taking it costs.
 const LAZY_MARGIN: usize = 1;
 
+/// The fast finders' step: after a miss, the next position searched is one
+/// further on for every `2^SEARCH_STRENGTH` bytes since the last match —
+/// libzstd's `kSearchStrength`. Incompressible stretches are crossed quickly;
+/// the first match ends the acceleration.
+const SEARCH_STRENGTH: u32 = 8;
+
 /// Largest hash table the matcher will build, as a log2.
 ///
 /// Also the *only* size it used to build. A 2^17 table of `u32` is 512 KiB, and
@@ -149,6 +155,69 @@ fn hash4(bytes: &[u8], hash_log: u32) -> usize {
     (v.wrapping_mul(2_654_435_761) >> (32 - hash_log)) as usize
 }
 
+/// libzstd's multiplicative hashes of the low `n` bytes of a little-endian
+/// word (`zstd_compress_internal.h`, 1.5.7). The shift left discards the bytes
+/// past `n` before multiplying, so only those `n` bytes reach the top bits the
+/// shift right keeps.
+fn hash_n(word: u64, n: u8, log: u32) -> usize {
+    const PRIME5: u64 = 889_523_592_379;
+    const PRIME6: u64 = 227_718_039_650_203;
+    const PRIME7: u64 = 58_295_818_150_454_627;
+    const PRIME8: u64 = 0xCF1B_BCDC_B7A5_6463;
+    let product = match n {
+        5 => (word << 24).wrapping_mul(PRIME5),
+        6 => (word << 16).wrapping_mul(PRIME6),
+        7 => (word << 8).wrapping_mul(PRIME7),
+        _ => word.wrapping_mul(PRIME8),
+    };
+    (product >> (64 - log)) as usize
+}
+
+/// Which bytes of `row` equal `tag`: bit `i` of the result for byte `i`. A
+/// row is 16, 32 or 64 bytes.
+///
+/// The row finder's one data-parallel step, kept to this function so a NEON
+/// version can take its place from `zalt-neon` (the crate allowed `unsafe`).
+/// This one is SWAR in safe Rust: per eight bytes, XOR with the tag repeated
+/// makes matching bytes zero; the exact zero-byte test below flags them in
+/// each byte's top bit (no false positives, unlike the cheaper `x − 0x01…`
+/// form), and a multiply gathers the eight flags into one byte.
+fn tag_matches(row: &[u8], tag: u8) -> u64 {
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    // Bit 8k (one per byte) to bit 56 + k: byte k's flag times 2^(56 − 7k).
+    // No two terms land on one bit, so nothing carries into the top byte.
+    const GATHER: u64 = 0x0102_0408_1020_4080;
+    let pattern = u64::from(tag) * 0x0101_0101_0101_0101;
+    let mut mask = 0u64;
+    for (i, chunk) in row.chunks_exact(8).enumerate() {
+        let x = u64::from_le_bytes(chunk.try_into().expect("eight bytes")) ^ pattern;
+        let zero = !(((x & LOW7) + LOW7) | x) & HIGH;
+        mask |= ((zero >> 7).wrapping_mul(GATHER) >> 56) << (8 * i);
+    }
+    mask
+}
+
+/// Bytes the row finder hashes — libzstd's `BOUNDED(4, minMatch, 6)` for
+/// its levels 5–12, which all set 5.
+const ROW_HASH_BYTES: u8 = 5;
+
+/// Eight bytes at `pos`, or `None` within eight of the end — the fast
+/// finders hash and compare whole words.
+fn word_at(input: &[u8], pos: usize) -> Option<u64> {
+    input
+        .get(pos..)?
+        .first_chunk::<8>()
+        .map(|w| u64::from_le_bytes(*w))
+}
+
+fn four_at(input: &[u8], pos: usize) -> Option<u32> {
+    input
+        .get(pos..)?
+        .first_chunk::<4>()
+        .map(|w| u32::from_le_bytes(*w))
+}
+
 /// How far two slices agree, from their starts.
 ///
 /// **A word at a time**, which is where the encoder's time was going. This is
@@ -206,6 +275,26 @@ fn offset_code_for(
     offset: u32,
     literals_zero: bool,
 ) -> (u32, [u32; REP_COUNT]) {
+    // Most offsets are new, and a new offset can only be written one way. The
+    // repeat codes resolve to `repeats[0..3]`, or — the `literals_length == 0`
+    // shift — to `repeats[1]`, `repeats[2]` and `repeats[0] - 1`; an offset
+    // that is none of those is a literal offset, and the decoder's table after
+    // it is the old one shifted down. Trying all three repeat codes first made
+    // this 8% of encode time at level 1. The decoder still has the last word,
+    // in every debug build.
+    let named = offset == repeats[0]
+        || offset == repeats[1]
+        || offset == repeats[2]
+        || (literals_zero && offset == repeats[0].wrapping_sub(1));
+    if !named {
+        let value = offset + REP_COUNT as u32;
+        let after = [offset, repeats[0], repeats[1]];
+        debug_assert!({
+            let mut trial = repeats;
+            resolve_offset(value, literals_zero, &mut trial) == Ok(offset) && trial == after
+        });
+        return (value, after);
+    }
     for candidate in 1..=REP_COUNT as u32 {
         let mut trial = repeats;
         if resolve_offset(candidate, literals_zero, &mut trial) == Ok(offset) {
@@ -300,8 +389,18 @@ fn relax(
 
 /// A match finder whose history persists across the blocks of one frame.
 pub struct Matcher {
-    /// Most recent position for each hash.
+    /// Most recent position for each hash. For [`Finder::DoubleFast`], the
+    /// short table.
     head: Vec<u32>,
+    /// [`Finder::DoubleFast`]'s long table, keyed on eight bytes. Empty
+    /// otherwise.
+    long: Vec<u32>,
+    long_log: u32,
+    /// [`Finder::Row`]'s tags, one byte per slot of `head`; each row's first
+    /// byte is instead the row's head index. Empty otherwise.
+    tags: Vec<u8>,
+    /// `log2` of the row length, for [`Finder::Row`]; 0 otherwise.
+    row_log: u32,
     /// Bits of hash `head` is indexed by. Sized to the input — see
     /// [`hash_log_for`].
     hash_log: u32,
@@ -399,23 +498,49 @@ impl Matcher {
                 .checked_next_power_of_two()
                 .unwrap_or(window),
         );
-        let hash_log = hash_log_for(input_len, tuning.hash_log);
         // A tree only where something can use it: the lazy parse searches
         // positions it may then skip inserting, and in a tree searching *is*
         // inserting. Level tables pair them correctly; this keeps a wrong
-        // pairing from ever reaching the lazy loop.
+        // pairing from ever reaching the lazy loop. The fast finders have their
+        // own greedy loops and nothing else.
         let finder = match (tuning.finder, tuning.parse) {
             (Finder::Tree, ParseMode::Optimal { .. }) => Finder::Tree,
+            (f @ (Finder::Fast { .. } | Finder::DoubleFast { .. }), ParseMode::Greedy) => f,
+            (f @ Finder::Row { .. }, ParseMode::Greedy | ParseMode::Lazy(_)) => f,
             _ => Finder::Chain,
+        };
+        let (hash_log, long_log) = match finder {
+            Finder::DoubleFast { short_log, .. } => (
+                hash_log_for(input_len, short_log),
+                hash_log_for(input_len, tuning.hash_log),
+            ),
+            _ => (hash_log_for(input_len, tuning.hash_log), 0),
         };
         // Whichever structure is not in use is a single slot rather than a
         // window's worth, so a tree level does not also pay to clear a chain.
         let (chain_size, tree_size) = match finder {
             Finder::Chain => (chain_size, 0),
             Finder::Tree => (1, chain_size),
+            Finder::Fast { .. } | Finder::DoubleFast { .. } | Finder::Row { .. } => (1, 0),
+        };
+        let row_log = match finder {
+            Finder::Row { row_log } => u32::from(row_log),
+            _ => 0,
         };
         Self {
             head: vec![EMPTY; 1 << hash_log],
+            long: if long_log > 0 {
+                vec![EMPTY; 1 << long_log]
+            } else {
+                Vec::new()
+            },
+            long_log,
+            tags: if row_log > 0 {
+                vec![0; 1 << hash_log]
+            } else {
+                Vec::new()
+            },
+            row_log,
             hash_log,
             chain: vec![EMPTY; chain_size],
             chain_mask: chain_size - 1,
@@ -439,9 +564,96 @@ impl Matcher {
     }
 
     fn insert(&mut self, input: &[u8], pos: usize) {
+        if self.row_log > 0 {
+            return self.insert_row(input, pos);
+        }
         let h = hash4(&input[pos..], self.hash_log);
         self.chain[pos & self.chain_mask] = self.head[h];
         self.head[h] = pos as u32;
+    }
+
+    /// The row a position hashes to, as the index of its first slot, and its
+    /// tag — or `None` within eight bytes of the end, where it cannot be
+    /// hashed.
+    fn row_of(&self, input: &[u8], pos: usize) -> Option<(usize, u8)> {
+        let hash = hash_n(word_at(input, pos)?, ROW_HASH_BYTES, self.hash_log + 8);
+        let row = ((hash >> 8) << self.row_log) & (self.head.len() - 1);
+        Some((row, hash as u8))
+    }
+
+    /// Put `pos` at the head of its row, over the oldest entry. Slot 0 of each
+    /// row holds the head index rather than a position, as in libzstd, so a
+    /// row of `2^row_log` keeps `2^row_log − 1` positions.
+    fn insert_row(&mut self, input: &[u8], pos: usize) {
+        let Some((row, tag)) = self.row_of(input, pos) else {
+            return;
+        };
+        let mask = (1usize << self.row_log) - 1;
+        let mut next = usize::from(self.tags[row]).wrapping_sub(1) & mask;
+        if next == 0 {
+            next = mask;
+        }
+        self.tags[row] = next as u8;
+        self.tags[row + next] = tag;
+        self.head[row + next] = pos as u32;
+    }
+
+    /// The row finder's search: the candidates in `pos`'s row whose tag
+    /// matches, newest first, up to `depth` of them, compared in full.
+    fn find_row(&self, input: &[u8], pos: usize, limit: usize) -> Option<(usize, usize)> {
+        let available = limit.saturating_sub(pos);
+        if available < MIN_MATCH {
+            return None;
+        }
+        let (row, tag) = self.row_of(input, pos)?;
+        let entries = 1usize << self.row_log;
+        let mask = entries - 1;
+        let head = usize::from(self.tags[row]) & mask;
+        // Slot 0 is the head index, never a position.
+        let matches = tag_matches(&self.tags[row..row + entries], tag) & !1;
+        // Rotate so bit 0 is the head: ascending bits are then newest first.
+        let all = if entries == 64 {
+            u64::MAX
+        } else {
+            (1u64 << entries) - 1
+        };
+        let mut order = if head == 0 {
+            matches
+        } else {
+            ((matches >> head) | (matches << (entries - head))) & all
+        };
+
+        let mut best_len = 0usize;
+        let mut best_offset = 0usize;
+        let mut attempts = self.depth;
+        while order != 0 && attempts > 0 {
+            let slot = (head + order.trailing_zeros() as usize) & mask;
+            order &= order - 1;
+            let candidate = self.head[row + slot];
+            let c = candidate as usize;
+            if candidate == EMPTY || c >= pos {
+                continue;
+            }
+            // Newest first, so every later candidate is further back still.
+            if pos - c > self.max_offset {
+                break;
+            }
+            attempts -= 1;
+            // As in `find`: only a candidate that agrees where the best
+            // match ends can be longer than it.
+            if best_len > 0 && input[c + best_len] != input[pos + best_len] {
+                continue;
+            }
+            let length = common_prefix(&input[c..], &input[pos..pos + available]);
+            if length > best_len {
+                best_len = length;
+                best_offset = pos - c;
+                if best_len == available || best_len >= self.target_length {
+                    break;
+                }
+            }
+        }
+        (best_len >= MIN_MATCH).then_some((best_len, best_offset))
     }
 
     /// Longest match at `pos`, searching back through the chain.
@@ -449,6 +661,9 @@ impl Matcher {
     /// Returns `(length, offset)`. `limit` is the position matching may not run
     /// past — the block's tail boundary.
     fn find(&self, input: &[u8], pos: usize, limit: usize) -> Option<(usize, usize)> {
+        if self.row_log > 0 {
+            return self.find_row(input, pos, limit);
+        }
         let available = limit.saturating_sub(pos);
         if available < MIN_MATCH {
             return None;
@@ -602,8 +817,12 @@ impl Matcher {
             let mut step = 1;
             if self.indexed < hashable {
                 match self.finder {
+                    // The fast finders never reach the optimal parser —
+                    // `with_tuning` pairs them with greedy parsing only — and
+                    // would index nothing here if they did.
                     Finder::Chain => self.insert(input, self.indexed),
                     Finder::Tree => step = self.tree_update(input, self.indexed, 0, 0, None),
+                    Finder::Fast { .. } | Finder::DoubleFast { .. } | Finder::Row { .. } => {}
                 }
             }
             // Never past `target`. The parser is about to search there, and
@@ -1115,6 +1334,10 @@ impl Matcher {
     /// Index every position in a range that has four bytes to hash.
     fn index_range(&mut self, input: &[u8], from: usize, to: usize) {
         let end = to.min(input.len().saturating_sub(MIN_MATCH - 1));
+        // Every position, for the row finder too. libzstd's row finder indexes
+        // only the first 96 and last 32 positions of a match over 384 bytes;
+        // measured here (2026-10-09, `corpus/`) that rule cost 5–7% of size at
+        // levels 5 and 12 — it lost the candidates repetitive input lives on.
         for pos in from..end {
             self.insert(input, pos);
         }
@@ -1128,6 +1351,15 @@ impl Matcher {
     pub fn parse(&mut self, input: &[u8], start: usize, end: usize) -> Parse {
         if let ParseMode::Optimal { .. } = self.mode {
             return self.parse_optimal(input, start, end);
+        }
+        match self.finder {
+            Finder::Fast { min_match } => return self.parse_fast(input, start, end, min_match),
+            Finder::DoubleFast { min_match, .. } => {
+                return self.parse_double_fast(input, start, end, min_match);
+            }
+            // The row finder searches inside the shared greedy/lazy loop
+            // below, through `find` and `insert`.
+            Finder::Chain | Finder::Tree | Finder::Row { .. } => {}
         }
         // Both grow to some fraction of the block and both are rebuilt for
         // every block, so starting them at zero spends the block's first
@@ -1248,6 +1480,265 @@ impl Matcher {
             literals,
         }
     }
+
+    /// Emit a sequence: the literals since `anchor`, then `length` bytes from
+    /// `offset` back, its offset code chosen by asking the decoder.
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &mut self,
+        parse: &mut Parse,
+        input: &[u8],
+        anchor: usize,
+        pos: usize,
+        length: usize,
+        offset: usize,
+    ) {
+        let literal_length = (pos - anchor) as u32;
+        let offset_value = self.choose_offset_value(offset as u32, literal_length);
+        parse.literals.extend_from_slice(&input[anchor..pos]);
+        parse.sequences.push(Sequence {
+            literal_length,
+            match_length: length as u32,
+            offset: offset as u32,
+            offset_value,
+        });
+    }
+
+    /// Whether `candidate` is a usable earlier position for a match at `pos`:
+    /// present, before it, and inside the window.
+    fn usable(&self, candidate: u32, pos: usize) -> bool {
+        let c = candidate as usize;
+        candidate != EMPTY && c < pos && pos - c <= self.max_offset
+    }
+
+    /// Length of a match at repeat `offset` from `pos`, if its first four bytes
+    /// agree — libzstd's repcode check, which costs one compare when it fails.
+    fn repeat_at(&self, input: &[u8], pos: usize, limit: usize, offset: u32) -> Option<usize> {
+        let offset = offset as usize;
+        if offset == 0 || offset > pos || offset > self.max_offset || pos + MIN_MATCH > limit {
+            return None;
+        }
+        if four_at(input, pos - offset)? != four_at(input, pos)? {
+            return None;
+        }
+        Some(common_prefix(&input[pos - offset..], &input[pos..limit]))
+    }
+
+    /// Extend a match backwards over literals it can absorb, as libzstd does:
+    /// the position that found it is often a byte or two past where it begins.
+    fn catch_up(
+        input: &[u8],
+        anchor: usize,
+        mut pos: usize,
+        mut length: usize,
+        offset: usize,
+    ) -> (usize, usize) {
+        while pos > anchor && pos > offset && input[pos - 1] == input[pos - 1 - offset] {
+            pos -= 1;
+            length += 1;
+        }
+        (pos, length)
+    }
+
+    /// After a match ending at `pos`: while the second most recent offset
+    /// matches again right here, take it with no literals — libzstd's
+    /// "immediate repcode". Returns where the run of them ends.
+    fn immediate_repeats(
+        &mut self,
+        parse: &mut Parse,
+        input: &[u8],
+        mut pos: usize,
+        limit: usize,
+        mut index: impl FnMut(&mut Self, &[u8], usize),
+    ) -> usize {
+        // After a sequence with literals the decoder's table is
+        // [offset, older, oldest]; a sequence with none names `repeats[1]` by
+        // code 1. `choose_offset_value` finds that code; this only proposes.
+        while let Some(length) = self.repeat_at(input, pos, limit, self.repeats[1]) {
+            let offset = self.repeats[1] as usize;
+            index(self, input, pos);
+            self.emit(parse, input, pos, pos, length, offset);
+            pos += length;
+        }
+        pos
+    }
+
+    /// Level 1–2's parse: libzstd's `fast` (`zstd_fast.c`, 1.5.7).
+    ///
+    /// One table, one candidate. Each position searched is hashed and
+    /// written; a miss steps on, one byte further for every 256 bytes since
+    /// the last match; a match is extended backwards, taken, and leaves two
+    /// positions indexed — two in, two from the end — before checking for an
+    /// immediate repeat. Nothing else is inserted, which is most of the speed:
+    /// the chain levels indexed every byte of every match.
+    fn parse_fast(&mut self, input: &[u8], start: usize, end: usize, min_match: u8) -> Parse {
+        let mut parse = Parse {
+            sequences: Vec::with_capacity((end - start) / 32),
+            literals: Vec::with_capacity((end - start) / 4),
+        };
+        let log = self.hash_log;
+        let hash =
+            |input: &[u8], pos: usize| word_at(input, pos).map(|w| hash_n(w, min_match, log));
+        if end - start <= TAIL + MIN_MATCH {
+            parse.literals.extend_from_slice(&input[start..end]);
+            return parse;
+        }
+        let limit = end - TAIL;
+        let mut pos = start;
+        let mut anchor = start;
+        while pos + MIN_MATCH <= limit {
+            let Some(h) = hash(input, pos) else { break };
+            let candidate = self.head[h];
+            self.head[h] = pos as u32;
+            let searched = pos;
+
+            // The most recent offset, a byte on: the commonest match there is
+            // in structured data, and the cheapest to code.
+            let found = if let Some(length) = self.repeat_at(input, pos + 1, limit, self.repeats[0])
+            {
+                Some((pos + 1, length, self.repeats[0] as usize))
+            } else if self.usable(candidate, pos)
+                && four_at(input, candidate as usize) == four_at(input, pos)
+            {
+                let offset = pos - candidate as usize;
+                let length = common_prefix(&input[candidate as usize..], &input[pos..limit]);
+                let (at, length) = Self::catch_up(input, anchor, pos, length, offset);
+                Some((at, length, offset))
+            } else {
+                None
+            };
+            let Some((at, length, offset)) = found else {
+                pos += ((pos - anchor) >> SEARCH_STRENGTH) + 1;
+                continue;
+            };
+
+            self.emit(&mut parse, input, anchor, at, length, offset);
+            pos = at + length;
+            anchor = pos;
+            if pos <= limit {
+                for p in [searched + 2, pos - 2] {
+                    if let Some(h) = hash(input, p) {
+                        self.head[h] = p as u32;
+                    }
+                }
+                pos = self.immediate_repeats(&mut parse, input, pos, limit, |m, input, p| {
+                    if let Some(h) = hash(input, p) {
+                        m.head[h] = p as u32;
+                    }
+                });
+                anchor = pos;
+            }
+        }
+        parse.literals.extend_from_slice(&input[anchor..end]);
+        parse
+    }
+
+    /// Level 3–4's parse: libzstd's `dfast` (`zstd_double_fast.c`, 1.5.7).
+    ///
+    /// Two tables, written at every position searched: a long one keyed on
+    /// eight bytes, and a short one on `min_match`. A long hit is taken; a
+    /// short one only after checking whether the long table has something
+    /// longer a byte later. After a match, four positions are indexed and
+    /// immediate repeats taken, as in [`Matcher::parse_fast`].
+    fn parse_double_fast(
+        &mut self,
+        input: &[u8],
+        start: usize,
+        end: usize,
+        min_match: u8,
+    ) -> Parse {
+        let mut parse = Parse {
+            sequences: Vec::with_capacity((end - start) / 32),
+            literals: Vec::with_capacity((end - start) / 4),
+        };
+        let (short_log, long_log) = (self.hash_log, self.long_log);
+        let short = move |input: &[u8], pos: usize| {
+            word_at(input, pos).map(|w| hash_n(w, min_match, short_log))
+        };
+        let long =
+            move |input: &[u8], pos: usize| word_at(input, pos).map(|w| hash_n(w, 8, long_log));
+        if end - start <= TAIL + MIN_MATCH {
+            parse.literals.extend_from_slice(&input[start..end]);
+            return parse;
+        }
+        let limit = end - TAIL;
+        let mut pos = start;
+        let mut anchor = start;
+        while pos + MIN_MATCH <= limit {
+            let (Some(hl), Some(hs)) = (long(input, pos), short(input, pos)) else {
+                break;
+            };
+            let (cl, cs) = (self.long[hl], self.head[hs]);
+            self.long[hl] = pos as u32;
+            self.head[hs] = pos as u32;
+            let searched = pos;
+
+            let found = if let Some(length) = self.repeat_at(input, pos + 1, limit, self.repeats[0])
+            {
+                Some((pos + 1, length, self.repeats[0] as usize))
+            } else if self.usable(cl, pos)
+                && pos + 8 <= limit
+                && word_at(input, cl as usize) == word_at(input, pos)
+            {
+                let offset = pos - cl as usize;
+                let length = common_prefix(&input[cl as usize..], &input[pos..limit]);
+                let (at, length) = Self::catch_up(input, anchor, pos, length, offset);
+                Some((at, length, offset))
+            } else if self.usable(cs, pos) && four_at(input, cs as usize) == four_at(input, pos) {
+                let mut offset = pos - cs as usize;
+                let mut at = pos;
+                let mut length = common_prefix(&input[cs as usize..], &input[pos..limit]);
+                // A long match a byte on beats the short one in hand.
+                if let Some(h1) = long(input, pos + 1) {
+                    let c1 = self.long[h1];
+                    self.long[h1] = (pos + 1) as u32;
+                    if self.usable(c1, pos + 1)
+                        && pos + 1 + 8 <= limit
+                        && word_at(input, c1 as usize) == word_at(input, pos + 1)
+                    {
+                        let l1 = common_prefix(&input[c1 as usize..], &input[pos + 1..limit]);
+                        if l1 > length {
+                            (at, length, offset) = (pos + 1, l1, pos + 1 - c1 as usize);
+                        }
+                    }
+                }
+                let (at, length) = Self::catch_up(input, anchor, at, length, offset);
+                Some((at, length, offset))
+            } else {
+                None
+            };
+            let Some((at, length, offset)) = found else {
+                pos += ((pos - anchor) >> SEARCH_STRENGTH) + 1;
+                continue;
+            };
+
+            self.emit(&mut parse, input, anchor, at, length, offset);
+            pos = at + length;
+            anchor = pos;
+            if pos <= limit {
+                let p = searched + 2;
+                if let (Some(hl), Some(hs)) = (long(input, p), short(input, p)) {
+                    self.long[hl] = p as u32;
+                    self.head[hs] = p as u32;
+                }
+                if let Some(h) = long(input, pos - 2) {
+                    self.long[h] = (pos - 2) as u32;
+                }
+                if let Some(h) = short(input, pos - 1) {
+                    self.head[h] = (pos - 1) as u32;
+                }
+                pos = self.immediate_repeats(&mut parse, input, pos, limit, |m, input, p| {
+                    if let (Some(hl), Some(hs)) = (long(input, p), short(input, p)) {
+                        m.long[hl] = p as u32;
+                        m.head[hs] = p as u32;
+                    }
+                });
+                anchor = pos;
+            }
+        }
+        parse.literals.extend_from_slice(&input[anchor..end]);
+        parse
+    }
 }
 
 #[cfg(test)]
@@ -1306,6 +1797,166 @@ mod tests {
         }
         out.extend_from_slice(&parse.literals[lit..]);
         out.split_off(base)
+    }
+
+    /// The literal-offset shortcut in `offset_code_for` gives exactly what
+    /// asking the decoder for every code gives, over a grid of repeat tables,
+    /// offsets and both literal-length cases.
+    #[test]
+    fn offset_codes_take_the_shortcut_only_where_it_agrees_with_the_decoder() {
+        let slow = |repeats: [u32; REP_COUNT], offset: u32, zero: bool| {
+            for candidate in 1..=REP_COUNT as u32 {
+                let mut trial = repeats;
+                if resolve_offset(candidate, zero, &mut trial) == Ok(offset) {
+                    return (candidate, trial);
+                }
+            }
+            let mut trial = repeats;
+            resolve_offset(offset + 3, zero, &mut trial).unwrap();
+            (offset + 3, trial)
+        };
+        for a in 1..7 {
+            for b in 1..7 {
+                for c in 1..7 {
+                    for offset in 1..10 {
+                        for zero in [false, true] {
+                            let r = [a, b, c];
+                            assert_eq!(
+                                offset_code_for(r, offset, zero),
+                                slow(r, offset, zero),
+                                "{r:?} {offset} {zero}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The SWAR tag match agrees with comparing byte by byte, at every row
+    /// width, for tags whose bit patterns stress the trick: 0x00 and 0xFF, and
+    /// 0x80 and 0x7F, where a borrow or carry between bytes would show.
+    #[test]
+    fn tag_matching_agrees_with_comparing_each_byte() {
+        let mut s = 0x9E37_79B9u32;
+        let mut next = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 24) as u8
+        };
+        for entries in [16usize, 32, 64] {
+            for round in 0..2000 {
+                let tag = match round % 5 {
+                    0 => 0x00,
+                    1 => 0xFF,
+                    2 => 0x80,
+                    3 => 0x7F,
+                    _ => next(),
+                };
+                // Rows dense with the tag and its neighbours, and random ones.
+                let row: Vec<u8> = (0..entries)
+                    .map(|_| match next() % 4 {
+                        0 => tag,
+                        1 => tag.wrapping_add(1),
+                        2 => tag ^ 0x80,
+                        _ => next(),
+                    })
+                    .collect();
+                let expected = row
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| **b == tag)
+                    .fold(0u64, |m, (i, _)| m | 1 << i);
+                assert_eq!(tag_matches(&row, tag), expected, "{row:02x?} tag {tag:02x}");
+            }
+        }
+    }
+
+    /// Levels 5–12 (the row finder) account for every byte and replay to the
+    /// input across blocks.
+    #[test]
+    fn the_row_finder_parses_and_replays_across_blocks() {
+        let mut input = Vec::new();
+        for i in 0..400u32 {
+            input.extend_from_slice(format!("line {} of the log: status ok\n", i % 37).as_bytes());
+        }
+        input.extend(core::iter::repeat_n(0x41u8, 3000));
+        let mut s = 0x1234_5678u32;
+        input.extend((0..5000).map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 24) as u8
+        }));
+        let copy = input[100..4000].to_vec();
+        input.extend_from_slice(&copy);
+        for level in 5..=12 {
+            let tuning = super::super::level::tuning(level);
+            assert!(matches!(tuning.finder, Finder::Row { .. }), "level {level}");
+            let mut m = Matcher::with_tuning(tuning, 22, input.len());
+            let mut start = 0;
+            let mut matched = 0;
+            while start < input.len() {
+                let end = (start + 3001).min(input.len());
+                let parse = m.parse(&input, start, end);
+                assert_accounts_for(&input[start..end], &parse);
+                assert_eq!(
+                    replay(&input[..start], &parse),
+                    &input[start..end],
+                    "level {level} at {start}"
+                );
+                matched += parse
+                    .sequences
+                    .iter()
+                    .map(|q| q.match_length as usize)
+                    .sum::<usize>();
+                start = end;
+            }
+            // About 80% of the input is compressible — the log lines, the run
+            // and the copy; only the noise is not. A finder that silently
+            // found nothing would still replay, so hold it to finding most.
+            assert!(
+                matched * 10 >= input.len() * 6,
+                "level {level} matched only {matched} of {} bytes",
+                input.len()
+            );
+        }
+    }
+
+    /// Levels 1–4 (the fast finders) account for every byte and replay to the
+    /// input, block after block over shared history — text, runs, noise and
+    /// near-repeats, so every branch of both loops is taken.
+    #[test]
+    fn the_fast_finders_parse_and_replay_across_blocks() {
+        let mut input = Vec::new();
+        for i in 0..400u32 {
+            input.extend_from_slice(format!("line {} of the log: status ok\n", i % 37).as_bytes());
+        }
+        input.extend(core::iter::repeat_n(0x41u8, 3000));
+        let mut s = 0x1234_5678u32;
+        input.extend((0..5000).map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 24) as u8
+        }));
+        let copy = input[100..4000].to_vec();
+        input.extend_from_slice(&copy);
+        for level in 1..=4 {
+            let tuning = super::super::level::tuning(level);
+            assert!(matches!(
+                tuning.finder,
+                Finder::Fast { .. } | Finder::DoubleFast { .. }
+            ));
+            let mut m = Matcher::with_tuning(tuning, 22, input.len());
+            let mut start = 0;
+            while start < input.len() {
+                let end = (start + 3001).min(input.len());
+                let parse = m.parse(&input, start, end);
+                assert_accounts_for(&input[start..end], &parse);
+                assert_eq!(
+                    replay(&input[..start], &parse),
+                    &input[start..end],
+                    "level {level} at {start}"
+                );
+                start = end;
+            }
+        }
     }
 
     #[test]

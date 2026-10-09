@@ -1,16 +1,11 @@
 //! # zalt-ztml — L3, the instance
 //!
-//! The first recipe. `doc/ZALT-MAC.md` §8 is the only section of that document
-//! that discusses ZTML, and this is the only crate that may name it — every
-//! layer below is content-blind by construction and CI greps them for it.
+//! This is the only crate that has any mention of ZTML
 //!
 //! ## Almost all of this crate is in `data/`
-//!
-//! That is the design working. §3: *"If it accumulates meaningful amounts of
-//! Rust, that is a signal the seam in `zalt-recipe` is too narrow."* What is
-//! here is a manifest, a dictionary, and the few lines needed to hand them to a
-//! caller. `ci/layering.sh` counts the lines and complains if that stops being
-//! true.
+//! What is here is a manifest, a dictionary, and the few lines needed to hand
+//! them to a caller. `ci/layering.sh` counts the lines and complains if that
+//! stops being true.
 //!
 //! ## Why the manifest exists twice
 //!
@@ -32,10 +27,10 @@
 //! `zalt-recipe-train` builds it and `just ztml-sweep` is where the level came
 //! from.
 //!
-//! It is a *raw-content* dictionary, so it carries no `Dictionary_ID`. That is
-//! the exact shape RFC 9842 §5 specifies for `dcz`, which supplies the identity
-//! out of band as a SHA-256 — see `zalt_recipe::dcz`, and the note in
-//! `data/ztml.toml` for what the missing ID still costs everywhere else.
+//! It is a *raw-content* dictionary, so it carries no `Dictionary_ID`.
+//! RFC 9842 §5 specifies for `dcz`, which supplies the identity as a SHA-256
+//! — see `zalt_recipe::dcz`, and the note in `data/ztml.toml`
+//! for what the missing ID still costs everywhere else.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -111,10 +106,7 @@ pub fn recipe() -> Recipe {
     }
 }
 
-/// The recipe with its dictionary already parsed, ready to route.
-///
-/// The dictionary is embedded, so this resolves without a filesystem — the
-/// baked-in path from §7's three load routes.
+/// The recipe with its (embedded) dictionary already parsed, ready to route.
 pub fn entry() -> Result<zalt_recipe::Entry, zalt_codec::error::Error> {
     Ok(zalt_recipe::Entry {
         recipe: recipe(),

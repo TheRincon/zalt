@@ -529,6 +529,7 @@ concurrent DIR="corpus/ztml" THREADS="":
 #
 #   just profile-encode doc/rfc8878.txt
 #   just profile-encode corpus/ztml/showcase.zdoc 10
+#   just profile-encode corpus/varied.txt 14 1      (at level 1)
 #
 # The encode counterpart of `profile-decode`, and it earned its place the same
 # way: the gap ratio says how far behind libzstd we are and never which part is
@@ -537,12 +538,12 @@ concurrent DIR="corpus/ztml" THREADS="":
 # reverted because the profile's explanation turned out not to predict a
 # measurement. See doc/ZALT-MAC.md §10.
 [doc("Leaf-weighted profile of encoding one file.")]
-profile-encode FILE SECS="14":
+profile-encode FILE SECS="14" LEVEL="":
     #!/usr/bin/env bash
     set -uo pipefail
     cargo build --release -q -p zalt-bench || exit 1
     out=$(mktemp -t zalt-encode-sample)
-    ./target/release/zalt-bench profile-encode "{{FILE}}" "{{SECS}}" &
+    ./target/release/zalt-bench profile-encode "{{FILE}}" "{{SECS}}" {{LEVEL}} &
     pid=$!
     sleep 2
     sample "$pid" "$(( {{SECS}} - 3 ))" -mayDie -f "$out" >/dev/null 2>&1
