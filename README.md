@@ -1,8 +1,10 @@
 # zalt
 
-A clean-room **Zstandard (RFC 8878)** implementation in Rust, built to be
+An independent **Zstandard (RFC 8878)** implementation in Rust, built to be
 embedded in a hostile-input setting — a browser, an app, anything that handles
-bytes it did not create.
+bytes it did not create. The decoder is written from the RFC; the encoder uses
+libzstd as its reference, and says where (see
+[Acknowledgements](#acknowledgements)).
 
 Three things it tries to be, in order. Each is useful without the ones below it:
 
@@ -19,7 +21,7 @@ real document; this file is the map.
 
 ## Status
 
-> **pre-release (`0.0.1`).** Not published to crates.io. 
+> **Pre-release (`0.0.1`).** Not published to crates.io.
 
 | Milestone | | |
 |---|---|---|
@@ -29,6 +31,8 @@ real document; this file is the map.
 | M3 | Apple Silicon tuning | ✅ |
 | M4 | Recipes and dictionaries | ✅ |
 | M5 | Encoder — correctness first, then ratio | ✅ |
+| M6 | `zalt::native` cache codec | gated: ships only if it beats `zstd -3` |
+| M7 | ZSTA archives: create, extract, append, recover | ✅ |
 
 ---
 
@@ -44,8 +48,11 @@ real document; this file is the map.
 - Bound memory: a window cap checked at header parse, lazy window allocation,
   and a global budget across live decoders.
 - Expose a C ABI with a hand-written header and a panic-proof boundary.
-- Encode modern zstd frames, bit exactly.
-- Dictionaries
+- Encode zstd frames at levels 1–19 that the reference `zstd` decodes; the
+  scalar and NEON backends produce identical bytes.
+- Decode with dictionaries, and build content-prefix dictionaries from samples.
+- Write and read ZSTA archives: a valid `.tar.zst` that is also randomly
+  accessible, with per-entry BLAKE3 (or XXH3) hashes and recovery past damage.
 
 **Deliberately never**
 
@@ -230,20 +237,22 @@ crates for higher-layer vocabulary and fails the build on a hit.
 
 | Layer | Crate | Concern | Knows about |
 |---|---|---|---|
-| L1 | `zalt-codec` | RFC 8878: parse and decode | Bytes. Nothing else. |
+| L1 | `zalt-codec` | RFC 8878: parse, decode and encode | Bytes. Nothing else. |
 | L1a | `zalt-neon` | SIMD kernels behind the same interfaces | CPU architecture |
 | L2 | `zalt-embed` | Streaming, budget, pooling, allocators | Host process constraints |
+| L3 | `zalt-recipe` | Tuning manifests and dictionary selection, as data | Recipes, not content |
+| L3 | `zalt-ztml` | The ZTML recipe: a manifest and a dictionary | One content class |
+| — | `zalt-archive` | ZSTA archives built from standard zstd frames | Files and metadata |
 | — | `zalt-ffi` | C ABI, hand-written header | The boundary |
 | — | `zalt-cli` | `zalt(1)` | Files and flags |
 | — | `zalt-bench` | Throughput harness, profiling | Corpora |
+| — | `zalt-recipe-train` | Dev tool: build and measure dictionaries | Sample sets |
+| — | `zsta-seekable-probe` | Test-only: checks ZSTA against zstd's seekable reader | The reference C |
 
 `zalt-codec` is `no_std + alloc` and architecture-neutral: it may not contain
 the words `neon`, `aarch64`, `darwin`, or any content class. Acceleration
 reaches it only through the `backend` trait seam, and the scalar implementation
 is never deleted — it is the Miri-testable oracle and the portability story.
-
-Crates arriving later (`zalt-recipe`, `zalt-ztml`, `zalt-darwin`) are
-deliberately absent rather than empty.
 
 ---
 
@@ -305,6 +314,7 @@ are unchecked.
 | `just miri` | UB detection over the scalar path (Miri cannot run NEON) |
 | `just no-std` | `zalt-codec` still cross-compiles to `thumbv7em-none-eabi` |
 | `just ffi-smoke` | a real C program compiles and links against the staticlib |
+| `just deny` | every dependency is permissively licensed, from crates.io, with no known advisory |
 | `fuzz/` | hostile input, differential vs libzstd, round-trip, streaming and backend equivalence |
 
 **The errors directory is the important one.** Round-trip tests only ever prove
@@ -319,16 +329,66 @@ both now pinned as regression tests.
 ```
 crates/          the workspace (see the layering table above)
 doc/ZALT-MAC.md  the design document — rationale, milestones, every measurement
-doc/rfc8878.txt  the spec, vendored
+doc/ZSTA_SPEC.md the ZSTA archive format specification (draft 0.2)
+doc/rfc8878.txt  the zstd spec, vendored
 ci/              layering and ABI checks, git hooks
 fuzz/            cargo-fuzz targets (its own workspace)
-zstd-fixtures/   facebook/zstd's own regression corpus
+zstd-fixtures/   facebook/zstd's own regression corpus (BSD, see its LICENSE)
 corpus/          benchmark corpora — gitignored, local, rebuilt by `just bench-corpus`
 justfile         one entry point for every task; CI runs the same recipes
 ```
 
 ---
 
+## Acknowledgements
+
+zalt builds on other people's work, and tries to say exactly where.
+
+- **Zstandard**, by Yann Collet and the zstd contributors at Meta.
+  [RFC 8878](doc/rfc8878.txt) (Y. Collet and M. Kucherawy) is what the decoder
+  is written from. libzstd 1.5.7 is the reference everything here is measured
+  against, and the encoder's starting point. These follow its source, and the
+  module docs say how closely:
+  - the shape of the level table (`clevels.h`);
+  - the `fast` and `dfast` finders, with libzstd's parameters, for levels 1–4;
+  - the row-hash match finder (`zstd_lazy.c`);
+  - the optimal parser's price model (`zstd_opt.c`);
+  - FSE table construction and normalization;
+  - canonical Huffman code assignment;
+  - the order sequences are written in (`ZSTD_encodeSequences_body`).
+
+  zstd's own regression and golden corpora are vendored in `zstd-fixtures/`.
+- **xxHash**, by Yann Collet. XXH64 is the frame checksum. XXH3 is one of the
+  archive entry hashes; it was written from the reference `xxhash.h`, which is
+  also its test oracle.
+- **BLAKE3**, by Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves and Zooko
+  Wilcox-O'Hearn. The [`blake3`](https://crates.io/crates/blake3) crate is used
+  as is, for the default archive entry hash.
+- **ruzstd**, by Moritz Borcherding: a second, independent decoder that the
+  differential tests compare against, so that zalt and libzstd can't agree on a
+  misreading unnoticed.
+- **cap-std** and **rustix**, by Dan Gohman, Jakub Konka and the Bytecode
+  Alliance: extraction's file system access, relative to directory handles, so
+  an archive can't write outside its destination.
+- [RFC 9842](doc/rfc9842.txt), Compression Dictionary Transport (P. Meenan and
+  Y. Weiss), which defines the `dcz` streams `zalt-recipe` reads and resolves
+  dictionaries for.
+
+zalt is not affiliated with or endorsed by Meta or the zstd project.
+
+---
+
 ## License
 
-MIT OR Apache-2.0.
+Released into the public domain under the [Unlicense](UNLICENSE). Where a
+public-domain dedication is not recognized, or where you prefer a conventional
+license, you may instead use it under [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option. Apache-2.0 includes an express
+patent grant.
+
+Third-party files keep their own licenses: `zstd-fixtures/` and
+`crates/zsta-seekable-probe/c/xxhash.h` are from zstd (BSD, with a `LICENSE`
+beside each), and `doc/rfc*.txt` are IETF RFCs.
+
+Unless you state otherwise, any contribution you submit for inclusion is
+offered under the same terms.
