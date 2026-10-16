@@ -1,4 +1,5 @@
-//! `zalt(1)` — decompress, inspect and validate zstd frames from the shell.
+//! `zalt(1)` — compress, decompress, inspect and validate zstd frames from the
+//! shell.
 //!
 //! # Why this exists
 //!
@@ -27,15 +28,18 @@
 //! library claims, exercised by something other than a test.
 //!
 //! `info` is the exception and reads the whole file, which is stated where it
-//! is implemented.
+//! is implemented. So is `compress`, for a different reason: the encoder is
+//! one-shot, and §10 is explicit that a streaming encoder should be written
+//! when there is a caller to shape it.
 
 #![forbid(unsafe_code)]
 
+mod archive;
 mod args;
 mod inspect;
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -47,6 +51,25 @@ use args::{Args, Command, USAGE, human};
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // `zalt archive …` has its own arguments; see `archive.rs` for why it is a
+    // separate parser rather than more flags on this one.
+    if let Some((first, rest)) = argv.split_first()
+        && matches!(first.as_str(), "archive" | "a")
+    {
+        return match archive::run(rest) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(archive::Outcome::Usage(archive::Usage(msg))) => {
+                eprintln!("zalt archive: {msg}");
+                eprintln!("try 'zalt archive help'");
+                ExitCode::from(2)
+            }
+            Err(archive::Outcome::Failed(archive::Failed(msg))) => {
+                eprintln!("zalt archive: {msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let args = match Args::parse(&argv) {
         Ok(a) => a,
@@ -88,10 +111,108 @@ fn run(args: &Args) -> Result<(), Failure> {
             println!("backend: {}", zalt_embed::backend_name());
             Ok(())
         }
+        Command::Compress => compress(args),
         Command::Decompress => decompress(args),
         Command::Info => info(args),
         Command::Check => check(args),
     }
+}
+
+// --------------------------------------------------------------- compress
+
+/// Encode each input as one frame, to stdout or `--output`.
+///
+/// Several inputs to stdout become several frames back to back, which a
+/// conformant decoder — this one included — reads as their contents
+/// concatenated. That is the format's own rule, not a convention of this tool.
+///
+/// **Each input is read whole.** The encoder is one-shot: it chooses blocks
+/// and matches over the entire input, and a streaming encoder is a state
+/// machine §10 defers until something needs one. A browser never compresses
+/// through this path; a person at a shell compressing a file can hold it.
+fn compress(args: &Args) -> Result<(), Failure> {
+    let params = args.encode_params();
+    params
+        .validate()
+        .map_err(|e| Failure::Usage(format!("cannot encode with these settings: {e}")))?;
+
+    let stdout = io::stdout();
+    // zstd(1) refuses this too, for the same reason: a frame on a terminal is
+    // noise that can leave the terminal in a strange state, and it is almost
+    // always a forgotten redirect rather than an intention.
+    if args.output.is_none() && stdout.is_terminal() {
+        return Err(Failure::Usage(
+            "refusing to write compressed data to a terminal; redirect it, or use -o FILE".into(),
+        ));
+    }
+    let mut sink: Box<dyn Write> = match &args.output {
+        Some(path) => Box::new(BufWriter::new(open_output(path, args.force)?)),
+        None => Box::new(BufWriter::new(stdout.lock())),
+    };
+
+    let mut encode_one = |name: &str, content: &[u8]| -> Result<(), Failure> {
+        let frame = zalt_embed::compress(content, &params)
+            .map_err(|e| Failure::Input(format!("{name}: {e}")))?;
+        sink.write_all(&frame)
+            .map_err(|e| Failure::Input(format!("write failed: {e}")))?;
+        report_compress(
+            args,
+            name,
+            content.len() as u64,
+            frame.len() as u64,
+            &params,
+        );
+        Ok(())
+    };
+
+    if args.inputs.is_empty() {
+        let mut content = Vec::new();
+        io::stdin()
+            .lock()
+            .read_to_end(&mut content)
+            .map_err(|e| Failure::Input(format!("<stdin>: {e}")))?;
+        encode_one("<stdin>", &content)?;
+    } else {
+        for path in &args.inputs {
+            let content =
+                std::fs::read(path).map_err(|e| Failure::Input(format!("{path}: {e}")))?;
+            encode_one(path, &content)?;
+        }
+    }
+    sink.flush()
+        .map_err(|e| Failure::Input(format!("write failed: {e}")))?;
+    Ok(())
+}
+
+fn report_compress(
+    args: &Args,
+    name: &str,
+    read: u64,
+    written: u64,
+    params: &zalt_codec::encode::EncodeParams,
+) {
+    if args.quiet {
+        return;
+    }
+    let ratio = if written > 0 {
+        read as f64 / written as f64
+    } else {
+        0.0
+    };
+    let how = if params.strategy == zalt_codec::encode::Strategy::Stored {
+        "stored".to_string()
+    } else {
+        format!(
+            "level {}",
+            zalt_codec::encode::level::effective(params.level)
+        )
+    };
+    eprintln!(
+        "{name}: {} -> {} ({ratio:.2}x, {how}{})",
+        human(read),
+        human(written),
+        if params.checksum { ", checksum" } else { "" },
+    );
 }
 
 // ------------------------------------------------------------- decompress
@@ -203,7 +324,6 @@ impl<'a> Session<'a> {
         // two reads lives here until the rest of it arrives.
         let mut carry: Vec<u8> = Vec::new();
         let mut decoded: Vec<u8> = Vec::new();
-        let mut ended_cleanly = false;
 
         loop {
             let n = input.read(&mut chunk)?;
@@ -230,12 +350,8 @@ impl<'a> Session<'a> {
                 }
                 stats.peak_footprint = stats.peak_footprint.max(decoder.footprint());
 
-                match progress.status {
-                    Status::FrameComplete => {
-                        stats.frames += 1;
-                        ended_cleanly = true;
-                    }
-                    Status::NeedMoreInput => ended_cleanly = false,
+                if progress.status == Status::FrameComplete {
+                    stats.frames += 1;
                 }
 
                 // No forward progress means the decoder is waiting on bytes that
@@ -247,7 +363,12 @@ impl<'a> Session<'a> {
             carry.drain(..cursor);
         }
 
-        if !carry.is_empty() || (!ended_cleanly && stats.read > 0) {
+        // The decoder's own state decides, not the last status it returned: a
+        // stream that ends on a skippable frame — every ZSTA archive does, and
+        // so does anything carrying a seekable-format seek table — finishes
+        // with `NeedMoreInput`, and is complete. Judging by the last status
+        // reported those as truncated.
+        if !carry.is_empty() || (stats.read > 0 && !decoder.is_between_frames()) {
             return Err(failed("truncated input: the last frame does not end"));
         }
         Ok(stats)

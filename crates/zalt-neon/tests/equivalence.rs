@@ -161,3 +161,90 @@ fn decoding_real_zstd_agrees_between_backends() {
     assert_eq!(neon, TEXT_BIN, "neon backend must decode correctly");
     assert_eq!(scalar, neon, "backends must agree byte for byte");
 }
+
+/// `common_prefix` on every pair of slice lengths up to 80 — past the first
+/// word, through several vector steps, and every tail — with the first
+/// difference at every position, and with none.
+#[test]
+fn common_prefix_agrees_on_every_length_and_difference() {
+    let mut base = vec![0u8; 96];
+    fill(&mut base, 0x5B);
+    for la in 0..=80usize {
+        for lb in 0..=80usize {
+            let shorter = la.min(lb);
+            for differ_at in 0..=shorter {
+                let a = &base[..la];
+                let mut b = base[..lb].to_vec();
+                if differ_at < shorter {
+                    b[differ_at] ^= 0x80;
+                }
+                let expect = Scalar::common_prefix(a, &b);
+                assert_eq!(expect, differ_at, "scalar is the reference");
+                assert_eq!(
+                    Neon::common_prefix(a, &b),
+                    expect,
+                    "la={la} lb={lb} differ_at={differ_at}"
+                );
+            }
+        }
+    }
+}
+
+/// Long agreements, where the vector loop does nearly all the work, and
+/// differences in every bit position of the byte that differs — the mask
+/// keeps four bits per byte, so a difference only in some bits must still
+/// land on the right byte.
+#[test]
+fn common_prefix_agrees_on_long_runs_and_single_bit_differences() {
+    let mut base = vec![0u8; 5000];
+    fill(&mut base, 0x2D);
+    for len in [100usize, 255, 256, 257, 1000, 4095, 4096, 4097, 4999] {
+        for bit in 0..8 {
+            let mut b = base.clone();
+            b[len] ^= 1 << bit;
+            assert_eq!(Neon::common_prefix(&base, &b), len, "len={len} bit={bit}");
+            assert_eq!(Scalar::common_prefix(&base, &b), len);
+        }
+    }
+    assert_eq!(Neon::common_prefix(&base, &base), base.len());
+    assert_eq!(Neon::common_prefix(&base[..4097], &base), 4097);
+}
+
+/// The property that matters: a backend changes how fast matches are
+/// measured, never what is encoded. Whole frames, every level, byte for byte
+/// — a `common_prefix` that disagreed anywhere a match finder looked would
+/// change a match length, and this would see it.
+#[test]
+fn every_level_encodes_identically_with_either_backend() {
+    use zalt_codec::encode::{EncodeParams, Strategy, compress_with};
+
+    let mut input = Vec::new();
+    for i in 0..1200u32 {
+        input.extend_from_slice(
+            format!(
+                "<row id=\"{i}\" kind=\"{}\">value {}</row>\n",
+                i % 7,
+                (i * 13) % 101
+            )
+            .as_bytes(),
+        );
+    }
+    input.extend(std::iter::repeat_n(b'A', 5000));
+    let mut noise = vec![0u8; 4000];
+    fill(&mut noise, 0x77);
+    input.extend_from_slice(&noise);
+    let copy = input[1000..20_000].to_vec();
+    input.extend_from_slice(&copy);
+
+    for level in 1..=19 {
+        let params = EncodeParams {
+            strategy: Strategy::Compress,
+            level,
+            checksum: true,
+            ..Default::default()
+        };
+        let scalar = compress_with::<Scalar>(&input, &params).expect("encodable");
+        let neon = compress_with::<Neon>(&input, &params).expect("encodable");
+        assert!(scalar == neon, "level {level}: frames differ");
+    }
+}

@@ -7,7 +7,7 @@
 
 use zalt_codec::Scalar;
 use zalt_codec::block::{BlockHeader, BlockType};
-use zalt_codec::decode::{Decoder, Status};
+use zalt_codec::decode::Decoder;
 use zalt_codec::error::Error;
 use zalt_codec::magic;
 use zalt_codec::params::DecodeLimits;
@@ -88,7 +88,6 @@ fn decode_chunked(input: &[u8], chunk: usize) -> Result<Vec<u8>, Error> {
     let mut decoder = Decoder::<Scalar>::new(permissive());
     let mut out = Vec::new();
     let mut cursor = 0usize;
-    let mut last_status = Status::NeedMoreInput;
 
     while cursor < input.len() {
         let end = (cursor + chunk).min(input.len());
@@ -99,12 +98,16 @@ fn decode_chunked(input: &[u8], chunk: usize) -> Result<Vec<u8>, Error> {
             return Err(Error::Truncated);
         }
         cursor += progress.consumed;
-        last_status = progress.status;
     }
 
-    match last_status {
-        Status::FrameComplete => Ok(out),
-        Status::NeedMoreInput => Err(Error::Truncated),
+    // The decoder's state decides, not the last status: a stream ending on a
+    // skippable frame finishes with `NeedMoreInput` and is complete. This
+    // helper used to require `FrameComplete`, the same mistake the one-shot
+    // decoder and the CLI made — so it could not have tested the fix.
+    if decoder.is_between_frames() && !input.is_empty() {
+        Ok(out)
+    } else {
+        Err(Error::Truncated)
     }
 }
 
@@ -193,6 +196,67 @@ fn skippable_frame_before_a_real_one() {
     // And it must survive arbitrary chunking too.
     for chunk in 1..=16 {
         assert_eq!(decode_chunked(&stream, chunk).unwrap(), HELLO_BIN);
+    }
+}
+
+/// The position the tests above never covered: a skippable frame **last**.
+///
+/// Every skippable-frame test here put the skippable frame *before* a real
+/// one, and the one-shot decoder, the CLI and this file's own chunked helper
+/// all judged the end of a stream by the last status returned — which after a
+/// skippable frame is `NeedMoreInput`. So a stream ending on one was reported
+/// truncated, by all three, and no test noticed. ZSTA archives end that way by
+/// construction, which is how it was found; so does any file carrying zstd's
+/// seekable-format seek table. `zstd(1)` decodes them.
+#[test]
+fn a_stream_may_end_with_a_skippable_frame() {
+    let skippable = |payload: &[u8]| {
+        let mut f = magic::ZSTD_SKIPPABLE_START.to_le_bytes().to_vec();
+        f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        f.extend_from_slice(payload);
+        f
+    };
+    let mut stream = HELLO_ZST.to_vec();
+    stream.extend(skippable(b"a trailing seek table, say"));
+    stream.extend(skippable(b""));
+    assert_eq!(decompress(&stream, permissive()).unwrap(), HELLO_BIN);
+    for chunk in 1..=16 {
+        assert_eq!(
+            decode_chunked(&stream, chunk).unwrap(),
+            HELLO_BIN,
+            "chunk {chunk}"
+        );
+    }
+
+    // A stream of nothing but skippable frames is complete, and empty —
+    // libzstd's `ZSTD_decompress` returns 0 for it, not an error.
+    let only = skippable(b"metadata");
+    assert_eq!(decompress(&only, permissive()).unwrap(), b"");
+    for chunk in 1..=8 {
+        assert_eq!(decode_chunked(&only, chunk).unwrap(), b"");
+    }
+}
+
+/// And what must still be refused, so the fix above is not a loosening.
+#[test]
+fn a_stream_cut_inside_a_trailing_skippable_frame_is_still_truncated() {
+    let mut stream = HELLO_ZST.to_vec();
+    stream.extend_from_slice(&magic::ZSTD_SKIPPABLE_START.to_le_bytes());
+    stream.extend_from_slice(&10u32.to_le_bytes());
+    stream.extend_from_slice(b"short"); // 5 of the 10 declared bytes
+    assert!(decompress(&stream, permissive()).is_err());
+    // Cut inside the skippable header's size field.
+    let header_cut = &stream[..HELLO_ZST.len() + 6];
+    assert!(decompress(header_cut, permissive()).is_err());
+    // A partial magic number after a complete frame.
+    let mut magic_cut = HELLO_ZST.to_vec();
+    magic_cut.extend_from_slice(&[0x28, 0xB5]);
+    assert!(decompress(&magic_cut, permissive()).is_err());
+    // Empty input is not a stream.
+    assert!(decompress(&[], permissive()).is_err());
+    for chunk in 1..=8 {
+        assert!(decode_chunked(&stream, chunk).is_err(), "chunk {chunk}");
+        assert!(decode_chunked(&magic_cut, chunk).is_err(), "chunk {chunk}");
     }
 }
 

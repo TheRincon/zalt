@@ -209,6 +209,21 @@ impl<B: Backend> Decoder<B> {
         }
     }
 
+    /// Whether the decoder sits between frames with nothing buffered — the one
+    /// state in which the end of the input is the end of a complete stream.
+    ///
+    /// **Not the same as "the last call returned [`Status::FrameComplete`]".**
+    /// A stream may end with a skippable frame, which finishes without one: the
+    /// decoder steps over it and goes back to waiting for a magic number, and
+    /// reports [`Status::NeedMoreInput`] because, mid-stream, more frames may
+    /// follow. At the end of the input that is a clean finish, not a truncated
+    /// one — `zstd(1)` agrees — and a caller deciding which needs this, not the
+    /// last status. Every ZSTA archive ends in skippable frames, as does any
+    /// file carrying zstd's seekable-format seek table.
+    pub fn is_between_frames(&self) -> bool {
+        matches!(self.state, State::Magic) && self.scratch.len == 0
+    }
+
     /// Return to the initial state, ready for an unrelated stream.
     ///
     /// Keeps the allocated buffers, which is the point: reusing a decoder
@@ -907,6 +922,17 @@ pub fn decompress_with<B: Backend>(input: &[u8], limits: DecodeLimits) -> Result
         match progress.status {
             Status::FrameComplete if cursor >= input.len() => return Ok(out),
             Status::FrameComplete => continue,
+            // All input consumed, back between frames: a stream that ended on
+            // a skippable frame, complete. Empty input is still refused — a
+            // stream with no frames at all is not a stream.
+            Status::NeedMoreInput
+                if progress.consumed == 0
+                    && cursor == input.len()
+                    && cursor > 0
+                    && decoder.is_between_frames() =>
+            {
+                return Ok(out);
+            }
             Status::NeedMoreInput if progress.consumed == 0 => return Err(Error::Truncated),
             Status::NeedMoreInput => continue,
         }

@@ -208,6 +208,55 @@ pub fn classify(magic_number: u32) -> Result<FrameKind> {
     }
 }
 
+/// The on-disk length of the frame — zstd or skippable — that starts at
+/// `src[0]`, found from its headers alone, without decoding anything.
+///
+/// A zstd frame is walked header, then block header by block header to the
+/// last block, then its checksum: RFC 8878 makes every frame self-delimiting
+/// this way, which is what lets a damaged file be walked frame by frame
+/// (ZSTA §11.3). libzstd's `ZSTD_findFrameCompressedSize` does the same.
+///
+/// [`Error::Truncated`] if `src` ends before the frame does — the answer for
+/// a file cut short, and also for a slice that is merely too small yet, so a
+/// caller reading a file in pieces can read more and ask again.
+/// Window and content-size limits are not applied: this only measures.
+pub fn compressed_size(src: &[u8]) -> Result<usize> {
+    let magic_number = u32::from_le_bytes(*src.first_chunk::<4>().ok_or(Error::Truncated)?);
+    if classify(magic_number)? == FrameKind::Skippable {
+        let size = src.get(4..8).ok_or(Error::Truncated)?;
+        let user = u32::from_le_bytes(size.try_into().map_err(|_| Error::Malformed)?) as usize;
+        let total = 8usize.checked_add(user).ok_or(Error::Malformed)?;
+        return if total <= src.len() {
+            Ok(total)
+        } else {
+            Err(Error::Truncated)
+        };
+    }
+    let descriptor = *src.get(4).ok_or(Error::Truncated)?;
+    let d = Descriptor::parse(descriptor)?;
+    let mut pos = 5 + header_len_after_descriptor(descriptor)?;
+    loop {
+        let header = src
+            .get(pos..pos + crate::block::BLOCK_HEADER_SIZE)
+            .ok_or(Error::Truncated)?;
+        let block = crate::block::BlockHeader::parse([header[0], header[1], header[2]])?;
+        pos += crate::block::BLOCK_HEADER_SIZE + block.stream_len() as usize;
+        if pos > src.len() {
+            return Err(Error::Truncated);
+        }
+        if block.last {
+            break;
+        }
+    }
+    if d.has_checksum {
+        pos += 4;
+    }
+    if pos > src.len() {
+        return Err(Error::Truncated);
+    }
+    Ok(pos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +267,96 @@ mod tests {
 
     /// Descriptor 0x24, taken from real `zstd -1` output for empty input:
     /// single segment, checksum present, 1-byte content size.
+    /// Frames built by hand, so every field the walk reads is one the test
+    /// chose: header widths, each block type, the checksum.
+    fn frame(
+        descriptor: u8,
+        header_rest: &[u8],
+        blocks: &[(u32, u32, &[u8])],
+        checksum: bool,
+    ) -> alloc::vec::Vec<u8> {
+        let mut f = magic::to_le_bytes(magic::ZSTD_FRAME).to_vec();
+        f.push(descriptor | if checksum { 0b100 } else { 0 });
+        f.extend_from_slice(header_rest);
+        for (i, (block_type, size, body)) in blocks.iter().enumerate() {
+            let last = u32::from(i + 1 == blocks.len());
+            let raw = last | (block_type << 1) | (size << 3);
+            f.extend_from_slice(&raw.to_le_bytes()[..3]);
+            f.extend_from_slice(body);
+        }
+        if checksum {
+            f.extend_from_slice(&[1, 2, 3, 4]);
+        }
+        f
+    }
+
+    #[test]
+    fn compressed_size_walks_every_block_type_and_the_checksum() {
+        // Single segment, 1-byte content size; a raw block of 3, an RLE block
+        // of 1000 (one byte on the wire), a "compressed" block of 2 bytes.
+        let f = frame(
+            0x20,
+            &[0x05],
+            &[(0, 3, b"abc"), (1, 1000, b"x"), (2, 2, b"zz")],
+            true,
+        );
+        assert_eq!(compressed_size(&f), Ok(f.len()));
+        // Trailing bytes are the next frame's business.
+        let mut more = f.clone();
+        more.extend_from_slice(b"next frame");
+        assert_eq!(compressed_size(&more), Ok(f.len()));
+        // Every cut is Truncated, never a wrong length.
+        for cut in 0..f.len() {
+            assert_eq!(
+                compressed_size(&f[..cut]),
+                Err(Error::Truncated),
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_size_reads_the_header_widths() {
+        // Window descriptor, 4-byte dictionary id, 8-byte content size.
+        let f = frame(
+            0b1100_0011,
+            &[0x00, 1, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0],
+            &[(0, 1, b"q")],
+            false,
+        );
+        assert_eq!(compressed_size(&f), Ok(f.len()));
+    }
+
+    #[test]
+    fn compressed_size_of_skippable_frames_and_refusals() {
+        let mut s = magic::to_le_bytes(0x184D_2A5E).to_vec();
+        s.extend_from_slice(&3u32.to_le_bytes());
+        s.extend_from_slice(b"abc");
+        assert_eq!(compressed_size(&s), Ok(11));
+        assert_eq!(compressed_size(&s[..10]), Err(Error::Truncated));
+        assert_eq!(
+            compressed_size(b"\x00\x01\x02\x03\x04"),
+            Err(Error::BadMagic)
+        );
+        let reserved_block = frame(0x20, &[0x05], &[(3, 1, b"x")], false);
+        assert_eq!(compressed_size(&reserved_block), Err(Error::Reserved));
+        let reserved_bit = frame(0x28, &[0x05], &[(0, 1, b"x")], false);
+        assert_eq!(compressed_size(&reserved_bit), Err(Error::Reserved));
+    }
+
+    #[test]
+    fn compressed_size_matches_the_encoder_on_real_frames() {
+        let data: alloc::vec::Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 13) as u8).collect();
+        for level in [1, 3, 19] {
+            let params = crate::EncodeParams {
+                level,
+                ..crate::EncodeParams::default()
+            };
+            let f = crate::compress(&data, &params).unwrap();
+            assert_eq!(compressed_size(&f), Ok(f.len()), "level {level}");
+        }
+    }
+
     #[test]
     fn descriptor_0x24_from_real_zstd() {
         assert_eq!(header_len_after_descriptor(0x24).unwrap(), 1);

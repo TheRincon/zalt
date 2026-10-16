@@ -89,9 +89,24 @@ fmt-check:
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+    @# The workspace build turns `native-fs` on (zalt-cli asks for it); the
+    @# format layer must also stand without it — the fuzz targets use it so.
+    cargo clippy -p zalt-archive --all-targets -- -D warnings
 
 clippy-fix:
     cargo clippy --fix --workspace --all-targets --allow-dirty -- -D warnings
+
+# ZSTA archives at size, against `gtar | zstd`, interleaved; ratios only mean
+# anything on a quiet machine (it refuses above 75% swap). CORPUS defaults to
+# ~/.cargo/registry/src/<index>.
+#   just archive-bench ~/some/dir 5
+archive-bench CORPUS="" ROUNDS="3":
+    python3 ci/archive-bench.py {{CORPUS}} {{ROUNDS}}
+
+# ZSTA members past 4 GiB and 8 GiB, round-tripped in memory (~14 GiB of
+# zeros encoded and decoded; ignored by `just test`).
+archive-huge:
+    cargo test --release -p zalt-archive --test roundtrip members_past_4_and_8_gib -- --ignored --nocapture
 
 # Enforce the layering contract from doc/ZALT-MAC.md §1.
 layering:
@@ -197,29 +212,30 @@ gate: fmt-check clippy layering ztml-dict-check abi-check test test-release
 
 # What the pre-push hook runs.
 #
-# `gate` is not by itself what CI checks. The workflow has five jobs, and gate
+# `gate` is not by itself what CI checks. The workflow has four jobs, and gate
 # is one of them; `no-std` is a separate job and gate does not cover it. That
 # gap is the one worth closing here, because it is the cheapest to break without
 # noticing — a `std` import in `zalt-codec` compiles fine on this laptop and
 # fails only on the cross-compile that proves the crate is still general.
 #
-# The two CI jobs deliberately left out are `miri` (~4 minutes) and `fuzz-build`
-# (needs nightly and cargo-fuzz). Both still run in CI. They are excluded on the
-# reasoning that **a hook people bypass is worse than a shorter hook they run**:
-# past a few minutes, `--no-verify` becomes the habit and then nothing is
-# checked at all. `just pre-push-full` runs them when the change warrants it.
+# Left out: `fuzz-build` (needs nightly and cargo-fuzz), which still runs in CI,
+# and `miri`, which no longer does — it had grown past six hours a run — and is
+# local only. Both are excluded on the reasoning that **a hook people bypass is
+# worse than a shorter hook they run**: past a few minutes, `--no-verify`
+# becomes the habit and then nothing is checked at all. `just pre-push-full`
+# runs them when the change warrants it.
 [doc("What the pre-push hook runs: gate + no-std.")]
 pre-push: gate no-std
     @echo
     @echo "pre-push passed (gate + no-std)."
     @echo "for the slow CI jobs too:  just pre-push-full"
 
-# Everything CI runs, including the slow jobs. Worth it before a PR, and before
-# anything touching `unsafe` — though note Miri cannot execute NEON intrinsics,
+# Everything CI runs, plus Miri, which only runs here. Worth it before a PR, and
+# before anything touching `unsafe` — though note Miri cannot execute NEON intrinsics,
 # so it validates the scalar oracle rather than the accelerated path. What
 # guards the kernels is `test-release` (already in gate, where `debug_assert` is
 # compiled out) and the `backend_equivalence` tests and fuzz target.
-[doc("Everything CI runs, slow jobs included (adds fuzz-build + miri).")]
+[doc("Everything CI runs, plus Miri (adds fuzz-build + miri).")]
 pre-push-full: gate no-std fuzz-build miri
     @echo
     @echo "pre-push-full passed (gate + no-std + fuzz-build + miri)."
@@ -456,6 +472,20 @@ _canary-frame:
 baseline DIR="corpus":
     cargo run --release -p zalt-bench -- baseline {{DIR}}
 
+# Every compression level against libzstd's *same* level.
+#
+#   just encode-levels corpus/ztml
+#   just encode-levels corpus/ztml 1,9,19 --time
+#
+# Size is deterministic and exact; add `--time` for speed, interleaved with
+# libzstd per level, which needs the same quiet machine every timing does. Each
+# row is zalt at level N divided by zstd at level N on both axes, so below 1.00
+# is better — a level has not matched libzstd's level until both columns say
+# so. Every frame at every level is decoded and compared before it is counted.
+[doc("Each compression level against libzstd's same level: size, and with --time, speed.")]
+encode-levels DIR="corpus" *ARGS="":
+    cargo run --release -p zalt-bench -- encode-levels {{DIR}} {{ARGS}}
+
 # Encode throughput against libzstd, over a corpus directory.
 #
 #   just encode-bench corpus/ztml
@@ -473,10 +503,34 @@ baseline DIR="corpus":
 encode-bench DIR="corpus":
     cargo run --release -p zalt-bench -- encode {{DIR}}
 
+# How decode scales across threads, and what sharing a pool costs.
+#
+#   just concurrent corpus/ztml
+#   just concurrent corpus/ztml 4
+#
+# §6 gives L2 a global budget and a decoder pool; §8 says the workload is many
+# small resources decoded concurrently; §10's zalt-darwin re-check admits none
+# of it was ever measured under concurrency. This is that measurement.
+#
+# Two shapes run the identical workload — through the shared pool, and with one
+# decoder per thread sharing nothing — so the gap between them at a given thread
+# count is the cost of sharing, with everything else held constant.
+#
+# **This mode needs a quiet machine in a way the others do not.** Interleaving
+# rescues a comparison between two implementations, because a disturbance lands
+# on both and cancels in the ratio. It cannot rescue a comparison between thread
+# counts: with no idle cores an added thread has nowhere to run, and the row
+# reports the scheduler. The harness checks load against core count, and voids
+# itself outright if any row comes back superlinear.
+[doc("Decode scaling across threads, and what the pool costs. Needs an idle machine.")]
+concurrent DIR="corpus/ztml" THREADS="":
+    cargo run --release -p zalt-bench -- concurrent {{DIR}} {{THREADS}}
+
 # Leaf-weighted profile of encoding one file. Needs nothing installed.
 #
 #   just profile-encode doc/rfc8878.txt
 #   just profile-encode corpus/ztml/showcase.zdoc 10
+#   just profile-encode corpus/varied.txt 14 1      (at level 1)
 #
 # The encode counterpart of `profile-decode`, and it earned its place the same
 # way: the gap ratio says how far behind libzstd we are and never which part is
@@ -485,12 +539,12 @@ encode-bench DIR="corpus":
 # reverted because the profile's explanation turned out not to predict a
 # measurement. See doc/ZALT-MAC.md §10.
 [doc("Leaf-weighted profile of encoding one file.")]
-profile-encode FILE SECS="14":
+profile-encode FILE SECS="14" LEVEL="":
     #!/usr/bin/env bash
     set -uo pipefail
     cargo build --release -q -p zalt-bench || exit 1
     out=$(mktemp -t zalt-encode-sample)
-    ./target/release/zalt-bench profile-encode "{{FILE}}" "{{SECS}}" &
+    ./target/release/zalt-bench profile-encode "{{FILE}}" "{{SECS}}" {{LEVEL}} &
     pid=$!
     sleep 2
     sample "$pid" "$(( {{SECS}} - 3 ))" -mayDie -f "$out" >/dev/null 2>&1

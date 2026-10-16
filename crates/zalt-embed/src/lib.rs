@@ -37,3 +37,16 @@ pub type DefaultBackend = zalt_codec::Scalar;
 pub fn backend_name() -> &'static str {
     <DefaultBackend as zalt_codec::Backend>::NAME
 }
+
+/// Compress `input` into one zstd frame, measuring matches with this build's
+/// backend — NEON on aarch64.
+///
+/// The frame is byte-identical to `zalt_codec::encode::compress`'s, which
+/// uses the portable scalar backend; only the time differs. `zalt-neon`'s
+/// equivalence tests hold every level to that.
+pub fn compress(
+    input: &[u8],
+    params: &zalt_codec::encode::EncodeParams,
+) -> zalt_codec::Result<std::vec::Vec<u8>> {
+    zalt_codec::encode::compress_with::<DefaultBackend>(input, params)
+}

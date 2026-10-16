@@ -42,7 +42,12 @@ fn params_from(seed: [u8; 3], content_len: usize) -> EncodeParams {
     let window_log = (block_log as u8).max(10);
 
     EncodeParams {
-        level: 3,
+        // Every level, from bits of `seed[1]` the checksum does not use. A
+        // level changes only which sequences are chosen — but greedy, lazy and
+        // optimal parsing each choose them their own way, and the optimal
+        // parser tracks repeat offsets per path. Fixed at 3, this target never
+        // reached the code most likely to disagree with libzstd about them.
+        level: 1 + i32::from((seed[1] >> 1) % 19),
         // Both strategies, so the sequence bitstream is exercised on whatever
         // match structure the mutator invents. This is the part of the encoder
         // with arithmetic in it, and the part libzstd is the only real oracle

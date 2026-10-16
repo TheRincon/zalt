@@ -15,6 +15,8 @@ use zalt_embed::policy::UNTRUSTED_MAX_WINDOW_LOG;
 /// What the user asked for.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Encode each input as one frame.
+    Compress,
     /// Decode frames from one input to one output.
     Decompress,
     /// Report frame structure without decoding.
@@ -48,6 +50,16 @@ pub struct Args {
     pub quiet: bool,
     /// Overwrite an existing output file.
     pub force: bool,
+    /// Compression level, 1..=19, when one was given.
+    pub level: Option<i32>,
+    /// Store without compressing.
+    pub stored: bool,
+    /// Append a content checksum. `None` means the command's default.
+    pub checksum: Option<bool>,
+    /// Flags that only make sense for one direction, by name, so a flag given
+    /// to the wrong command is refused rather than quietly ignored.
+    decode_only: Vec<String>,
+    encode_only: Vec<String>,
 }
 
 /// A usage error. Exits 2, never 1: a mistake in the invocation is not the
@@ -81,6 +93,11 @@ impl Args {
             in_buf: 64 * 1024,
             quiet: false,
             force: false,
+            level: None,
+            stored: false,
+            checksum: None,
+            decode_only: Vec::new(),
+            encode_only: Vec::new(),
         };
 
         let mut it = argv.iter().peekable();
@@ -108,8 +125,34 @@ impl Args {
                 }
                 "-q" | "--quiet" => args.quiet = true,
                 "-f" | "--force" => args.force = true,
-                "--recycle" => args.recycle = true,
+                "--recycle" => {
+                    args.recycle = true;
+                    args.decode_only.push("--recycle".into());
+                }
+                "--stored" => {
+                    args.stored = true;
+                    args.encode_only.push("--stored".into());
+                }
+                "--check" => {
+                    args.checksum = Some(true);
+                    args.encode_only.push("--check".into());
+                }
+                "--no-check" => {
+                    args.checksum = Some(false);
+                    args.encode_only.push("--no-check".into());
+                }
+                "-L" | "--level" => {
+                    let raw = take(&mut it, "--level")?;
+                    args.level = Some(parse_level(&raw)?);
+                    args.encode_only.push("--level".into());
+                }
+                // `-19`, `-3`: the spelling every zstd user's fingers know.
+                level if is_level_flag(level) => {
+                    args.level = Some(parse_level(&level[1..])?);
+                    args.encode_only.push(level.to_string());
+                }
                 "--trusted" => {
+                    args.decode_only.push("--trusted".into());
                     // Keep any explicit limit already given: the flag selects a
                     // baseline, and a later `--max-window-log` narrows it.
                     let explicit = args.policy.limits.max_decoded_size;
@@ -131,14 +174,17 @@ impl Args {
                     args.policy.limits.max_window_log = n;
                 }
                 "--max-decoded" => {
+                    args.decode_only.push("--max-decoded".into());
                     let raw = take(&mut it, "--max-decoded")?;
                     args.policy.limits.max_decoded_size = Some(parse_size(&raw)?);
                 }
                 "--budget" => {
+                    args.decode_only.push("--budget".into());
                     let raw = take(&mut it, "--budget")?;
                     args.budget = Some(parse_size(&raw)?);
                 }
                 "--in-buf" => {
+                    args.decode_only.push("--in-buf".into());
                     let raw = take(&mut it, "--in-buf")?;
                     let n = parse_size(&raw)?;
                     if n == 0 {
@@ -155,6 +201,7 @@ impl Args {
                 }
                 word if !command_seen => {
                     args.command = match word {
+                        "compress" | "c" => Command::Compress,
                         "decompress" | "d" => Command::Decompress,
                         "info" | "i" => Command::Info,
                         "check" => Command::Check,
@@ -162,7 +209,7 @@ impl Args {
                         "help" => Command::Help,
                         other => usage!(
                             "unknown command: {other}\n\
-                             expected one of: decompress, info, check, version, help"
+                             expected one of: compress, decompress, info, check, version, help"
                         ),
                     };
                     command_seen = true;
@@ -179,13 +226,50 @@ impl Args {
     }
 
     fn validate(&self) -> Result<(), UsageError> {
-        if self.command == Command::Decompress && self.inputs.len() > 1 && self.output.is_some() {
+        let one_output = matches!(self.command, Command::Decompress | Command::Compress);
+        if one_output && self.inputs.len() > 1 && self.output.is_some() {
             usage!("--output takes one input; {} were given", self.inputs.len());
+        }
+        if self.command == Command::Compress {
+            if let Some(flag) = self.decode_only.first() {
+                usage!("{flag} applies to decoding, not compress");
+            }
+            if self.stored && self.level.is_some() {
+                usage!("--stored does not compress, so a level means nothing to it");
+            }
+        } else if let Some(flag) = self.encode_only.first() {
+            usage!("{flag} applies to compress only");
         }
         if self.command == Command::Check && self.output.is_some() {
             usage!("check produces no output; --output does not apply");
         }
         Ok(())
+    }
+
+    /// Encoder parameters for `compress`.
+    ///
+    /// The window ceiling is the same `--max-window-log` decoding uses, and
+    /// the same default, because it is the same promise read from the other
+    /// side: how much history the receiver has agreed to hold.
+    pub fn encode_params(&self) -> zalt_codec::encode::EncodeParams {
+        use zalt_codec::encode::{BLOCK_SIZE_DEFAULT, EncodeParams, Strategy, level};
+        let window_log = self.policy.limits.max_window_log;
+        EncodeParams {
+            level: self.level.unwrap_or(level::LEVEL_DEFAULT),
+            strategy: if self.stored {
+                Strategy::Stored
+            } else {
+                Strategy::Compress
+            },
+            window_log,
+            // On by default, unlike the library: a file at rest is where
+            // corruption goes unnoticed, and four bytes is what zstd(1) also
+            // charges to notice it.
+            checksum: self.checksum.unwrap_or(true),
+            dictionary_id: None,
+            // A ceiling below 128 KiB must still admit every block.
+            block_size: BLOCK_SIZE_DEFAULT.min(1u32 << window_log.min(31)),
+        }
     }
 
     /// Whether the policy still carries the untrusted default window ceiling.
@@ -194,6 +278,35 @@ impl Args {
     /// was raised says so.
     pub fn window_cap_is_default(&self) -> bool {
         self.policy.limits.max_window_log == UNTRUSTED_MAX_WINDOW_LOG
+    }
+}
+
+/// `-1` to `-99`: a dash and one or two digits, nothing else.
+fn is_level_flag(arg: &str) -> bool {
+    let digits = &arg.as_bytes()[1.min(arg.len())..];
+    arg.starts_with('-') && (1..=2).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit)
+}
+
+/// A compression level, refused loudly outside what this build implements.
+///
+/// The library clamps — a level above 19 is treated as 19, as libzstd treats a
+/// level above its own maximum — and that is right for a library, whose caller
+/// has a documented contract. At a shell it is wrong: someone typing `-22`
+/// expects libzstd's 22, which declares a 128 MiB window, and would get a frame
+/// that is merely level 19 with no sign of the substitution.
+fn parse_level(raw: &str) -> Result<i32, UsageError> {
+    let level: i32 = raw
+        .parse()
+        .map_err(|_| UsageError(format!("not a compression level: {raw}")))?;
+    match level {
+        1..=19 => Ok(level),
+        20..=22 => Err(UsageError(format!(
+            "level {level} is not implemented: zstd's levels 20-22 declare windows \
+             past the 8 MiB ceiling browsers decode, and zalt stops at 19"
+        ))),
+        _ => Err(UsageError(format!(
+            "compression levels are 1..=19, got {level}"
+        ))),
     }
 }
 
@@ -251,13 +364,16 @@ pub fn human(bytes: u64) -> String {
 }
 
 pub const USAGE: &str = "\
-zalt — Zstandard (RFC 8878) decoder
+zalt — Zstandard (RFC 8878) codec
 
 USAGE
     zalt <command> [options] [file...]
 
 COMMANDS
+    compress, c     encode each input as one frame, to stdout or --output
     decompress, d   decode frames to stdout or --output  (also: zalt -d)
+    archive, a      ZSTA archives: create, list, extract, verify
+                    (see 'zalt archive help')
     info, i         report frame and block structure without decoding
     check           decode and discard; exit non-zero if any input fails
     version         print the version and the selected backend
@@ -277,6 +393,16 @@ OPTIONS
     --budget SIZE         ceiling on total live decoder memory
     --recycle             reuse decoder buffers through a bounded free list
     --in-buf SIZE         input chunk size (default 64KiB)
+
+COMPRESS
+    -1 .. -19             compression level (default 3). 16 and up parse
+                          optimally and are slow; 19 is the strongest.
+    -L, --level N         the same, spelled out
+    --stored              no compression: raw and RLE blocks only
+    --check / --no-check  content checksum (default on, as in zstd(1))
+    --max-window-log N    largest window the frame may declare, 10..=31.
+                          Default 23 (8 MiB), which every browser decodes.
+    Refuses to write to a terminal; redirect, or use -o.
 
     -h, --help            this text
     -V, --version         version

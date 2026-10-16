@@ -19,6 +19,10 @@
 #   4. zalt  -> zalt     the round trip, which proves the least and is listed
 #                        last for that reason.
 #
+# Our frames are written by `zalt compress` — the shipped tool, not a test
+# harness. Until the CLI could compress, an example program stood in for it,
+# and the script then vouched for an encoder path no user ran.
+#
 # Usage:  ci/interop.sh [files...]      (defaults to a spread of repo files)
 
 set -uo pipefail
@@ -30,10 +34,9 @@ cd "$ROOT"
 command -v "$ZSTD" >/dev/null || { echo "need zstd on PATH (or \$ZSTD)" >&2; exit 1; }
 
 echo "building..."
-cargo build -q --release -p zalt-codec --example compress --example ruzstd_decompress
+cargo build -q --release -p zalt-codec --example ruzstd_decompress
 cargo build -q --release -p zalt-cli
 
-COMPRESS="target/release/examples/compress"
 RUZSTD="target/release/examples/ruzstd_decompress"
 ZALT="target/release/zalt"
 
@@ -79,10 +82,27 @@ for src in "${FILES[@]}"; do
     echo
     echo "=== $name ($size bytes)"
 
-    for mode in stored compressed; do
+    # Stored, the default level, and one level from each way of parsing:
+    # greedy (1), one-step lazy (5), two-step lazy (9), optimal (16) and
+    # optimal with a scout pass (19). A level changes only which sequences
+    # are chosen, but each parser chooses them its own way, and a choice the
+    # reference reads differently from us is exactly what this script is for.
+    for mode in stored compressed 1 5 9 16 19; do
         for sum in nochecksum checksum; do
             frame="$WORK/$name.$mode.$sum.zst"
-            "$COMPRESS" "$src" "$frame" "$mode" "$sum" || { refuse "encode $mode/$sum"; continue; }
+            case "$mode" in
+                stored)     how=(--stored) ;;
+                compressed) how=() ;;            # the default level
+                *)          how=("-$mode") ;;
+            esac
+            case "$sum" in
+                checksum)   check=(--check) ;;
+                *)          check=(--no-check) ;;
+            esac
+            # `${how[@]+...}`: macOS ships bash 3.2, where `set -u` calls an
+            # empty array unbound — and the default-level row has no flags.
+            "$ZALT" c -q -f ${how[@]+"${how[@]}"} "${check[@]}" -o "$frame" "$src" \
+                || { refuse "encode $mode/$sum"; continue; }
             fsize="$(wc -c < "$frame" | tr -d ' ')"
             printf '  %s/%s -> %s bytes\n' "$mode" "$sum" "$fsize"
 

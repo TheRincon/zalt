@@ -1,0 +1,25 @@
+[package]
+name = "zsta-seekable-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+publish = false
+description = "Answers ZSTA spec Open Question Q1: does zstd's reference seekable reader accept the ZSTA seek-table profile?"
+
+[dependencies]
+# `seekable`     compiles zstd's contrib/seekable_format: the reference reader under test.
+# `experimental` exposes ZSTD_getFrameHeader, used for the §5.2 frame-conformance checks.
+# Default features are off so legacy (v0.x) frame support is not compiled in, matching the spec.
+zstd-sys = { version = "2.1", default-features = false, features = ["seekable", "experimental"] }
+
+[build-dependencies]
+# Compiles the reference XXH3-128 in `c/` (xxHash's own, vendored from zstd's
+# copy). Already in the tree, as zstd-sys's.
+cc = "1"
+
+[dev-dependencies]
+# zalt as the encoder under test — see `encoder_at` in tests/common/mod.rs.
+zalt-codec.workspace = true
+
+# (The probe's own `[profile.dev.package.zstd-sys] opt-level = 3` moved to the
+# workspace root, where cargo requires profiles to live.)

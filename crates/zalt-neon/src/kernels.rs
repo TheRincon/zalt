@@ -3,7 +3,10 @@
 //! Byte-exact with [`zalt_codec::Scalar`] on every input satisfying the
 //! [`Backend`] contract. `tests/equivalence.rs` is what holds that claim up.
 
-use core::arch::aarch64::{uint8x16_t, vld1q_u8, vqtbl1q_u8, vst1q_u8};
+use core::arch::aarch64::{
+    uint8x16_t, vceqq_u8, vget_lane_u64, vld1q_u8, vmvnq_u8, vqtbl1q_u8, vreinterpret_u64_u8,
+    vreinterpretq_u16_u8, vshrn_n_u16, vst1q_u8,
+};
 use zalt_codec::Backend;
 
 /// NEON backend for aarch64.
@@ -79,6 +82,57 @@ impl Backend for Neon {
                 copy_match_narrow(buf, pos, offset, len);
             }
         }
+    }
+
+    /// The first word scalar, then sixteen bytes a step.
+    ///
+    /// **Why not NEON from the first byte.** Most calls end inside the first
+    /// eight bytes — they are candidates sharing a hash and little else — and
+    /// there a vector compare and its mask extraction cost more than one XOR:
+    /// measured (2026-10-12, M1, one process, variants interleaved) pure NEON
+    /// took 1.06–1.25x the scalar loop's time at lengths 3 and 7. Past the
+    /// first word the vector loop wins outright: 0.57x at 64 bytes, 0.39x at
+    /// 4000, against a best safe 32-byte loop's 0.63x and 0.51x. This is that
+    /// hybrid: 0.99–1.00x at the short lengths, the vector loop's speed at the
+    /// long ones.
+    ///
+    /// **The mask.** `vceqq_u8` gives 0xFF per equal byte; inverted, a
+    /// non-zero byte marks a difference. `vshrn_n_u16::<4>` narrows each
+    /// 16-bit pair to one byte holding four bits from each input byte, so the
+    /// 128-bit compare becomes a 64-bit mask with four bits per byte, in order
+    /// — the first differing byte is `trailing_zeros / 4`. No `movemask` on
+    /// aarch64; this is the usual substitute, and libzstd's.
+    #[inline]
+    fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+        let n = a.len().min(b.len());
+        let (Some(x), Some(y)) = (a.first_chunk::<8>(), b.first_chunk::<8>()) else {
+            return zalt_codec::Scalar::common_prefix(a, b);
+        };
+        let diff = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+        if diff != 0 {
+            return (diff.trailing_zeros() >> 3) as usize;
+        }
+
+        let mut matched = 8usize;
+        while matched + VEC <= n {
+            // SAFETY: `matched + VEC <= n`, and `n` is the shorter length, so
+            // both sixteen-byte loads lie inside their slices. Nothing else
+            // here touches memory.
+            let mask = unsafe {
+                let x = vld1q_u8(a.as_ptr().add(matched));
+                let y = vld1q_u8(b.as_ptr().add(matched));
+                let differ = vmvnq_u8(vceqq_u8(x, y));
+                vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+                    differ,
+                ))))
+            };
+            if mask != 0 {
+                return matched + (mask.trailing_zeros() >> 2) as usize;
+            }
+            matched += VEC;
+        }
+        // Fewer than sixteen bytes left on the shorter side.
+        matched + zalt_codec::Scalar::common_prefix(&a[matched..n], &b[matched..n])
     }
 }
 

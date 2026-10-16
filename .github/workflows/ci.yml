@@ -77,22 +77,8 @@ jobs:
           tool: just,cargo-fuzz
       - run: just fuzz-build
 
-  # Miri over the scalar path. It cannot execute NEON intrinsics, which is
-  # precisely why the scalar backend is never deleted — it is the only way to
-  # get UB detection over this code at all.
-  miri:
-    runs-on: ubuntu-latest
-    # Floating nightly; see the note on `fuzz-build`.
-    env:
-      RUSTFLAGS: ""
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just,nextest
-      - name: ensure zstd
-        run: command -v zstd || (sudo apt-get update && sudo apt-get install -y zstd)
-      - run: just miri
+  # Miri is not run here. It ran over the scalar path until 2026-10, when the
+  # encoder's tests had grown it from about four minutes to over six hours a
+  # run. It is still the only UB detection this code gets — NEON intrinsics
+  # are beyond it, which is why the scalar backend is never deleted — so it is
+  # run locally when a change warrants it: `just miri`, or `just pre-push-full`.
