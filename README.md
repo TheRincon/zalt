@@ -4,11 +4,6 @@ A clean-room **Zstandard (RFC 8878)** implementation in Rust, built to be
 embedded in a hostile-input setting — a browser, an app, anything that handles
 bytes it did not create.
 
-**The decoder is what exists today; an encoder is planned** (milestone M5).
-Decoding came first deliberately: it is the side exposed to bytes an attacker
-chose, so it is where the security argument lives and where correctness had to
-be settled before anything else.
-
 Three things it tries to be, in order. Each is useful without the ones below it:
 
 1. A clean, general, reliable Rust zstd implementation — modern format only, no
@@ -20,9 +15,20 @@ Three things it tries to be, in order. Each is useful without the ones below it:
 The design rationale lives in [`doc/ZALT-MAC.md`](doc/ZALT-MAC.md). It is the
 real document; this file is the map.
 
-> **Status: pre-release (`0.0.1`).** Not published to crates.io. The decoder is
-> complete and RFC 8878 conformant; the **encoder and dictionary support are not
-> written yet** (M5 and M4). See [Status](#status).
+---
+
+## Status
+
+> **pre-release (`0.0.1`).** Not published to crates.io. 
+
+| Milestone | | |
+|---|---|---|
+| M0 | Skeleton, backend seam, CI | ✅ |
+| M1 | Correct scalar decoder, conformance, fuzzing | ✅ |
+| M2 | Embedding: budget, pool, allocators, C FFI, CLI | ✅ |
+| M3 | Apple Silicon tuning | ✅ |
+| M4 | Recipes and dictionaries | ✅ |
+| M5 | Encoder — correctness first, then ratio | ✅ |
 
 ---
 
@@ -38,8 +44,8 @@ real document; this file is the map.
 - Bound memory: a window cap checked at header parse, lazy window allocation,
   and a global budget across live decoders.
 - Expose a C ABI with a hand-written header and a panic-proof boundary.
-
-**Not yet**   
+- Encode modern zstd frames, bit exactly.
+- Dictionaries
 
 **Deliberately never**
 
@@ -320,24 +326,6 @@ zstd-fixtures/   facebook/zstd's own regression corpus
 corpus/          benchmark corpora — gitignored, local, rebuilt by `just bench-corpus`
 justfile         one entry point for every task; CI runs the same recipes
 ```
-
----
-
-## Status
-
-| Milestone | | |
-|---|---|---|
-| M0 | Skeleton, backend seam, CI | ✅ |
-| M1 | Correct scalar decoder, conformance, fuzzing | ✅ |
-| M2 | Embedding: budget, pool, allocators, C FFI, CLI | ✅ |
-| M3 | Apple Silicon tuning | in progress |
-| M4 | Recipes and dictionaries | not started |
-| M5 | Encoder — correctness first, then ratio | not started |
-
-M5's scope is genuinely open: if the first consumer never needs to *compress*
-request bodies, the encoder reduces to what dictionary support and round-trip
-differential testing require. That question, and six others, are recorded in
-§11 of the design document rather than guessed at here.
 
 ---
 
