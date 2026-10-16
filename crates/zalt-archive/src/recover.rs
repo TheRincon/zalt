@@ -61,6 +61,7 @@ use std::io::Write;
 use zalt_codec::params::DecodeLimits;
 
 use crate::frames::{self, MAX_FRAME_CONTENT, MAX_WINDOW_LOG};
+use crate::hash::Hasher;
 use crate::index::{Entry, Index, IndexLimits};
 use crate::layout::{
     self, FLAG_DICT_REQUIRED, Header, MAGIC_DICTIONARY, MAGIC_HEADER, MAGIC_INDEX,
@@ -141,6 +142,14 @@ struct TarWalk {
     broken: Option<String>,
     /// Whether the thread was last picked up by a search.
     searched: bool,
+    /// The `Hash_Algorithm` the recovered index will have, 0 for none.
+    algorithm: u8,
+    /// Threads a BLAKE3 hash may use.
+    threads: usize,
+    /// The last member's content hash, while its content is still arriving:
+    /// the hasher and how many content bytes are still to come. They are the
+    /// first of `skip`, the padding after them.
+    hashing: Option<(Hasher, u64)>,
 }
 
 impl TarWalk {
@@ -153,6 +162,11 @@ impl TarWalk {
             return;
         }
         let passed = self.skip.min(data.len() as u64);
+        if let Some((mut h, left)) = self.hashing.take() {
+            let content = left.min(passed);
+            h.update(&data[..content as usize]);
+            self.hash_continues(h, left - content);
+        }
         data = &data[passed as usize..];
         self.skip -= passed;
         if self.skip > 0 {
@@ -215,12 +229,29 @@ impl TarWalk {
             }
             let total = m.header_len + pad(m.size);
             let start = self.at;
+            // The content as far as this frame holds it, hashed now; the rest
+            // as the frames carrying it arrive (the top of `feed`).
+            let hasher = if m.kind.has_content() {
+                Hasher::new(self.algorithm, self.threads)
+            } else {
+                None
+            };
+            let content_start = pos + m.header_len as usize;
+            let content_here = (m.size).min((stream.len() - content_start) as u64);
+            let content_left = m.size - content_here;
+            if let Some(mut h) = hasher {
+                h.update(&stream[content_start..content_start + content_here as usize]);
+                self.hashing = Some((h, content_left));
+            }
             self.members.push(Found {
                 entry: entry_from(m, start),
                 end: start + total,
                 damaged: false,
                 searched: self.searched,
             });
+            if let Some((h, left)) = self.hashing.take() {
+                self.hash_continues(h, left);
+            }
             self.at += total;
             let available = rest.len() as u64;
             if available >= total {
@@ -232,11 +263,24 @@ impl TarWalk {
         }
     }
 
+    /// Record the last member's hash if its content is complete, or keep
+    /// hashing it.
+    fn hash_continues(&mut self, h: Hasher, left: u64) {
+        if left > 0 {
+            self.hashing = Some((h, left));
+        } else if let Some(m) = self.members.last_mut() {
+            m.entry.hash = Some(h.finish());
+        }
+    }
+
     /// `len` bytes of stream that a damaged frame held, starting at `at`.
     fn gap(&mut self, len: u64, at: u64) {
         if self.broken.is_some() || len == 0 {
             return;
         }
+        // A member the damage reaches is not kept, and its hash could not be
+        // finished anyway.
+        self.hashing = None;
         if self.skip > 0 {
             // Inside a member whose header was read: it is damaged.
             if let Some(m) = self.members.last_mut() {
@@ -257,6 +301,7 @@ impl TarWalk {
     /// a search, believed — to start.
     fn resync(&mut self, at: u64, searched: bool) {
         self.pending.clear();
+        self.hashing = None;
         self.skip = 0;
         self.at = at;
         self.broken = None;
@@ -542,19 +587,25 @@ pub fn recover_with<S: Source + ?Sized, W: Write>(
         Index::parse(payload, &IndexLimits::default()).ok()
     });
 
-    // Pass 2.
-    let mut tar = TarWalk::default();
-    let mut walked: Vec<Walked> = Vec::new();
-    let mut stream = 0u64;
-    let mut terminator = false;
-    let mut damaged_frames = 0u64;
-    let mut resynced = false;
+    // Pass 2. Every member kept is hashed again as it is walked, with the
+    // options' algorithm: the Archive Header does not say what the damaged
+    // archive used, and its index — the only place that did — may be gone.
     // Frames are read in order and decoded a batch at a time, one per core;
     // the walk below then takes them in order, exactly as before.
     let threads = match options.threads {
         0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
         n => n,
     };
+    let mut tar = TarWalk {
+        algorithm: options.hash.algorithm(),
+        threads,
+        ..TarWalk::default()
+    };
+    let mut walked: Vec<Walked> = Vec::new();
+    let mut stream = 0u64;
+    let mut terminator = false;
+    let mut damaged_frames = 0u64;
+    let mut resynced = false;
     let mut ready: std::collections::VecDeque<Prepared> = std::collections::VecDeque::new();
     for (k, x) in extents.iter().enumerate() {
         if ready.is_empty() {
@@ -771,7 +822,7 @@ pub fn recover_with<S: Source + ?Sized, W: Write>(
         stream: 0,
         written: header_len,
         data_frames: 0,
-        hash_algorithm: 0,
+        hash_algorithm: options.hash.algorithm(),
     };
     let mut writer = Writer::resume(out, options, resume)?;
     let mut kept_bytes = header_len;

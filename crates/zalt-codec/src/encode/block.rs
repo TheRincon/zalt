@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use super::level::Tuning;
 use super::match_finder;
 use super::sequences;
+use crate::backend::Backend;
 use crate::block::BlockType;
 
 /// Largest block the format allows, and this encoder's default.
@@ -69,9 +70,9 @@ pub fn write_one(out: &mut Vec<u8>, content: &[u8], last: bool) -> Emitted {
 /// input the literals section plus an empty sequences section is *always*
 /// larger — so without this, "compress" would reliably expand exactly the data
 /// `strategy = "stored"` exists to protect.
-pub fn write_compressed(
+pub fn write_compressed<B: Backend>(
     out: &mut Vec<u8>,
-    matcher: &mut match_finder::Matcher,
+    matcher: &mut match_finder::Matcher<B>,
     input: &[u8],
     start: usize,
     end: usize,
@@ -115,7 +116,7 @@ fn stored_cost(content: &[u8]) -> usize {
 /// Always emits at least one block, so an empty input becomes an empty final
 /// raw block rather than a frame with no blocks in it — which is what the
 /// format requires and what libzstd emits for empty input.
-pub fn write_all(
+pub fn write_all<B: Backend>(
     out: &mut Vec<u8>,
     input: &[u8],
     boundaries: &[usize],
@@ -134,8 +135,8 @@ pub fn write_all(
     // `input.len()` is the whole frame, not this block: the matcher indexes
     // every position of the frame and reaches back across block boundaries, so
     // sizing its tables to one block would alias positions that are still live.
-    let mut matcher =
-        compress.map(|tuning| match_finder::Matcher::with_tuning(tuning, window_log, input.len()));
+    let mut matcher = compress
+        .map(|tuning| match_finder::Matcher::<B>::with_tuning(tuning, window_log, input.len()));
 
     let mut offset = 0usize;
     for &end in boundaries.iter().chain(core::iter::once(&input.len())) {
@@ -212,7 +213,7 @@ mod tests {
         // Deliberately not a multiple: the last chunk is short, which is where
         // an off-by-one in the loop would show.
         let input: Vec<u8> = (0..250u32).map(|i| (i % 251) as u8).collect();
-        let emitted = write_all(
+        let emitted = write_all::<crate::Scalar>(
             &mut out,
             &input,
             &crate::encode::split::fixed(input.len(), 100),
@@ -234,7 +235,7 @@ mod tests {
     #[test]
     fn an_empty_input_still_produces_one_final_block() {
         let mut out = Vec::new();
-        let emitted = write_all(&mut out, &[], &[], None, 17);
+        let emitted = write_all::<crate::Scalar>(&mut out, &[], &[], None, 17);
         assert_eq!(emitted.len(), 1);
         assert!(parse_first(&out).last);
         assert_eq!(parse_first(&out).size, 0);

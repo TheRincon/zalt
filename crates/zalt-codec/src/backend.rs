@@ -59,6 +59,19 @@ pub trait Backend: Copy + Clone + Send + Sync + 'static {
     /// - `offset <= pos`
     /// - `pos + len <= buf.len()`
     fn copy_match(buf: &mut [u8], pos: usize, offset: usize, len: usize);
+
+    /// How many leading bytes `a` and `b` share — the encoder's match length.
+    ///
+    /// The one encoder kernel. Every match finder measures every candidate
+    /// with it, and at the deeper levels it is most of the encode: 71% of
+    /// level 13's time over a deferred tree, where comparisons run long.
+    ///
+    /// **No contract**, unlike the decoding kernels: any two slices, of any
+    /// lengths, and the answer is at most the shorter. An implementation must
+    /// not read past either. A wrong answer here is a wrong match length, and
+    /// a frame that decodes to the wrong bytes, so the equivalence tests
+    /// compare whole encoded frames, not just this function.
+    fn common_prefix(a: &[u8], b: &[u8]) -> usize;
 }
 
 /// Portable scalar backend. The reference semantics for every other backend.
@@ -93,5 +106,48 @@ impl Backend for Scalar {
         for i in 0..len {
             buf[pos + i] = buf[pos - offset + i];
         }
+    }
+
+    /// **A word at a time.** Not the most obvious form, as `copy_match` is,
+    /// because this one is also what every build without NEON encodes with —
+    /// the match finder's own loop from before this seam existed, moved here
+    /// unchanged. A byte-at-a-time `take_while` walks it with a compare and
+    /// an unpredictable branch per byte; comparing eight bytes at once turns
+    /// that into an XOR and a `trailing_zeros`, which on Firestorm is
+    /// `eor`/`rbit`/`clz`: three instructions for what was eight iterations.
+    ///
+    /// `trailing_zeros` finds the lowest *bit* that differs, and because the
+    /// load is little-endian the lowest differing bit lies in the lowest
+    /// differing byte — so `>> 3` is the byte index, with no endianness
+    /// correction. A big-endian host would need `leading_zeros` instead, which
+    /// is why the load is explicitly `from_le_bytes` rather than native.
+    ///
+    /// No bounds check in the loop: `first_chunk` returns `None` at the end of
+    /// the shorter slice, which is also the loop's exit condition. `matched`
+    /// only advances after *both* chunks are produced, so the slicing below it
+    /// can never be out of range.
+    #[inline]
+    fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+        const WORD: usize = 8;
+
+        let mut matched = 0usize;
+        while let (Some(x), Some(y)) = (
+            a[matched..].first_chunk::<WORD>(),
+            b[matched..].first_chunk::<WORD>(),
+        ) {
+            let diff = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+            if diff != 0 {
+                return matched + (diff.trailing_zeros() >> 3) as usize;
+            }
+            matched += WORD;
+        }
+
+        // Fewer than eight bytes left on one side. At most seven iterations.
+        matched
+            + a[matched..]
+                .iter()
+                .zip(&b[matched..])
+                .take_while(|(x, y)| x == y)
+                .count()
     }
 }

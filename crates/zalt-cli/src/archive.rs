@@ -1,7 +1,7 @@
 //! `zalt archive` — ZSTA archives from the shell.
 //!
 //! ```text
-//! zalt archive create -o out.tar.zst [-19] [--threads N] [--no-xattrs] [--no-acls] [--no-fflags] PATH...
+//! zalt archive create -o out.tar.zst [-19] [--threads N] [--hash blake3|xxh3|none] [--no-xattrs] [--no-acls] [--no-fflags] PATH...
 //! zalt archive list [-l] ARCHIVE
 //! zalt archive extract ARCHIVE [-C DIR] [-f] [--keep-setid] [--same-owner] [--devices] [PATH...]
 //! zalt archive verify ARCHIVE
@@ -45,6 +45,9 @@ CREATE
     -o, --output PATH     the archive to write (required)
     -1 .. -19             compression level (default 3)
     --threads N           frames compressed in parallel (default: one per core)
+    --hash ALGORITHM      each member's content hash: blake3 (the default),
+                          xxh3 (faster; catches accidents, not tampering),
+                          or none
     -f, --force           overwrite an existing archive
     --no-xattrs           leave out extended attributes
     --no-acls             leave out ACLs
@@ -66,7 +69,8 @@ EXTRACT
 
 APPEND
     Adds PATH... after the archive's last member; takes CREATE's options
-    except -o. Works on a copy that replaces the archive only once complete,
+    except -o and --hash: new members get the archive's own hash. Works on
+    a copy that replaces the archive only once complete,
     so a failure leaves the archive as it was. A path already in the archive
     is refused: members cannot be replaced.
 
@@ -81,7 +85,8 @@ RECOVER
     Rebuilds an archive that lost its index and seek table — a write cut
     short — or has damaged frames, keeping every member the damage did not
     touch, byte for byte. Lists the members it could not keep. The damaged
-    file is only read.
+    file is only read. Members it keeps are hashed again, with BLAKE3:
+    which hash the damaged archive used was only recorded in its index.
 
 COMMON
     -q, --quiet           no per-member output
@@ -127,6 +132,7 @@ struct Opts {
     no_fflags: bool,
     keep_provenance: bool,
     search: bool,
+    hash: Option<zalt_archive::Hash>,
     paths: Vec<String>,
 }
 
@@ -180,6 +186,15 @@ fn parse(argv: &[String], allowed: &[&str]) -> Result<Opts, Outcome> {
             "--no-fflags" => o.no_fflags = true,
             "--keep-provenance" => o.keep_provenance = true,
             "--search" => o.search = true,
+            "--hash" => {
+                let raw = take(&mut it, arg)?;
+                o.hash = Some(match raw.as_str() {
+                    "blake3" => zalt_archive::Hash::Blake3,
+                    "xxh3" => zalt_archive::Hash::Xxh3,
+                    "none" => zalt_archive::Hash::None,
+                    _ => usage!("--hash: expected blake3, xxh3 or none, got {raw}"),
+                });
+            }
             "--threads" => {
                 let raw = take(&mut it, arg)?;
                 o.threads = raw.parse().map_err(|_| {
@@ -212,6 +227,7 @@ pub fn run(argv: &[String]) -> Result<(), Outcome> {
                 "-o",
                 "-N",
                 "--threads",
+                "--hash",
                 "-f",
                 "-q",
                 "--no-xattrs",
@@ -282,6 +298,7 @@ fn create(o: Opts) -> Result<(), Outcome> {
     let options = WriterOptions {
         level: o.level.unwrap_or(zalt_codec::encode::level::LEVEL_DEFAULT),
         threads: o.threads,
+        hash: o.hash.unwrap_or_default(),
         ..WriterOptions::default()
     };
     let mut writer = Writer::new(BufWriter::new(file), options)?;
@@ -627,8 +644,23 @@ fn verify(o: Opts) -> Result<(), Outcome> {
     archive.verify()?;
     if !o.quiet {
         let data = archive.frames().iter().filter(|f| f.is_data()).count();
+        let algorithm = archive.hash_algorithm();
+        let hashed = archive.entries().iter().any(|e| e.hash.is_some());
+        let hashes = if archive.checks_hashes() {
+            format!(
+                " and every {} hash",
+                zalt_archive::hash::algorithm_name(algorithm)
+            )
+        } else if hashed {
+            format!(
+                "; its {} hashes were not checked: zalt does not compute {0}",
+                zalt_archive::hash::algorithm_name(algorithm)
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
-            "{}: ok — {} members, {} data frames, {} of tar stream, every frame checked",
+            "{}: ok — {} members, {} data frames, {} of tar stream, every frame checked{hashes}",
             o.paths[0],
             archive.entries().len(),
             data,

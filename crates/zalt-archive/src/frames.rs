@@ -37,7 +37,7 @@ pub fn encode(content: &[u8], level: i32) -> Result<Vec<u8>> {
         checksum: true,
         ..Default::default()
     };
-    let frame = zalt_codec::encode::compress(content, &params)?;
+    let frame = zalt_embed::compress(content, &params)?;
     let header = header_of(&frame, &DecodeLimits::default())?;
     if header.frame_content_size != Some(content.len() as u64) {
         return Err(Error::Format(format!(

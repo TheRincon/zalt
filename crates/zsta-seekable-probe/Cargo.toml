@@ -12,6 +12,11 @@ description = "Answers ZSTA spec Open Question Q1: does zstd's reference seekabl
 # Default features are off so legacy (v0.x) frame support is not compiled in, matching the spec.
 zstd-sys = { version = "2.1", default-features = false, features = ["seekable", "experimental"] }
 
+[build-dependencies]
+# Compiles the reference XXH3-128 in `c/` (xxHash's own, vendored from zstd's
+# copy). Already in the tree, as zstd-sys's.
+cc = "1"
+
 [dev-dependencies]
 # zalt as the encoder under test — see `encoder_at` in tests/common/mod.rs.
 zalt-codec.workspace = true

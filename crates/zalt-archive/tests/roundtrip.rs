@@ -25,6 +25,7 @@ fn options(threads: usize) -> WriterOptions {
         policy: tiny_policy(),
         threads,
         creator: Some(b"test".to_vec()),
+        hash: zalt_archive::Hash::default(),
     }
 }
 
@@ -515,4 +516,204 @@ fn verify_decodes_each_frame_once_when_the_archive_outgrows_the_cache() {
         limits.cache_bytes
     );
     assert!(ratio <= 1.1, "verify decoded {ratio:.2}x");
+}
+
+// ------------------------------------------------------------ entry hashes
+
+/// The BLAKE3 the crate links is BLAKE3: the official test vector for empty
+/// input, so a build that quietly hashed something else would fail here.
+#[test]
+fn blake3_is_blake3() {
+    assert_eq!(
+        blake3::hash(b"").to_hex().as_str(),
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    );
+}
+
+/// By default every member with content carries the BLAKE3 of it — an empty
+/// file included — and nothing else carries a hash.
+#[test]
+fn every_member_carries_the_blake3_of_its_content_by_default() {
+    let members = members();
+    let a = open(write(&members, options(2))).unwrap();
+    assert_eq!(a.hash_algorithm(), zalt_archive::hash::algorithm::BLAKE3);
+    assert!(a.checks_hashes());
+    for (want, content) in &members {
+        let e = a.entries().iter().find(|e| e.path == want.path).unwrap();
+        if e.kind == Kind::File {
+            let digest = blake3::hash(content);
+            assert_eq!(
+                e.hash.as_deref(),
+                Some(digest.as_bytes().as_slice()),
+                "{}",
+                e.path_lossy()
+            );
+        } else {
+            assert_eq!(e.hash, None, "{}", e.path_lossy());
+        }
+    }
+    a.verify().unwrap();
+}
+
+/// XXH3-128 when asked, in the canonical byte order, matching xxHash's own C.
+#[test]
+fn xxh3_hashes_match_the_reference_implementation() {
+    let members = members();
+    let o = WriterOptions {
+        hash: zalt_archive::Hash::Xxh3,
+        ..options(2)
+    };
+    let a = open(write(&members, o)).unwrap();
+    assert_eq!(a.hash_algorithm(), zalt_archive::hash::algorithm::XXH3_128);
+    for (want, content) in &members {
+        if want.kind != Kind::File {
+            continue;
+        }
+        let e = a.entries().iter().find(|e| e.path == want.path).unwrap();
+        let reference = zsta_seekable_probe::xxh3::xxh3_128(content);
+        assert_eq!(
+            e.hash.as_deref(),
+            Some(reference.as_slice()),
+            "{}",
+            e.path_lossy()
+        );
+    }
+    a.verify().unwrap();
+}
+
+/// `Hash::None` writes `Hash_Algorithm` 0 and no digests, and still verifies.
+#[test]
+fn an_unhashed_archive_has_no_digests_and_still_verifies() {
+    let o = WriterOptions {
+        hash: zalt_archive::Hash::None,
+        ..options(2)
+    };
+    let a = open(write(&members(), o)).unwrap();
+    assert_eq!(a.hash_algorithm(), 0);
+    assert!(!a.checks_hashes());
+    assert!(a.entries().iter().all(|e| e.hash.is_none()));
+    a.verify().unwrap();
+}
+
+/// Our XXH3-128 against the reference on every length to 2200 — all four
+/// short paths, then one, two and three 1024-byte blocks with every stripe
+/// remainder — and on longer inputs, whole and fed in pieces of every size
+/// that matters to the streaming buffer.
+#[test]
+fn xxh3_matches_the_reference_on_every_length_and_split() {
+    use zalt_archive::xxh3;
+    let data = pseudo(200_000, 9);
+    for len in 0..=2200 {
+        let reference = zsta_seekable_probe::xxh3::xxh3_128(&data[..len]);
+        assert_eq!(
+            xxh3::canonical(xxh3::hash(&data[..len])),
+            reference,
+            "len {len}"
+        );
+    }
+    for len in [
+        240, 241, 255, 256, 257, 4095, 4096, 4097, 16_383, 16_384, 16_385, 100_003, 200_000,
+    ] {
+        let reference = zsta_seekable_probe::xxh3::xxh3_128(&data[..len]);
+        assert_eq!(
+            xxh3::canonical(xxh3::hash(&data[..len])),
+            reference,
+            "len {len}"
+        );
+        for piece in [1usize, 3, 63, 64, 65, 192, 255, 256, 257, 1000, 4096] {
+            let mut s = xxh3::Xxh3::new();
+            for chunk in data[..len].chunks(piece) {
+                s.update(chunk);
+            }
+            assert_eq!(
+                xxh3::canonical(s.digest()),
+                reference,
+                "len {len}, pieces of {piece}"
+            );
+        }
+    }
+}
+
+/// Content that does not match its hash — every frame checksum intact, so
+/// only the hash can tell — is refused by `verify` and by reading the member,
+/// and the other members still read. Doctored through the index, the one
+/// place a digest lives.
+#[test]
+fn content_that_does_not_match_its_hash_is_refused() {
+    for target in ["proj/small_1.txt", "proj/large.bin", "proj/empty.txt"] {
+        let bytes = write(&members(), options(2));
+        let doctored = with_index(&bytes, |index| {
+            let e = index
+                .entries
+                .iter_mut()
+                .find(|e| e.path == target.as_bytes())
+                .unwrap();
+            e.hash.as_mut().unwrap()[5] ^= 1;
+        });
+        let a = open(doctored).unwrap();
+        let err = a.verify().unwrap_err().to_string();
+        assert!(
+            err.contains(target) && err.contains("BLAKE3"),
+            "{target}: {err}"
+        );
+        for e in a.entries() {
+            let read = a.entry_bytes(e);
+            if e.path == target.as_bytes() {
+                assert!(read.is_err(), "{target} read despite its hash");
+            } else {
+                read.unwrap();
+            }
+        }
+    }
+}
+
+/// A member far larger than `verify`'s window is hashed across windows — fed
+/// as each one is decoded, not read again — so a wrong digest at its end is
+/// still caught, and nothing is decoded twice.
+#[test]
+fn a_member_larger_than_the_cache_is_hashed_across_windows_and_decoded_once() {
+    let options = WriterOptions {
+        policy: FramePolicy {
+            small_file_threshold: 32 << 10,
+            solid_target: 64 << 10,
+            large_chunk: 64 << 10,
+        },
+        ..WriterOptions::default()
+    };
+    let big = pseudo(3 << 20, 77);
+    let mut members = vec![];
+    for i in 0..20 {
+        let content = pseudo(5000 + i * 300, i as u32);
+        let mut e = Entry::new(Kind::File, format!("before/{i:02}").into_bytes());
+        e.size = content.len() as u64;
+        members.push((e, content));
+    }
+    let mut e = Entry::new(Kind::File, "big.bin");
+    e.size = big.len() as u64;
+    members.push((e, big));
+    let mut e = Entry::new(Kind::File, "after.txt");
+    e.size = 5;
+    members.push((e, b"after".to_vec()));
+    let bytes = write(&members, options);
+    let limits = ReadLimits {
+        cache_bytes: 160 << 10,
+        ..ReadLimits::default()
+    };
+
+    let a = Archive::open(bytes.clone().into_boxed_slice(), limits).unwrap();
+    a.verify().unwrap();
+    let ratio = a.bytes_decoded() as f64 / a.tar_stream_size() as f64;
+    assert!(ratio <= 1.1, "verify decoded {ratio:.2}x");
+
+    let doctored = with_index(&bytes, |index| {
+        let e = index
+            .entries
+            .iter_mut()
+            .find(|e| e.path == b"big.bin")
+            .unwrap();
+        e.hash.as_mut().unwrap()[31] ^= 0x80;
+    });
+    let a = Archive::open(doctored.into_boxed_slice(), limits).unwrap();
+    let err = a.verify().unwrap_err().to_string();
+    assert!(err.contains("big.bin"), "{err}");
 }

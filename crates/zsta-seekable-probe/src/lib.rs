@@ -24,6 +24,7 @@ pub mod index;
 pub mod seekable;
 pub mod stock;
 pub mod tar;
+pub mod xxh3;
 pub mod xxh64;
 
 pub(crate) fn is_error(code: usize) -> bool {

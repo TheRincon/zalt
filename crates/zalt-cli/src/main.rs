@@ -151,7 +151,7 @@ fn compress(args: &Args) -> Result<(), Failure> {
     };
 
     let mut encode_one = |name: &str, content: &[u8]| -> Result<(), Failure> {
-        let frame = zalt_codec::encode::compress(content, &params)
+        let frame = zalt_embed::compress(content, &params)
             .map_err(|e| Failure::Input(format!("{name}: {e}")))?;
         sink.write_all(&frame)
             .map_err(|e| Failure::Input(format!("write failed: {e}")))?;

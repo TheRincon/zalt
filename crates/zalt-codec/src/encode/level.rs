@@ -68,7 +68,8 @@ pub enum Finder {
     /// A binary tree per hash bucket, ordered by the bytes following each
     /// position — libzstd's `bt` family. Each step halves what is left to
     /// search, so it reaches the longest matches in far fewer steps; it costs a
-    /// tree update on every position. Optimal parsing only.
+    /// tree update on every position. With lazy parsing it is libzstd's
+    /// `btlazy2`; with optimal parsing, its `btopt` family.
     Tree,
     /// libzstd's `fast`: one hash table with a single slot per hash, keyed on
     /// `min_match` bytes, and no chain. Positions are hashed only where they
@@ -118,9 +119,9 @@ pub struct Tuning {
     pub search_depth: usize,
     /// How candidates are chosen among.
     pub parse: Parse,
-    /// How candidates are found. [`Finder::Tree`] requires
-    /// [`Parse::Optimal`]; the lazy parse searches positions it then may not
-    /// insert, which a tree — where searching *is* inserting — cannot do.
+    /// How candidates are found. [`Finder::Fast`] and
+    /// [`Finder::DoubleFast`] require [`Parse::Greedy`], and [`Finder::Row`]
+    /// does not serve [`Parse::Optimal`]; a mismatch falls back to the chain.
     pub finder: Finder,
     /// A match at least this long is taken without further search. Bounds the
     /// optimal parser's cost on long matches, where pricing every length gains
@@ -217,12 +218,24 @@ const NO_TARGET: usize = usize::MAX;
 ///   effort.
 /// - **Small documents barely care**: every variant tried came within about
 ///   0.3% of the others on the ZTML corpus.
-/// - **5 to 12 search rows** (libzstd's row-hash finder), PROVISIONALLY all
-///   rows of 64 with 64 attempts: on `corpus/` that is 5.7% smaller than the
-///   chains at level 5 and 1.0% at level 9, 1.1% larger at 12 (chains went to
-///   depth 128). libzstd's own row sizes (16–64, 8–64 attempts) cost 2–7%.
-///   The per-level speed/size dial is set once it can be timed on a quiet
-///   machine — see `doc/ZALT-MAC.md`, "Row-hash finder".
+/// - **5 to 12 search rows** (libzstd's row-hash finder), set from a sweep
+///   timed against libzstd on `corpus/` (2026-10-10). Rows of 16/32/64 with
+///   16/32/64 attempts are the points worth having — 64 with 32 lost to 32
+///   with 32 on both axes — and depth climbs with the level: 16 at 5, 32 at
+///   6–7, 64 from 8. Against the chains these replaced: level 5 2.3% smaller
+///   at the same speed, level 9 1% smaller and 1.4x faster, level 12 1.1%
+///   larger and 3x faster (0.998x `zstd -12`'s size at 1.42x its time). Rows
+///   cap at 64 candidates, so deeper search above 12 is a tree's job —
+///   libzstd's `btlazy2` at 13–15.
+/// - **13 to 15 stay on chains**, measured 2026-10-11. The tree pairs with
+///   the lazy parse (see `find_tree`), but zalt's tree sorts every position
+///   on insertion, match interiors included, and that dominates: at depths
+///   16, 32 and 64 it ran about 10 MB/s whatever the depth, against 13.6 for
+///   the 192-deep chain at 13 — 2.3–2.5x `zstd -13`'s time against 1.8x.
+///   Only at 15 did it win on time (1.07x against 1.36x, depth 64), for 0.5%
+///   more size (1.026x against 1.021x). libzstd's `btlazy2` avoids the cost
+///   with a *deferred* tree: positions join their bucket unsorted and are
+///   sorted only when a search passes through them.
 /// - **1 to 4 are libzstd's `fast` and `dfast`**, with the parameters
 ///   `clevels.h` gives for input over 256 KB (1.5.7, read from the vendored
 ///   copy): windows 19–21, hash bits 14/16 and 17+16/18+18, keys of 7, 6, 5
@@ -233,9 +246,9 @@ const TABLE: [Tuning; 19] = [
     fast(20, 16, 6),                                         //  2
     dfast(21, 17, 16, 5),                                    //  3
     dfast(21, 18, 18, 5),                                    //  4
-    row(21, 19, 6, 64, Parse::Lazy(1)),                      //  5
-    row(21, 19, 6, 64, Parse::Lazy(1)),                      //  6
-    row(21, 20, 6, 64, Parse::Lazy(2)),                      //  7
+    row(21, 19, 4, 16, Parse::Lazy(1)),                      //  5
+    row(21, 19, 5, 32, Parse::Lazy(1)),                      //  6
+    row(21, 20, 5, 32, Parse::Lazy(2)),                      //  7
     row(21, 20, 6, 64, Parse::Lazy(2)),                      //  8
     row(22, 21, 6, 64, Parse::Lazy(2)),                      //  9
     row(22, 22, 6, 64, Parse::Lazy(2)),                      // 10
@@ -296,13 +309,17 @@ mod tests {
 
     /// Effort must not fall as the level rises. A table that searched less at
     /// level 12 than at 11 would be a typo, and one that is invisible: every
-    /// frame would still decode.
+    /// frame would still decode. Depth is compared only where it means the
+    /// same thing — the same parse *and* finder: 64 row attempts and 16 tree
+    /// nodes are not on one scale.
     #[test]
     fn effort_is_monotone_within_each_parse_family() {
         for pair in TABLE.windows(2) {
             let (a, b) = (pair[0], pair[1]);
             assert!(b.window_log >= a.window_log, "{a:?} -> {b:?}");
-            if core::mem::discriminant(&a.parse) == core::mem::discriminant(&b.parse) {
+            if core::mem::discriminant(&a.parse) == core::mem::discriminant(&b.parse)
+                && core::mem::discriminant(&a.finder) == core::mem::discriminant(&b.finder)
+            {
                 assert!(b.search_depth >= a.search_depth, "{a:?} -> {b:?}");
                 assert!(b.target_length >= a.target_length, "{a:?} -> {b:?}");
             }

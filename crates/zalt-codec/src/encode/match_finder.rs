@@ -30,8 +30,11 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use core::marker::PhantomData;
+
 use super::level::{Finder, Parse as ParseMode, Tuning};
 use super::optimal::{Prices, Stats};
+use crate::backend::{Backend, Scalar};
 use crate::sequences::{REP_COUNT, REP_INITIAL, resolve_offset};
 
 /// Shortest match worth emitting.
@@ -120,6 +123,13 @@ fn hash_log_for(len: usize, max: u32) -> u32 {
 /// Marks an empty slot. Unreachable as a position: a frame this encoder emits
 /// is bounded well below 4 GiB.
 const EMPTY: u32 = u32::MAX;
+
+/// The deferred tree's mark, in a position's second slot, for "in its bucket
+/// but not yet sorted". libzstd uses 1, which a real position can equal; this
+/// cannot, for the same reason [`EMPTY`] cannot. And a descent that read it
+/// as a child would stop there: the tree's age check rejects any child not
+/// older than its parent, and nothing is older than this.
+const UNSORTED: u32 = u32::MAX - 1;
 
 /// One LZ77 sequence: literals, then a match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,50 +226,6 @@ fn four_at(input: &[u8], pos: usize) -> Option<u32> {
         .get(pos..)?
         .first_chunk::<4>()
         .map(|w| u32::from_le_bytes(*w))
-}
-
-/// How far two slices agree, from their starts.
-///
-/// **A word at a time**, which is where the encoder's time was going. This is
-/// the innermost loop of the whole encoder — [`Matcher::find`] runs it up to
-/// [`SEARCH_DEPTH`] times per position, twice over for the lazy step — and a
-/// byte-at-a-time `take_while` walks it with a compare and an unpredictable
-/// branch per byte. Comparing eight bytes at once turns that into an XOR and a
-/// `trailing_zeros`, which on Firestorm is `eor`/`rbit`/`clz`: three
-/// instructions for what was eight iterations.
-///
-/// `trailing_zeros` finds the lowest *bit* that differs, and because the load is
-/// little-endian the lowest differing bit lies in the lowest differing byte —
-/// so `>> 3` is the byte index, with no endianness correction. A big-endian host
-/// would need `leading_zeros` instead, which is why the load is explicitly
-/// `from_le_bytes` rather than native.
-///
-/// No `unsafe`, and no bounds check in the loop either: `first_chunk` returns
-/// `None` at the end of the shorter slice, which is also the loop's exit
-/// condition. `matched` only advances after *both* chunks are produced, so the
-/// slicing below it can never be out of range.
-fn common_prefix(a: &[u8], b: &[u8]) -> usize {
-    const WORD: usize = 8;
-
-    let mut matched = 0usize;
-    while let (Some(x), Some(y)) = (
-        a[matched..].first_chunk::<WORD>(),
-        b[matched..].first_chunk::<WORD>(),
-    ) {
-        let diff = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
-        if diff != 0 {
-            return matched + (diff.trailing_zeros() >> 3) as usize;
-        }
-        matched += WORD;
-    }
-
-    // Fewer than eight bytes left on one side. At most seven iterations.
-    matched
-        + a[matched..]
-            .iter()
-            .zip(&b[matched..])
-            .take_while(|(x, y)| x == y)
-            .count()
 }
 
 /// The `Offset_Value` that encodes `offset`, and the repeat table after it.
@@ -388,7 +354,10 @@ fn relax(
 }
 
 /// A match finder whose history persists across the blocks of one frame.
-pub struct Matcher {
+///
+/// Generic over the [`Backend`] that measures matches — `common_prefix`, the
+/// one encoder kernel. [`Scalar`] unless a caller picks another.
+pub struct Matcher<B = Scalar> {
     /// Most recent position for each hash. For [`Finder::DoubleFast`], the
     /// short table.
     head: Vec<u32>,
@@ -414,6 +383,11 @@ pub struct Matcher {
     /// indexed by position modulo the tree's size. Empty for the chain.
     tree: Vec<u32>,
     tree_mask: usize,
+    /// Whether the tree defers sorting — libzstd's `btlazy2` — which it does
+    /// under the greedy and lazy parses. See [`Matcher::find_tree`].
+    deferred: bool,
+    /// Scratch for the deferred tree: the unsorted positions a search walked.
+    unsorted: Vec<u32>,
     /// Largest offset the frame's declared window admits.
     max_offset: usize,
     /// Chain candidates examined per search.
@@ -426,9 +400,10 @@ pub struct Matcher {
     /// build a scout matcher identical to this one.
     tuning: Tuning,
     window_log: u8,
-    /// First position not yet inserted. Only the optimal parser uses it: it
-    /// searches positions out of the order the lazy loop visits them, and
-    /// catches the chain up to wherever it is about to search.
+    /// First position not yet inserted. The optimal parser uses it with either
+    /// finder — it searches positions out of the order the lazy loop visits
+    /// them, and catches up to wherever it is about to search — and the lazy
+    /// loop uses it with a tree, where searching inserts.
     indexed: usize,
     /// What the optimal parser prices from, carried across blocks.
     stats: Option<Stats>,
@@ -445,9 +420,11 @@ pub struct Matcher {
     /// from the decoder's copy. Reset per *frame*, which is why it lives with
     /// the matcher rather than being rebuilt per block.
     repeats: [u32; REP_COUNT],
+    /// The kernel that measures matches. Zero-sized.
+    backend: PhantomData<B>,
 }
 
-impl Matcher {
+impl<B: Backend> Matcher<B> {
     /// A matcher for a frame with this `windowLog`, encoding `input_len` bytes.
     ///
     /// **`input_len` sizes the tables and nothing else.** It is not a limit —
@@ -498,13 +475,12 @@ impl Matcher {
                 .checked_next_power_of_two()
                 .unwrap_or(window),
         );
-        // A tree only where something can use it: the lazy parse searches
-        // positions it may then skip inserting, and in a tree searching *is*
-        // inserting. Level tables pair them correctly; this keeps a wrong
-        // pairing from ever reaching the lazy loop. The fast finders have their
-        // own greedy loops and nothing else.
+        // The fast finders have their own greedy loops and nothing else, and
+        // rows serve only the greedy/lazy loop. A tree serves both parses: in a
+        // tree searching *is* inserting, and both keep it in order through the
+        // `indexed` cursor — see `find_tree`.
         let finder = match (tuning.finder, tuning.parse) {
-            (Finder::Tree, ParseMode::Optimal { .. }) => Finder::Tree,
+            (Finder::Tree, _) => Finder::Tree,
             (f @ (Finder::Fast { .. } | Finder::DoubleFast { .. }), ParseMode::Greedy) => f,
             (f @ Finder::Row { .. }, ParseMode::Greedy | ParseMode::Lazy(_)) => f,
             _ => Finder::Chain,
@@ -547,6 +523,8 @@ impl Matcher {
             finder,
             tree: vec![EMPTY; 2 * tree_size],
             tree_mask: tree_size.saturating_sub(1),
+            deferred: finder == Finder::Tree && !matches!(tuning.parse, ParseMode::Optimal { .. }),
+            unsorted: Vec::new(),
             max_offset: window,
             depth: tuning.search_depth.max(1),
             mode: tuning.parse,
@@ -560,12 +538,18 @@ impl Matcher {
             candidates: Vec::new(),
             path: Vec::new(),
             repeats: REP_INITIAL,
+            backend: PhantomData,
         }
     }
 
     fn insert(&mut self, input: &[u8], pos: usize) {
         if self.row_log > 0 {
             return self.insert_row(input, pos);
+        }
+        if self.finder == Finder::Tree {
+            // A position the lazy loop searched is already in; the cursor
+            // knows, and inserting it again would corrupt the tree.
+            return self.insert_up_to(input, pos + 1);
         }
         let h = hash4(&input[pos..], self.hash_log);
         self.chain[pos & self.chain_mask] = self.head[h];
@@ -644,7 +628,7 @@ impl Matcher {
             if best_len > 0 && input[c + best_len] != input[pos + best_len] {
                 continue;
             }
-            let length = common_prefix(&input[c..], &input[pos..pos + available]);
+            let length = B::common_prefix(&input[c..], &input[pos..pos + available]);
             if length > best_len {
                 best_len = length;
                 best_offset = pos - c;
@@ -654,6 +638,113 @@ impl Matcher {
             }
         }
         (best_len >= MIN_MATCH).then_some((best_len, best_offset))
+    }
+
+    /// The lazy loop's search, whichever finder: `find`, or `find_tree`.
+    fn search(&mut self, input: &[u8], pos: usize, limit: usize) -> Option<(usize, usize)> {
+        if self.finder == Finder::Tree {
+            self.find_tree(input, pos, limit)
+        } else {
+            self.find(input, pos, limit)
+        }
+    }
+
+    /// Longest match at `pos` in the deferred tree, inserting `pos` —
+    /// libzstd's `btlazy2` (`ZSTD_DUBT_findBestMatch`, 1.5.7).
+    ///
+    /// **Why deferred.** A tree that sorts each position as it is inserted
+    /// pays a descent for every byte, match interiors included, and under the
+    /// lazy parse — which searches only a fraction of positions — that cost
+    /// is most of the work: measured 2026-10-11, it lost to plain chains at
+    /// levels 13–14. So positions the parse does not search join their bucket
+    /// *unsorted*, as a chain link ([`Matcher::add_unsorted`]), and are sorted
+    /// only when a search here walks past them. Interiors no search reaches
+    /// are never sorted at all.
+    ///
+    /// **The search** walks the bucket's unsorted positions newest first, up
+    /// to the depth; cuts the list there if it is still going, dropping what
+    /// is older — libzstd's trade, a little ratio for bounded time; sorts the
+    /// walked positions into the tree oldest first, each becoming the root
+    /// over everything older; and then searches the tree and makes `pos` its
+    /// root, as the optimal parser's tree does.
+    ///
+    /// **Order.** The tree needs each position inserted exactly once and in
+    /// order, and the lazy loop searches some positions and indexes the rest
+    /// afterwards, so this goes through the cursor the optimal parser uses:
+    /// everything before `pos` is caught up first, and the loop's later
+    /// `insert` of `pos` finds the cursor already past it. A position the
+    /// cursor has passed is not searched at all; it would be inserted twice.
+    fn find_tree(&mut self, input: &[u8], pos: usize, limit: usize) -> Option<(usize, usize)> {
+        let available = limit.saturating_sub(pos);
+        if available < MIN_MATCH {
+            return None;
+        }
+        self.insert_up_to(input, pos);
+        if self.indexed != pos {
+            return None;
+        }
+
+        // Walk the unsorted positions. Only above `reused_below`, where a
+        // slot still belongs to the position that names it, and each strictly
+        // older than the last — anything else is stale.
+        let reused_below = pos.saturating_sub(self.tree_mask);
+        let floor = pos.saturating_sub(self.max_offset);
+        let mut walked = core::mem::take(&mut self.unsorted);
+        walked.clear();
+        let mut budget = self.depth;
+        let mut node = self.head[hash4(&input[pos..], self.hash_log)];
+        let mut previous = pos;
+        let mask = self.tree_mask;
+        let is_unsorted = |tree: &[u32], m: u32, previous: usize| {
+            let m = m as usize;
+            m < previous && m > reused_below && m >= floor && tree[2 * (m & mask) + 1] == UNSORTED
+        };
+        while node != EMPTY && is_unsorted(&self.tree, node, previous) && budget > 1 {
+            walked.push(node);
+            previous = node as usize;
+            node = self.tree[2 * (node as usize & mask)];
+            budget -= 1;
+        }
+        // Out of budget with the list still going: cut it here. The position
+        // becomes a sorted leaf, and everything older drops out of the tree.
+        if node != EMPTY && is_unsorted(&self.tree, node, previous) {
+            let slots = 2 * (node as usize & self.tree_mask);
+            self.tree[slots] = EMPTY;
+            self.tree[slots + 1] = EMPTY;
+        }
+        // Oldest first, so each sorts into a tree of positions already
+        // sorted. Its first slot is its link to the next older — the root of
+        // that tree — and the descent overwrites both slots.
+        for &u in walked.iter().rev() {
+            let u = u as usize;
+            let root = self.tree[2 * (u & self.tree_mask)];
+            self.tree_descend(input, u, root, pos, budget, 0, 0, None);
+            budget += 1;
+        }
+        self.unsorted = walked;
+
+        let mut out = core::mem::take(&mut self.candidates);
+        out.clear();
+        self.tree_update(input, pos, available, MIN_MATCH - 1, Some(&mut out));
+        self.indexed = pos + 1;
+        // Reported shortest first, each longer than the last.
+        let best = out
+            .last()
+            .map(|&(length, offset)| (length as usize, offset as usize));
+        self.candidates = out;
+        best
+    }
+
+    /// Put `pos` at the head of its bucket in the deferred tree, unsorted:
+    /// its first slot links to the previous head, as a chain would, and its
+    /// second holds [`UNSORTED`] until a search sorts it. libzstd's
+    /// `ZSTD_updateDUBT`.
+    fn add_unsorted(&mut self, input: &[u8], pos: usize) {
+        let h = hash4(&input[pos..], self.hash_log);
+        let slots = 2 * (pos & self.tree_mask);
+        self.tree[slots] = self.head[h];
+        self.tree[slots + 1] = UNSORTED;
+        self.head[h] = pos as u32;
     }
 
     /// Longest match at `pos`, searching back through the chain.
@@ -719,7 +810,7 @@ impl Matcher {
                 // §5's win #2 has a one-byte source. Reaching past `pos` is
                 // sound because the decoder copies byte by byte and reads back
                 // what it has just written.
-                let length = common_prefix(&input[c..], &input[pos..pos + available]);
+                let length = B::common_prefix(&input[c..], &input[pos..pos + available]);
                 if length > best_len {
                     best_len = length;
                     best_offset = pos - c;
@@ -802,7 +893,7 @@ impl Matcher {
         if floor > 0 && input[pos - offset + floor - 1] != input[pos + floor - 1] {
             return 0;
         }
-        common_prefix(&input[pos - offset..], &input[pos..pos + available])
+        B::common_prefix(&input[pos - offset..], &input[pos..pos + available])
     }
 
     /// Insert every position from the cursor up to, not including, `target`.
@@ -821,6 +912,7 @@ impl Matcher {
                     // `with_tuning` pairs them with greedy parsing only — and
                     // would index nothing here if they did.
                     Finder::Chain => self.insert(input, self.indexed),
+                    Finder::Tree if self.deferred => self.add_unsorted(input, self.indexed),
                     Finder::Tree => step = self.tree_update(input, self.indexed, 0, 0, None),
                     Finder::Fast { .. } | Finder::DoubleFast { .. } | Finder::Row { .. } => {}
                 }
@@ -867,20 +959,41 @@ impl Matcher {
         input: &[u8],
         pos: usize,
         available: usize,
+        best: usize,
+        out: Option<&mut Vec<(u32, u32)>>,
+    ) -> usize {
+        let h = hash4(&input[pos..], self.hash_log);
+        let node = self.head[h];
+        self.head[h] = pos as u32;
+        self.tree_descend(input, pos, node, pos, self.depth, available, best, out)
+    }
+
+    /// The descent of [`Matcher::tree_update`]: make `pos` the root of the
+    /// tree whose old root is `node`, comparing at most `budget` nodes.
+    ///
+    /// Separate so the deferred tree can sort a position that is already in
+    /// its bucket — see [`Matcher::find_tree`] — where the old root is the
+    /// position's own link rather than the bucket's head, and the newest
+    /// position written is `newest`, not `pos`.
+    #[allow(clippy::too_many_arguments)]
+    fn tree_descend(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        mut node: u32,
+        newest: usize,
+        budget: usize,
+        available: usize,
         mut best: usize,
         mut out: Option<&mut Vec<(u32, u32)>>,
     ) -> usize {
-        let h = hash4(&input[pos..], self.hash_log);
-        let mut node = self.head[h];
-        self.head[h] = pos as u32;
-
         // Bytes compared for ordering. Never past the input, and never past
         // `TREE_COMPARE_MAX` — see there.
         let hi = input.len().min(pos + TREE_COMPARE_MAX);
         let floor = pos.saturating_sub(self.max_offset);
         // A node at or below this may share its slots with a newer position
         // once the tree has wrapped, so its children are not followed.
-        let reused_below = pos.saturating_sub(self.tree_mask);
+        let reused_below = newest.saturating_sub(self.tree_mask);
 
         // The two open edges: where the next node sorting below `pos` hangs,
         // and where the next one sorting above it does. They start as `pos`'s
@@ -901,7 +1014,7 @@ impl Matcher {
         let mut longest = 0usize;
         let mut source_end = pos + 9;
 
-        for _ in 0..self.depth {
+        for _ in 0..budget {
             if node == EMPTY {
                 break;
             }
@@ -913,13 +1026,13 @@ impl Matcher {
             let slots = 2 * (m & self.tree_mask);
 
             let known = common_below.min(common_above);
-            let mut length = known + common_prefix(&input[m + known..], &input[pos + known..hi]);
+            let mut length = known + B::common_prefix(&input[m + known..], &input[pos + known..hi]);
             longest = longest.max(length);
             source_end = source_end.max(m + length);
 
             if length > best && out.is_some() {
                 // The verification described above: measured from byte zero.
-                length = common_prefix(&input[m..], &input[pos..hi]);
+                length = B::common_prefix(&input[m..], &input[pos..hi]);
                 let reportable = length.min(available);
                 if reportable > best
                     && reportable >= MIN_MATCH
@@ -1026,7 +1139,7 @@ impl Matcher {
             if input[pos - offset + best] != input[pos + best] {
                 continue;
             }
-            let length = common_prefix(&input[pos - offset..], &input[pos..pos + available]);
+            let length = B::common_prefix(&input[pos - offset..], &input[pos..pos + available]);
             if length > best {
                 out.push((length as u32, offset as u32));
                 best = length;
@@ -1059,7 +1172,7 @@ impl Matcher {
             }
             let next = self.chain[c & self.chain_mask];
             if input[c + best] == input[pos + best] {
-                let length = common_prefix(&input[c..], &input[pos..pos + available]);
+                let length = B::common_prefix(&input[c..], &input[pos..pos + available]);
                 if length > best {
                     out.push((length as u32, (pos - c) as u32));
                     best = length;
@@ -1098,7 +1211,7 @@ impl Matcher {
             && start == 0
             && !self.scouted
         {
-            let mut scout = Matcher::with_tuning(self.tuning, self.window_log, end);
+            let mut scout = Matcher::<B>::with_tuning(self.tuning, self.window_log, end);
             scout.scouted = true;
             let _ = scout.parse_optimal(input, start, end);
             self.stats = scout.stats;
@@ -1333,6 +1446,10 @@ impl Matcher {
 
     /// Index every position in a range that has four bytes to hash.
     fn index_range(&mut self, input: &[u8], from: usize, to: usize) {
+        if self.finder == Finder::Tree {
+            // In order, from the cursor; `from` is already behind it.
+            return self.insert_up_to(input, to);
+        }
         let end = to.min(input.len().saturating_sub(MIN_MATCH - 1));
         // Every position, for the row finder too. libzstd's row finder indexes
         // only the first 96 and last 32 positions of a match over 384 bytes;
@@ -1401,7 +1518,7 @@ impl Matcher {
         // invariant its simple form — the interleave in particular needs the
         // insert to lead the search, which is precisely the bug above.
         while pos + MIN_MATCH <= limit {
-            let found = self.find(input, pos, limit);
+            let found = self.search(input, pos, limit);
             self.insert(input, pos);
 
             let Some((mut length, mut offset)) = found else {
@@ -1440,7 +1557,7 @@ impl Matcher {
                 ParseMode::Optimal { .. } => 0,
             };
             for _ in 0..lookahead {
-                match self.find(input, pos + 1, limit) {
+                match self.search(input, pos + 1, limit) {
                     Some((next_len, next_offset)) if next_len >= length + LAZY_MARGIN => {
                         self.insert(input, pos + 1);
                         pos += 1;
@@ -1521,7 +1638,7 @@ impl Matcher {
         if four_at(input, pos - offset)? != four_at(input, pos)? {
             return None;
         }
-        Some(common_prefix(&input[pos - offset..], &input[pos..limit]))
+        Some(B::common_prefix(&input[pos - offset..], &input[pos..limit]))
     }
 
     /// Extend a match backwards over literals it can absorb, as libzstd does:
@@ -1601,7 +1718,7 @@ impl Matcher {
                 && four_at(input, candidate as usize) == four_at(input, pos)
             {
                 let offset = pos - candidate as usize;
-                let length = common_prefix(&input[candidate as usize..], &input[pos..limit]);
+                let length = B::common_prefix(&input[candidate as usize..], &input[pos..limit]);
                 let (at, length) = Self::catch_up(input, anchor, pos, length, offset);
                 Some((at, length, offset))
             } else {
@@ -1681,13 +1798,13 @@ impl Matcher {
                 && word_at(input, cl as usize) == word_at(input, pos)
             {
                 let offset = pos - cl as usize;
-                let length = common_prefix(&input[cl as usize..], &input[pos..limit]);
+                let length = B::common_prefix(&input[cl as usize..], &input[pos..limit]);
                 let (at, length) = Self::catch_up(input, anchor, pos, length, offset);
                 Some((at, length, offset))
             } else if self.usable(cs, pos) && four_at(input, cs as usize) == four_at(input, pos) {
                 let mut offset = pos - cs as usize;
                 let mut at = pos;
-                let mut length = common_prefix(&input[cs as usize..], &input[pos..limit]);
+                let mut length = B::common_prefix(&input[cs as usize..], &input[pos..limit]);
                 // A long match a byte on beats the short one in hand.
                 if let Some(h1) = long(input, pos + 1) {
                     let c1 = self.long[h1];
@@ -1696,7 +1813,7 @@ impl Matcher {
                         && pos + 1 + 8 <= limit
                         && word_at(input, c1 as usize) == word_at(input, pos + 1)
                     {
-                        let l1 = common_prefix(&input[c1 as usize..], &input[pos + 1..limit]);
+                        let l1 = B::common_prefix(&input[c1 as usize..], &input[pos + 1..limit]);
                         if l1 > length {
                             (at, length, offset) = (pos + 1, l1, pos + 1 - c1 as usize);
                         }
@@ -1745,6 +1862,10 @@ impl Matcher {
 mod tests {
     use super::*;
     use alloc::format;
+
+    // The tests measure with the reference backend; the equivalence tests in
+    // `zalt-neon` hold every other backend to the same frames.
+    type Matcher = super::Matcher<crate::Scalar>;
 
     fn parse_one(block: &[u8]) -> Parse {
         Matcher::new(17, block.len()).parse(block, 0, block.len())
@@ -1871,10 +1992,13 @@ mod tests {
         }
     }
 
-    /// Levels 5–12 (the row finder) account for every byte and replay to the
-    /// input across blocks.
+    /// Levels 5–15 (the lazy parse over rows, then over a tree) account for every
+    /// byte and replay to the input across blocks. For the tree this is also
+    /// the in-order check: a position searched by the lookahead and then
+    /// indexed again would corrupt the tree, and with the tree's own verified
+    /// reporting that shows up here as matches missing, not wrong bytes.
     #[test]
-    fn the_row_finder_parses_and_replays_across_blocks() {
+    fn the_lazy_finders_parse_and_replay_across_blocks() {
         let mut input = Vec::new();
         for i in 0..400u32 {
             input.extend_from_slice(format!("line {} of the log: status ok\n", i % 37).as_bytes());
@@ -1887,9 +2011,18 @@ mod tests {
         }));
         let copy = input[100..4000].to_vec();
         input.extend_from_slice(&copy);
-        for level in 5..=12 {
-            let tuning = super::super::level::tuning(level);
-            assert!(matches!(tuning.finder, Finder::Row { .. }), "level {level}");
+        // 13–15 as a tree, though the table keeps chains there: the lazy
+        // loop's tree path must hold up whether or not a level uses it.
+        for level in 5..=15 {
+            let mut tuning = super::super::level::tuning(level);
+            if level >= 13 {
+                tuning.finder = Finder::Tree;
+                tuning.search_depth = 64;
+            }
+            assert!(
+                matches!(tuning.finder, Finder::Row { .. } | Finder::Tree),
+                "level {level}"
+            );
             let mut m = Matcher::with_tuning(tuning, 22, input.len());
             let mut start = 0;
             let mut matched = 0;
@@ -1915,6 +2048,54 @@ mod tests {
             assert!(
                 matched * 10 >= input.len() * 6,
                 "level {level} matched only {matched} of {} bytes",
+                input.len()
+            );
+        }
+    }
+
+    /// The deferred tree with a window far smaller than the input, so its
+    /// slots are reused over and over: positions in a bucket's unsorted list
+    /// and in its tree go stale under it. That may cost matches; it must never
+    /// cost bytes, an offset past the window, or a panic.
+    #[test]
+    fn the_deferred_tree_survives_a_wrapping_window() {
+        let mut input = Vec::new();
+        for i in 0..800u32 {
+            input.extend_from_slice(format!("line {} of the log: status ok\n", i % 37).as_bytes());
+        }
+        input.extend(core::iter::repeat_n(0x41u8, 3000));
+        let copy = input[100..9000].to_vec();
+        input.extend_from_slice(&copy);
+        for depth in [2, 16, 64] {
+            let tuning = Tuning {
+                finder: Finder::Tree,
+                search_depth: depth,
+                ..super::super::level::tuning(13)
+            };
+            let mut m = Matcher::with_tuning(tuning, 10, input.len());
+            assert!(m.deferred);
+            let mut start = 0;
+            let mut matched = 0;
+            while start < input.len() {
+                let end = (start + 3001).min(input.len());
+                let parse = m.parse(&input, start, end);
+                assert_accounts_for(&input[start..end], &parse);
+                assert_eq!(
+                    replay(&input[..start], &parse),
+                    &input[start..end],
+                    "depth {depth} at {start}"
+                );
+                for q in &parse.sequences {
+                    assert!(q.offset <= 1 << 10, "depth {depth}: offset {}", q.offset);
+                    matched += q.match_length as usize;
+                }
+                start = end;
+            }
+            // Consecutive log lines share most of their bytes, well inside
+            // the window, so even a tree losing positions finds most of it.
+            assert!(
+                matched * 10 >= input.len() * 6,
+                "depth {depth} matched only {matched} of {}",
                 input.len()
             );
         }
@@ -2437,6 +2618,69 @@ mod tests {
                 s.offset
             );
         }
+    }
+
+    /// The lazy parse over a tree (libzstd's `btlazy2`) finds nearly what an
+    /// exhaustive chain does, and deferring the sort costs next to nothing.
+    ///
+    /// The tree must see each position exactly once and in order, and the
+    /// lazy loop searches some positions and indexes others; the deferred
+    /// tree must also sort what a search walks, oldest first. A slip in any of
+    /// it corrupts the tree, which reports only verified matches — so it shows
+    /// as cost, never as wrong bytes. Measured on this input: the tree sorted
+    /// on insert 1.3% over a chain searched 4096 deep, and 30% over with each
+    /// lazily-searched position inserted twice; deferred, 0.08% from sorted
+    /// on insert, against 1.2% with the walk sorted newest first and 3.7%
+    /// with it not sorted at all.
+    #[test]
+    fn the_tree_finds_what_a_deep_chain_finds() {
+        let mut input = Vec::new();
+        for i in 0..6000u32 {
+            input.extend_from_slice(
+                format!(
+                    "  <entry id=\"{i}\" kind=\"{}\">value {}</entry>\n",
+                    i % 7,
+                    (i * 13) % 101
+                )
+                .as_bytes(),
+            );
+        }
+        let cost = |tuning: Tuning, deferred: bool| {
+            let mut m = Matcher::with_tuning(tuning, 22, input.len());
+            assert_eq!(m.deferred, tuning.finder == Finder::Tree);
+            m.deferred = deferred;
+            let (mut literals, mut sequences) = (0, 0);
+            let mut start = 0;
+            while start < input.len() {
+                let end = (start + (32 << 10)).min(input.len());
+                let parse = m.parse(&input, start, end);
+                assert_accounts_for(&input[start..end], &parse);
+                assert_eq!(replay(&input[..start], &parse), &input[start..end]);
+                literals += parse.literals.len();
+                sequences += parse.sequences.len();
+                start = end;
+            }
+            literals * 8 + sequences * 24
+        };
+        let tree = Tuning {
+            finder: Finder::Tree,
+            search_depth: 16,
+            ..super::super::level::tuning(13)
+        };
+        let chain = Tuning {
+            finder: Finder::Chain,
+            search_depth: 4096,
+            ..tree
+        };
+        let (sorted, deferred, chain) = (cost(tree, false), cost(tree, true), cost(chain, false));
+        assert!(
+            sorted * 100 <= chain * 105,
+            "sorted on insert {sorted} against chain {chain}"
+        );
+        assert!(
+            deferred.abs_diff(sorted) * 1000 <= sorted * 5,
+            "deferred {deferred} against sorted on insert {sorted}"
+        );
     }
 
     /// The optimal parser must not lose to the lazy one on ordinary structured

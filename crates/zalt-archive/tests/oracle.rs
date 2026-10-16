@@ -77,6 +77,7 @@ fn options(level: i32) -> WriterOptions {
         },
         threads: 4,
         creator: None,
+        hash: zalt_archive::Hash::default(),
     }
 }
 
@@ -206,7 +207,34 @@ fn index_agrees(name: &str, bytes: &[u8]) {
             "{}",
             t.path
         );
+        assert_eq!(t.hash, o.hash, "{}", t.path);
     }
+
+    // Every digest is the hash of the content as libzstd decodes it — read
+    // past our reader entirely, and hashed by the BLAKE3 authors' crate or
+    // xxHash's own C.
+    let stream = stock::decompress_stream(bytes).unwrap();
+    for t in &theirs.entries {
+        let Some(digest) = &t.hash else { continue };
+        let from = t.data_offset() as usize;
+        let content = &stream[from..from + t.size as usize];
+        let expect = match theirs.hash_algorithm {
+            1 => zsta_seekable_probe::xxh3::xxh3_128(content).to_vec(),
+            2 => blake3::hash(content).as_bytes().to_vec(),
+            n => panic!("{name}: Hash_Algorithm {n} written"),
+        };
+        assert_eq!(digest, &expect, "{name}: {}", t.path);
+    }
+}
+
+/// The same, for an archive hashed with XXH3-128 rather than the default.
+#[test]
+fn an_independent_reading_agrees_on_xxh3_hashes() {
+    let o = WriterOptions {
+        hash: zalt_archive::Hash::Xxh3,
+        ..options(3)
+    };
+    index_agrees("xxh3", &write(&members(), o));
 }
 
 // ------------------------------------------------------------ stock tools

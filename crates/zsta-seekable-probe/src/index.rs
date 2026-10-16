@@ -11,6 +11,7 @@ use crate::{
 
 pub const INDEX_MAGIC: &[u8; 4] = b"ZSTI";
 pub const INDEX_VERSION: u8 = 1;
+pub const PRESENCE_HASH: u64 = 1 << 0;
 pub const PRESENCE_LINK: u64 = 1 << 1;
 const PRESENCE_KNOWN: u64 = (1 << 9) - 1;
 const FIXED_HEADER: usize = 24;
@@ -88,6 +89,8 @@ pub struct IndexEntry {
     pub header_offset: u64,
     pub data_delta: u64,
     pub size: u64,
+    /// The raw digest (§7.2 bit 0), its length fixed by `Hash_Algorithm`.
+    pub hash: Option<Vec<u8>>,
     pub link: Option<String>,
 }
 
@@ -232,14 +235,32 @@ pub fn decode(ud: &[u8], max_body: usize) -> Result<CentralIndex, String> {
         let header_offset = get_varint(&body, &mut pos)?;
         let data_delta = get_varint(&body, &mut pos)?;
         let size = get_varint(&body, &mut pos)?;
+        // Optional fields in ascending bit order (§7.2): HASH, then LINK.
+        let hash = if presence & PRESENCE_HASH != 0 {
+            // §7.3's table: algorithm 0 forbids the bit, the rest fix a length.
+            let len = match hash_algorithm {
+                1 => 16,
+                2 | 3 => 32,
+                0 => return Err("index: HASH present under Hash_Algorithm 0".into()),
+                n => return Err(format!("index: unknown Hash_Algorithm {n}")),
+            };
+            let end = pos.checked_add(len).ok_or("index: offset overflow")?;
+            let digest = body.get(pos..end).ok_or("index: truncated HASH")?;
+            pos = end;
+            Some(digest.to_vec())
+        } else {
+            None
+        };
         let link = if presence & PRESENCE_LINK != 0 {
             let l = get_bytes(&body, &mut pos)?;
             Some(String::from_utf8(l.to_vec()).map_err(|_| "index: link is not UTF-8")?)
         } else {
             None
         };
-        if presence & !PRESENCE_LINK != 0 {
-            return Err("index: probe does not parse optional fields other than LINK".into());
+        if presence & !(PRESENCE_HASH | PRESENCE_LINK) != 0 {
+            return Err(
+                "index: probe does not parse optional fields other than HASH and LINK".into(),
+            );
         }
         if last_header.is_some_and(|h| header_offset <= h) {
             return Err("index: Header_Offset not strictly increasing".into());
@@ -264,6 +285,7 @@ pub fn decode(ud: &[u8], max_body: usize) -> Result<CentralIndex, String> {
             header_offset,
             data_delta,
             size,
+            hash,
             link,
         });
     }

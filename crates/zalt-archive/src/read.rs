@@ -21,6 +21,7 @@
 
 use std::io::Write;
 
+use crate::hash::{self, Hasher};
 use crate::index::{Entry, Index, IndexLimits};
 use crate::layout::{
     FLAG_DICT_REQUIRED, Header, MAGIC_DICTIONARY, MAGIC_HEADER, MAGIC_INDEX, MAGIC_SEEK_TABLE,
@@ -477,17 +478,54 @@ impl<S: Source + ?Sized> Archive<S> {
         Ok(m)
     }
 
-    /// Write an entry's content to `out` (§11.2), after checking its headers.
-    /// Returns the tar header's view of the member.
+    /// Write an entry's content to `out` (§11.2), after checking its headers,
+    /// and check its hash (§11.2 step 6) as the content goes past. Returns the
+    /// tar header's view of the member.
+    ///
+    /// **The content is written before the hash can be checked** — it is only
+    /// known at the end. On an error, whatever reached `out` must be
+    /// discarded; extraction removes the file.
     pub fn copy_entry(&self, e: &Entry, out: &mut dyn Write) -> Result<tar::Member> {
         let member = self.check_headers(e)?;
+        let mut hasher = self.hasher_for(e);
         if e.size > 0 {
             self.stream_range(e.data_offset, e.data_offset + e.size, &mut |chunk| {
+                if let Some(h) = hasher.as_mut() {
+                    h.update(chunk);
+                }
                 out.write_all(chunk)
                     .map_err(|err| Error::Io(format!("writing {}", e.path_lossy()), err))
             })?;
         }
+        if let Some(h) = hasher {
+            self.compare_hash(e, &h)?;
+        }
         Ok(member)
+    }
+
+    /// A hasher for an entry's content, if it has a hash this crate can
+    /// check. SHA-256 digests are not checked; see [`crate::hash`].
+    fn hasher_for(&self, e: &Entry) -> Option<Hasher> {
+        e.hash.as_ref()?;
+        Hasher::new(self.index.hash_algorithm, self.threads)
+    }
+
+    fn compare_hash(&self, e: &Entry, h: &Hasher) -> Result<()> {
+        if e.hash.as_deref() == Some(h.finish().as_slice()) {
+            return Ok(());
+        }
+        Err(Error::Inconsistent(format!(
+            "{}: the content does not match its {} hash",
+            e.path_lossy(),
+            hash::algorithm_name(self.index.hash_algorithm)
+        )))
+    }
+
+    /// Whether this reader checks the archive's entry hashes: it has some, in
+    /// an algorithm this crate computes.
+    pub fn checks_hashes(&self) -> bool {
+        hash::can_check(self.index.hash_algorithm)
+            && self.index.entries.iter().any(|e| e.hash.is_some())
     }
 
     /// An entry's content.
@@ -507,17 +545,28 @@ impl<S: Source + ?Sized> Archive<S> {
     /// index a complete account of the stream: a member present in the tar but
     /// missing from the index would leave a gap, and be caught here, where a
     /// stock `tar -x` would extract it without the index ever mentioning it.
+    /// And every member's content matches its hash, where it has one this
+    /// crate can check ([`Archive::checks_hashes`]).
     pub fn verify(&self) -> Result<()> {
         // One pass in stream order: a window of frames decoded in parallel,
         // then the headers of every member that window completes, checked
         // while it is still in the cache. Decoding everything first and
         // checking afterwards decoded every frame twice — the second time on
         // one thread — once an archive outgrew the cache.
+        //
+        // Content is hashed in the same pass, from the same window. Members
+        // tile the stream, so at most one is still being hashed when a window
+        // ends — one larger than the window — and it carries over: `active`,
+        // with how far it has been fed.
         let mut entries = self.index.entries.iter().peekable();
         let mut expected = 0u64;
         let mut covered = 0u64;
+        let mut active: Option<(&Entry, Hasher, u64)> = None;
         while covered < self.index.tar_stream_size {
             covered = self.prefetch(covered)?;
+            if let Some((e, h, fed)) = active.take() {
+                active = self.feed(e, h, fed, covered)?;
+            }
             while let Some(e) = entries.next_if(|e| e.data_offset <= covered) {
                 if e.header_offset != expected {
                     return Err(Error::Inconsistent(format!(
@@ -528,7 +577,16 @@ impl<S: Source + ?Sized> Archive<S> {
                 }
                 self.check_headers(e)?;
                 expected = e.data_offset + pad(e.size);
+                if let Some(h) = self.hasher_for(e) {
+                    active = self.feed(e, h, e.data_offset, covered)?;
+                }
             }
+        }
+        if let Some((e, _, _)) = active {
+            return Err(Error::Inconsistent(format!(
+                "{} runs past the end of the tar stream",
+                e.path_lossy()
+            )));
         }
         if let Some(e) = entries.next() {
             return Err(Error::Inconsistent(format!(
@@ -550,6 +608,31 @@ impl<S: Source + ?Sized> Archive<S> {
             )));
         }
         Ok(())
+    }
+
+    /// Hash an entry's content from `fed` up to `covered` — the frames
+    /// decoded so far — and check it once it is complete. Returns the hasher
+    /// to carry into the next window if the content goes on past `covered`.
+    fn feed<'e>(
+        &self,
+        e: &'e Entry,
+        mut h: Hasher,
+        fed: u64,
+        covered: u64,
+    ) -> Result<Option<(&'e Entry, Hasher, u64)>> {
+        let end = e.data_offset + e.size;
+        let to = end.min(covered);
+        if to > fed {
+            self.stream_range(fed, to, &mut |chunk| {
+                h.update(chunk);
+                Ok(())
+            })?;
+        }
+        if to == end {
+            self.compare_hash(e, &h)?;
+            return Ok(None);
+        }
+        Ok(Some((e, h, to)))
     }
 
     /// Decode, in parallel, the frames from the one holding stream offset

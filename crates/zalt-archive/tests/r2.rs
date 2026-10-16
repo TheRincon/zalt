@@ -21,6 +21,7 @@ fn options() -> WriterOptions {
         },
         threads: 2,
         creator: Some(b"r2 test".to_vec()),
+        hash: zalt_archive::Hash::default(),
     }
 }
 

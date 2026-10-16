@@ -55,6 +55,7 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 
+use crate::hash::{Hash, Hasher};
 use crate::index::{Entry, Index, Kind};
 use crate::layout::{
     FLAG_DICT_REQUIRED, Header, MAGIC_HEADER, MAGIC_INDEX, SeekEntry, TAG_CREATOR,
@@ -120,6 +121,10 @@ pub struct WriterOptions {
     /// The `Creator` header TLV. `Created` is never written: §12.4 lists its
     /// absence as a condition of reproducible output.
     pub creator: Option<Vec<u8>>,
+    /// The hash each member's content gets (§7.3). BLAKE3 by default; see
+    /// [`crate::hash`]. Ignored when appending: an index has one
+    /// `Hash_Algorithm`, so an appended member gets the archive's own.
+    pub hash: Hash,
 }
 
 impl Default for WriterOptions {
@@ -129,6 +134,7 @@ impl Default for WriterOptions {
             policy: FramePolicy::default(),
             threads: 0,
             creator: Some(format!("zalt {}", env!("CARGO_PKG_VERSION")).into_bytes()),
+            hash: Hash::default(),
         }
     }
 }
@@ -163,8 +169,8 @@ pub struct Writer<W: Write> {
     data_frames: u64,
     /// Every path in the archive so far, to refuse a second member with one.
     paths: HashSet<Vec<u8>>,
-    /// The index's `Hash_Algorithm`: 0 for a new archive, an appended
-    /// archive's own otherwise.
+    /// The index's `Hash_Algorithm`: the options' for a new archive, an
+    /// appended archive's own otherwise.
     hash_algorithm: u8,
 }
 
@@ -210,6 +216,7 @@ impl<W: Write> Writer<W> {
             paths: HashSet::new(),
             hash_algorithm: 0,
         };
+        w.hash_algorithm = w.options.hash.algorithm();
         let mut header = Header::default();
         if let Some(creator) = &w.options.creator {
             header.tlvs.push((TAG_CREATOR, creator.clone()));
@@ -352,6 +359,15 @@ impl<W: Write> Writer<W> {
                 entry.path_lossy()
             )));
         }
+        // The hash covers the content (§7.2), so only members that have
+        // some get one — an empty file included, whose hash is well defined.
+        // Whatever the caller put in `entry.hash` is the writer's to replace.
+        entry.hash = None;
+        let mut hasher = if entry.kind.has_content() {
+            Hasher::new(self.hash_algorithm, self.threads)
+        } else {
+            None
+        };
         let mut headers = Vec::with_capacity(BLOCK * 2);
         let header_len = tar::write_headers(&mut headers, &entry, extras)?;
         self.paths.insert(entry.path.clone());
@@ -366,7 +382,8 @@ impl<W: Write> Writer<W> {
             entry.data_offset = entry.header_offset + header_len;
             self.group.extend_from_slice(&headers);
             let name = entry.path_lossy().into_owned();
-            read_content(content, &mut self.group, entry.size, &name)?;
+            read_content(content, &mut self.group, entry.size, &name, hasher.as_mut())?;
+            entry.hash = hasher.map(|h| h.finish());
             self.entries.push(entry);
             return Ok(());
         }
@@ -380,7 +397,8 @@ impl<W: Write> Writer<W> {
 
         if total <= policy.solid_target {
             let mut payload = headers;
-            read_content(content, &mut payload, size, &name)?;
+            read_content(content, &mut payload, size, &name, hasher.as_mut())?;
+            self.set_last_hash(hasher);
             return self.queue(payload);
         }
 
@@ -392,10 +410,11 @@ impl<W: Write> Writer<W> {
         loop {
             let room = (chunk - payload.len()) as u64;
             let take = room.min(remaining);
-            read_exact_into(content, &mut payload, take, &name)?;
+            read_exact_into(content, &mut payload, take, &name, hasher.as_mut())?;
             remaining -= take;
             if remaining == 0 {
                 payload.resize(pad(payload.len() as u64) as usize, 0);
+                self.set_last_hash(hasher);
                 return self.queue(payload);
             }
             self.queue(std::mem::replace(&mut payload, Vec::with_capacity(chunk)))?;
@@ -432,6 +451,13 @@ impl<W: Write> Writer<W> {
             data_frames: self.data_frames,
         };
         Ok((self.out, summary))
+    }
+
+    /// Record the hash of the member just pushed, now its content is read.
+    fn set_last_hash(&mut self, hasher: Option<Hasher>) {
+        if let Some(e) = self.entries.last_mut() {
+            e.hash = hasher.map(|h| h.finish());
+        }
     }
 
     fn close_group(&mut self) -> Result<()> {
@@ -518,15 +544,28 @@ impl<W: Write> Writer<W> {
 }
 
 /// Read a file's content into `out`, padded to whole blocks.
-fn read_content(content: &mut dyn Read, out: &mut Vec<u8>, size: u64, name: &str) -> Result<()> {
-    read_exact_into(content, out, size, name)?;
+fn read_content(
+    content: &mut dyn Read,
+    out: &mut Vec<u8>,
+    size: u64,
+    name: &str,
+    hasher: Option<&mut Hasher>,
+) -> Result<()> {
+    read_exact_into(content, out, size, name, hasher)?;
     out.resize(pad(out.len() as u64) as usize, 0);
     Ok(())
 }
 
-/// Read exactly `n` bytes. A file that shrank after its size was taken is an
-/// error, not a short member: the header already promised `n`.
-fn read_exact_into(content: &mut dyn Read, out: &mut Vec<u8>, n: u64, name: &str) -> Result<()> {
+/// Read exactly `n` bytes, hashing them as they arrive. A file that shrank
+/// after its size was taken is an error, not a short member: the header
+/// already promised `n`.
+fn read_exact_into(
+    content: &mut dyn Read,
+    out: &mut Vec<u8>,
+    n: u64,
+    name: &str,
+    hasher: Option<&mut Hasher>,
+) -> Result<()> {
     let before = out.len();
     content
         .take(n)
@@ -540,6 +579,9 @@ fn read_exact_into(content: &mut dyn Read, out: &mut Vec<u8>, n: u64, name: &str
                 "the file is shorter than when its size was taken",
             ),
         ));
+    }
+    if let Some(h) = hasher {
+        h.update(&out[before..]);
     }
     Ok(())
 }

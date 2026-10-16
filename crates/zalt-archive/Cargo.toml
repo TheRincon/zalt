@@ -13,6 +13,12 @@ zalt-codec.workspace = true
 # For the backend chosen at compile time (NEON on aarch64), so archive
 # decoding runs the same kernels every other zalt decode does.
 zalt-embed.workspace = true
+# The default entry hash (§7.3), from the BLAKE3 authors. `pure` builds only
+# the portable Rust: no C or assembly, and on aarch64 no `unsafe` in what runs
+# (read from 1.8.7's build.rs and src/, 2026-10-12). Three crates come with
+# it: arrayvec, constant_time_eq and cfg-if, plus cc at build time. XXH3-128,
+# the other hash, is this crate's own (`src/xxh3.rs`).
+blake3 = { version = "1.8", default-features = false, features = ["std", "pure"] }
 
 # `native-fs`: archiving and extracting real files (the `fs` module), with
 # the metadata §9.3 asks for. Each of these replaces hand-written system-call

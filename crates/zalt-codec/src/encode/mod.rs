@@ -41,6 +41,7 @@
 
 use alloc::vec::Vec;
 
+use crate::backend::{Backend, Scalar};
 use crate::error::{Error, Result};
 use crate::params::{WINDOWLOG_ABSOLUTE_MAX, WINDOWLOG_MIN};
 
@@ -168,8 +169,19 @@ impl EncodeParams {
     }
 }
 
-/// Compress `input` into a single zstd frame.
+/// Compress `input` into a single zstd frame, measuring matches with the
+/// portable [`Scalar`] backend.
+///
+/// The output is byte-identical whichever backend measures — a backend changes
+/// how fast the answer arrives, never the answer — so this is the reference.
+/// To encode with the build's own backend (NEON on aarch64), call
+/// [`compress_with`], or `zalt_embed::compress`, which picks it.
 pub fn compress(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
+    compress_with::<Scalar>(input, params)
+}
+
+/// [`compress`], with matches measured by backend `B`.
+pub fn compress_with<B: Backend>(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
     params.validate()?;
 
     let tuning = (params.strategy == Strategy::Compress).then(|| level::tuning(params.level));
@@ -223,7 +235,7 @@ pub fn compress(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
     } else {
         proposed
     };
-    block::write_all(&mut out, input, &boundaries, tuning, params.window_log);
+    block::write_all::<B>(&mut out, input, &boundaries, tuning, params.window_log);
 
     frame::write_epilogue(&mut out, input, params);
     Ok(out)

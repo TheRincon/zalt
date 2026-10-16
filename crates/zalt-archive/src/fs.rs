@@ -999,7 +999,17 @@ pub fn extract<S: Source + ?Sized>(
                     .map_err(|err| io(&at, err))?
                     .into_std();
                 let mut out = BufWriter::new(file);
-                let member = archive.copy_entry(e, &mut out)?;
+                // A member whose content fails — its hash, a frame's
+                // checksum, a decode — must not be left looking complete:
+                // the file is removed before the error goes up.
+                let member = match archive.copy_entry(e, &mut out) {
+                    Ok(member) => member,
+                    Err(err) => {
+                        drop(out);
+                        let _ = dir.remove_file(name);
+                        return Err(err);
+                    }
+                };
                 let file = out.into_inner().map_err(|err| io(&at, err.into_error()))?;
                 let hold = link_targets.contains(e.path.as_slice());
                 if let Some(f) = apply(&file, e, &member, &at, options, hold, &mut warnings)? {
@@ -1081,13 +1091,41 @@ pub fn extract<S: Source + ?Sized>(
     for (e, member) in directories.into_iter().rev() {
         let (dir, name) = tree.parent(&e.path)?.expect("checked when created");
         let at = tree.shown(&components(&e.path));
-        let handle = cap_fs_ext::DirExt::open_dir_nofollow(&dir, name)
-            .map_err(|err| io(&at, err))?
-            .into_std_file();
+        let handle = open_dir_to_finish(&dir, name, &at)?;
         apply(&handle, e, &member, &at, options, false, &mut warnings)?;
     }
     summary.warnings = warnings.count;
     Ok(summary)
+}
+
+/// A directory opened to have its metadata set: read-only, never through a
+/// symlink, and checked to be a directory still.
+///
+/// **Not `open_dir_nofollow`**, which the tree walks with. That asks for a
+/// directory without asking to read it, and on Linux cap-std then adds
+/// `O_PATH` (cap-primitives 4.0.3, `rustix/fs/oflags.rs`): a descriptor that
+/// serves `openat` and its kin — all the walk needs — but refuses `fchmod`,
+/// `futimens` and `fsetxattr` with `EBADF`. macOS has no `O_PATH`, so only
+/// the Linux CI saw it, on every extraction with a directory in it. A plain
+/// read-only open takes all three.
+fn open_dir_to_finish(dir: &cap_std::fs::Dir, name: &OsStr, at: &Path) -> Result<std::fs::File> {
+    let mut how = cap_std::fs::OpenOptions::new();
+    how.read(true);
+    cap_fs_ext::OpenOptionsFollowExt::follow(&mut how, cap_fs_ext::FollowSymlinks::No);
+    cap_fs_ext::OpenOptionsMaybeDirExt::maybe_dir(&mut how, true);
+    let file = dir
+        .open_with(name, &how)
+        .map_err(|err| io(at, err))?
+        .into_std();
+    // It was a directory when extraction made it. Something swapped in since
+    // — a file, a FIFO — is not one to take a directory's mode and times.
+    if !file.metadata().map_err(|err| io(at, err))?.is_dir() {
+        return Err(Error::Refused(format!(
+            "{} is no longer a directory",
+            at.display()
+        )));
+    }
+    Ok(file)
 }
 
 // ------------------------------------------------------------------- macOS

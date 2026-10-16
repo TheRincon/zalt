@@ -26,8 +26,9 @@
 //! finished archive (§10, [`append`](fn@append)); and rebuilding the trailer of one that
 //! lost it (§11.3, [`recover`](fn@recover)). Also the macOS metadata of §9.1–§9.3 —
 //! extended attributes (resource forks included), ACLs, BSD file flags, birth
-//! time, owner names, FIFOs and device nodes. Not yet: dictionary mode and
-//! entry hashes.
+//! time, owner names, FIFOs and device nodes. And entry hashes (§7.3): every
+//! member's content hashed with BLAKE3 by default, or XXH3-128, and checked on
+//! every read ([`hash`]). Not yet: dictionary mode.
 //!
 //! ## Features
 //!
@@ -38,6 +39,10 @@
 //!   `forbid(unsafe_code)`. Everything else — the format, the writer, the
 //!   reader, and the text forms of the metadata in [`meta`] — needs none of
 //!   them and builds without it.
+//!
+//! One dependency is not optional: `blake3`, the BLAKE3 authors' crate, built
+//! with its `pure` feature — no C, and no `unsafe` on aarch64 — for the
+//! default entry hash.
 //!
 //! ## The evidence
 //!
@@ -52,6 +57,7 @@ pub mod append;
 pub mod frames;
 #[cfg(all(unix, feature = "native-fs"))]
 pub mod fs;
+pub mod hash;
 pub mod index;
 pub mod layout;
 pub mod meta;
@@ -60,8 +66,10 @@ pub mod recover;
 pub mod tar;
 pub mod varint;
 pub mod write;
+pub mod xxh3;
 
 pub use append::append;
+pub use hash::Hash;
 pub use index::{Entry, Kind};
 pub use read::{Archive, ReadLimits};
 pub use recover::{RecoverOptions, Recovered, recover, recover_with};

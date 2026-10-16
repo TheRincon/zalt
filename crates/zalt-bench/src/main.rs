@@ -1423,7 +1423,7 @@ fn bench_encode_levels(dir: &Path, levels: &[i32], timed: bool) {
         let mut zalt_bytes = 0usize;
         let mut zstd_bytes = 0usize;
         for (path, raw) in &files {
-            let frame = match zalt_codec::encode::compress(raw, &params) {
+            let frame = match zalt_embed::compress(raw, &params) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("level {level}: {}: {e}", path.display());
@@ -1454,7 +1454,7 @@ fn bench_encode_levels(dir: &Path, levels: &[i32], timed: bool) {
                     raw.len(),
                     &mut [
                         &mut || {
-                            let f = zalt_codec::encode::compress(raw, &params).expect("verified");
+                            let f = zalt_embed::compress(raw, &params).expect("verified");
                             std::hint::black_box(&f);
                         },
                         &mut || drop(std::hint::black_box(zstd_compress(raw, level))),
@@ -1588,7 +1588,7 @@ fn bench_encode(dir: &Path) {
         // Never benchmark an encoder whose output does not decode. Bytes
         // produced fast and read by nobody is the failure the whole differential
         // apparatus exists to prevent, and it must not show up as a good number.
-        match zalt_codec::encode::compress(&raw, &params) {
+        match zalt_embed::compress(&raw, &params) {
             Ok(frame) => match zalt_codec::decompress(&frame, permissive_limits()) {
                 Ok(out) if out == raw => cases.push((path.clone(), raw)),
                 _ => {
@@ -1614,7 +1614,7 @@ fn bench_encode(dir: &Path) {
     let mut any_noisy = false;
 
     for (path, raw) in &cases {
-        let zalt_size = zalt_codec::encode::compress(raw, &params)
+        let zalt_size = zalt_embed::compress(raw, &params)
             .expect("verified encodable")
             .len();
         let l3_size = zstd_compress(raw, 3).len();
@@ -1624,7 +1624,7 @@ fn bench_encode(dir: &Path) {
             raw.len(),
             &mut [
                 &mut || {
-                    let f = zalt_codec::encode::compress(raw, &params).expect("verified encodable");
+                    let f = zalt_embed::compress(raw, &params).expect("verified encodable");
                     std::hint::black_box(&f);
                 },
                 &mut || drop(std::hint::black_box(zstd_compress(raw, 3))),
@@ -1796,7 +1796,7 @@ fn profile_encode(file: &Path, seconds: u64, level: Option<i32>) {
     let params = level.map_or_else(encode_params, encode_params_at);
 
     // Fail out here rather than once per iteration under the profiler.
-    let size = match zalt_codec::encode::compress(&raw, &params) {
+    let size = match zalt_embed::compress(&raw, &params) {
         Ok(f) => f.len(),
         Err(e) => {
             eprintln!("{}: {e}", file.display());
@@ -1815,7 +1815,7 @@ fn profile_encode(file: &Path, seconds: u64, level: Option<i32>) {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut iterations = 0u64;
     while Instant::now() < deadline {
-        let frame = zalt_codec::encode::compress(&raw, &params).expect("verified before the loop");
+        let frame = zalt_embed::compress(&raw, &params).expect("verified before the loop");
         std::hint::black_box(&frame);
         iterations += 1;
     }
