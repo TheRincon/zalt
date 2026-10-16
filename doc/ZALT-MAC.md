@@ -4048,7 +4048,7 @@ serial and bounds-checked), sequence coding ~30%, `memmove` 6%, Huffman 6%.
 The worst remaining gap is the lazy chain levels, 9 and 12 at 3.3–4.3x —
 libzstd 1.5 searches those with its row-hash finder, not chains.
 
-##### Row-hash finder, levels 5 to 12 (2026-10-09, provisional)
+##### Row-hash finder, levels 5 to 12 (2026-10-09/10)
 
 libzstd 1.5.7 searches its greedy-to-lazy2 levels (5–12) with a row-hash
 finder, and moves to binary trees at 13. Each hash bucket is a row of the
@@ -4078,10 +4078,159 @@ Sizes on `corpus/` (deterministic; the machine was too loaded to time):
 - **Depth matters more than libzstd's row sizes suggest.** "Attempts" count
   only tag matches, so a row of 64 with 64 attempts is mostly 8 SWAR steps per
   search — likely cheap, but not yet timed.
-- **Provisional:** levels 5–12 are all rows of 64 with 64 attempts until the
-  per-level speed/size dial can be timed on a quiet machine. Levels 13–15 stay
-  on chains (libzstd uses `btlazy2` there; a tree-backed lazy parse is the
-  equivalent here).
+**The sweep, timed** (2026-10-10, language servers suspended, load ~2,
+swap 79%; time as a multiple of libzstd's at the same level, size against the
+chains these replaced):
+
+| rows / attempts | L5 time | L5 size | L9 time | L9 size | L12 time | L12 size |
+|---|---:|---:|---:|---:|---:|---:|
+| chains | 2.82x | 3 846 022 | 3.33x | 3 485 299 | 4.27x | 3 399 360 |
+| 16 / 8 | 2.75x | +0.3% | 1.50x | +5.9% | 0.92x | +8.4% |
+| 16 / 16 | 2.93x | −2.3% | 1.62x | +3.0% | 0.98x | +5.3% |
+| 32 / 32 | 3.27x | −4.4% | 1.85x | +0.6% | 1.13x | +2.8% |
+| 64 / 32 | 3.56x | −4.3% | 2.00x | +0.8% | 1.21x | +3.1% |
+| 64 / 64 | 3.97x | −5.7% | 2.33x | −1.0% | 1.42x | +1.1% |
+
+At level 5 rows are not faster than depth-12 chains — they buy size; at 9 and
+12 they win outright. 64 rows with 32 attempts lost to 32 with 32 on both
+axes. **The table: 16/16 at 5, 32/32 at 6–7, 64/64 from 8 to 12.** Levels
+13–15 stay on chains for now (libzstd's `btlazy2` is the model; tried
+below).
+
+Every level after the fast-level work, the splitter and table-estimate
+changes, and the rows (same conditions):
+
+| level | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 15 | 17 | 19 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| time vs zstd | 2.16x | 1.98x | 1.89x | 1.86x | 2.89x | 2.45x | 2.26x | 2.25x | 2.35x | 1.89x | 1.42x | 1.43x | 1.75x | 1.34x | 1.46x | 1.07x |
+| size vs zstd | 0.996x | 0.973x | 0.983x | 0.981x | 0.861x | 0.927x | 0.940x | 0.945x | 0.971x | 0.988x | 0.999x | 0.998x | 0.983x | 1.021x | 0.985x | 0.999x |
+
+Two days earlier the same corpus put level 1 at 11.08x, 5 at 5.46x, 9 at
+6.88x and 12 at 7.30x.
+
+##### Lazy parse over the binary tree, levels 13 to 15 (2026-10-11) — not adopted
+
+libzstd uses `btlazy2` (a binary tree with lazy parsing) at 13–15, with 16,
+32 and 64 compares (searchLog 4/5/6 in `clevels.h`). zalt's tree had served
+only the optimal parse, because in a tree searching *is* inserting and the
+lazy loop searches some positions and indexes others afterwards. It now serves
+both: the lazy loop searches through `find_tree`, which goes through the same
+in-order cursor the optimal parser uses, so every position is inserted exactly
+once and in order. A test holds the tree's lazy parse within 5% of a 4096-deep
+chain on structured text (measured 1.3%); with lookahead positions inserted
+twice it came out 30% worse, and failed — a corrupt tree replays correctly,
+so only cost can show it.
+
+**Sizes** (`corpus/`, vs zstd at the same level) saturate by depth 64:
+
+| tree depth | 16 | 32 | 64 | 128 | 256 | 512 |
+|---|---:|---:|---:|---:|---:|---:|
+| L13 | 0.992x | 0.980x | 0.979x | 0.978x | 0.978x | 0.979x |
+| L15 | 1.040x | 1.028x | 1.026x | 1.026x | 1.026x | 1.026x |
+
+zalt's tree spans the whole window at every level. libzstd's `btlazy2` tree
+holds `2^chainLog / 2` positions — 2M at level 13 in a 4 MiB window — so its
+13 searches half the window and its 15 all of it. That is why the tree beats
+`zstd -13` by 2% and gains nothing at 15.
+
+**Time**, two interleaved rounds (swap 66%, load about 2.2, language servers
+suspended; the rounds agree within 4%), round 1 shown:
+
+| finder | L13 time | L13 size | L14 time | L14 size | L15 time | L15 size |
+|---|---:|---:|---:|---:|---:|---:|
+| chains 192/256/384 | 1.79x | 0.983x | 1.54x | 0.994x | 1.36x | 1.021x |
+| tree, depth 16 | 2.30x | 0.992x | 1.60x | 1.008x | 1.00x | 1.040x |
+| tree, depth 32 | 2.50x | 0.980x | 1.71x | 0.997x | 1.07x | 1.028x |
+| tree, depth 64 | 2.50x | 0.979x | 1.75x | 0.995x | 1.07x | 1.026x |
+
+The tree runs about 10 MB/s whatever its depth, against 13.6 MB/s for the
+192-deep chain: the cost is not the search but the insertion. zalt's tree
+sorts every position as it is inserted, match interiors included, where a
+chain only links it. **13–15 stay on chains.** Only at 15 does the tree win on
+time, for 0.5% of size (1.07x at 1.026x against 1.36x at 1.021x) — left open.
+
+What libzstd does instead is a *deferred* tree (`ZSTD_updateDUBT`,
+`ZSTD_DUBT_findBestMatch` in `zstd_lazy.c`): a position joins its bucket
+unsorted, as cheaply as a chain link, and is sorted into the tree only when a
+later search passes through it. Interiors no search reaches are never sorted.
+That is the finder 13–15 would need to beat their chains.
+
+##### The deferred tree, levels 13 to 15 (2026-10-11/12) — not adopted either
+
+Built after the above: under the lazy parse the tree now defers, as
+`btlazy2` does. `add_unsorted` links a position into its bucket with the
+second slot marked `UNSORTED` (`u32::MAX − 1`, which no position can equal,
+where libzstd's mark of 1 can); `find_tree` walks the bucket's unsorted
+positions newest first up to the depth, cuts the list if it is still going,
+sorts the walked positions oldest first with the existing descent
+(`tree_descend`, split out of `tree_update`), then searches. The optimal
+parse keeps sorting on insert — it searches every position, so nothing would
+be deferred. Tests: the deferred tree within 0.5% of the same tree sorted on
+insert (measured 0.08%), which fails with the walk unsorted (3.7%) or sorted
+newest first (1.2%); a 1 KiB-window run where every slot is reused, for
+replay, offsets and panics.
+
+**Size** depends on depth now, because a shallow walk cuts the list and drops
+the tree behind it: level 13 at 1.029x `zstd -13` (depth 16), 1.000x (32),
+0.983x (64), 0.975x (128).
+
+**Time is worse**, and grows with depth (two rounds, agreeing within 4%):
+
+| finder | L13 time | L13 size | speed |
+|---|---:|---:|---:|
+| chains, 192 | 1.69–1.83x | 0.983x | 13–15 MB/s |
+| tree sorted on insert, any depth | 2.3–2.5x | 0.979x | ~10 MB/s |
+| deferred, 32 | 2.84x | 1.000x | 8.6 MB/s |
+| deferred, 64 | 4.32–4.48x | 0.983x | 5.6 MB/s |
+| deferred, 128 | 6.60x | 0.975x | 3.7 MB/s |
+
+A profile (`sample`, level 13, depth 64) put 71% of the time in
+`common_prefix`, nearly all of it from sorting walked positions — the final
+search was about 3%. The lazy parse searches almost every literal position,
+so little is deferred, and what is sorted compares long: runs and repeated
+lines agree for kilobytes. With the NEON `common_prefix` below the deferred
+tree ran about 1.5x faster (depth 64: 3.0–3.1x; 128: 4.2x) and still lost to
+the chains. **13–15 stay on chains**; the deferred tree is kept, tested and
+unused, as the place to start if a cheaper sort turns up.
+
+##### The encoder's kernel seam, and `common_prefix` in NEON (2026-10-12)
+
+`common_prefix` — how far a candidate agrees with the current position — is
+now a [`Backend`] method, the encoder's one kernel, so it can be accelerated
+the way the decoder's copies are. `Matcher` is generic over the backend
+(default `Scalar`), `compress_with::<B>` picks one, and `zalt_embed::compress`
+picks the build's, as `decompress` does; the CLI, the archive writer and the
+bench go through it. `zalt_codec::encode::compress` stays scalar.
+
+The NEON kernel is a hybrid. Measured per call (M1, one process, variants
+interleaved, best of nine), as multiples of the scalar 8-byte loop:
+
+| agreement | 3 | 7 | 12 | 24 | 64 | 300 | 4000 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| safe 16-byte (`u128`) | 1.20x | 1.26x | 0.96x | 0.84x | 0.78x | 0.76x | 0.65x |
+| safe 32-byte unrolled | 1.12x | 1.17x | 1.03x | 0.80x | 0.62x | 0.93x | 0.50x |
+| NEON from byte 0 | 1.06x | 1.11x | 0.84x | 0.67x | 0.58x | 0.69x | 0.39x |
+| **scalar first word, then NEON** | 0.99x | 1.00x | 0.96x | 0.76x | 0.57x | 0.74x | 0.39x |
+
+Most calls end in the first word — candidates sharing a hash and little
+else — where a vector compare and its mask cost more than one XOR; past it
+the vector loop wins outright. The mask is `vshrn_n_u16::<4>` over the
+inverted `vceqq_u8`, four bits per byte (aarch64 has no `movemask`).
+
+Frames are byte-identical whichever backend measures: `zalt-neon`'s tests
+encode every level both ways, and `backend_equivalence` now fuzzes the kernel
+and whole encodes (16 KiB cap; coverage 1,162 → 3,831 at 127 → 82 runs/s).
+End to end against zstd, two rounds (swap 84%, load ~2):
+
+| level | 1 | 5 | 9 | 12 | 19 |
+|---|---:|---:|---:|---:|---:|
+| scalar | 2.39x | 2.85x | 2.41–2.44x | 1.45x | 1.07x |
+| NEON | **2.12x** | 2.82–2.84x | 2.32–2.36x | 1.41–1.45x | 1.10x |
+
+Level 1 gains 11%; 5–12 gain 1–4%, their comparisons being mostly short;
+level 19 is 3% *slower* in both rounds, unexplained — inlining is the first
+suspect. 13 and 15 swung 20–25% between rounds for both builds and are not
+reported.
 
 ### M6 container header — design note
 
@@ -4164,8 +4313,9 @@ first milestone: the **portable profile** and an **R1 reader** (spec §14.2).
 - [x] Extraction under §13: paths, links, special files, limits.
 - [x] `zalt archive create | list | extract | verify`.
 - [x] The probe imported as the oracle; three fuzz targets (§14.3).
-- [ ] macOS metadata (§9.3), dictionaries (§6), entry hashes (§7.3), append and
-      recovery (R2, §10–§11.3), FIFOs and device nodes.
+- [x] macOS metadata (§9.3), entry hashes (§7.3), append and recovery (R2,
+      §10–§11.3), FIFOs and device nodes.
+- [ ] Dictionaries (§6).
 
 #### Where it sits
 
@@ -4264,6 +4414,22 @@ edges to 1 761; `archive_index` from 19 to 1 982.
 #### Findings for the spec
 
 Recorded here for the next draft; `doc/zstd-archives_new.md` is unchanged.
+
+- **§7.2 does not say XXH3-128's byte order.** "Raw digest" fits BLAKE3 and
+  SHA-256, whose digests are bytes, but XXH3-128 is a 128-bit integer. zalt
+  writes xxHash's canonical form (`XXH128_canonicalFromHash`: the high 64 bits
+  then the low, each big-endian, as `xxhsum -H2` prints); the spec should name
+  it, or two readers can each be right and disagree.
+- **Q6 is answered for zalt: BLAKE3 by default** (see *Entry hashes*). The
+  spec could say so, or at least that writers SHOULD prefer a cryptographic
+  hash where Q3 or Q4 may later apply.
+- **A recovered archive cannot know its original `Hash_Algorithm`.** Only the
+  Central Index records it, and §11.3's recovery exists for when the index is
+  gone. zalt re-hashes with its own default. If the algorithm should survive,
+  the Archive Header could carry it as a TLV.
+- **§11.2 step 6 checks the hash after the content is written.** A streaming
+  reader cannot do otherwise; the spec could add that a member failing its
+  hash MUST NOT be left in place, as zalt's extraction now ensures.
 
 - **macOS's `tar` is bsdtar, and it lists NFD paths in NFC.** The probe's
   `stock_cli_zstd_and_tar` fails under it *with libzstd as the encoder*: every
@@ -4594,6 +4760,96 @@ against a reintroduced 4 KiB read.
 A new fuzz target, `archive_meta`, feeds the ACL, flag, base64 and `%XX`
 parsers directly — random bytes rarely get a tar header past its checksum:
 2.5 M runs clean, 77 of its 821 corpus entries ACL-shaped.
+
+#### Entry hashes (§7.3, 2026-10-12/14)
+
+Every member with content now carries a hash of it, written by the writer,
+checked whenever the member is read, by `verify`, and on extraction.
+
+**BLAKE3 is the default — the user's decision on Q6.** A non-cryptographic
+hash catches accidental damage as well as any (a random corruption slips past
+128 bits with odds of about 2⁻¹²⁸), but anyone choosing the input can collide
+it. That breaks the two uses Q3 and Q4 propose: deduplicating by hash, and a
+signed index whose signature covers the hashes. A default sticks, and an
+archive hashed with XXH3 would need re-hashing before either could apply.
+Without a signature a cryptographic hash protects nothing extra — whoever can
+rewrite content can rewrite its digest — so XXH3-128 stays available
+(`--hash xxh3`) for archives that only need to detect accidents, and `none`
+for none.
+
+**Where the code comes from.**
+
+- **BLAKE3: the `blake3` crate**, the BLAKE3 authors' own, with `pure`. Read
+  before adding (1.8.7): by default it compiles its NEON path from C on
+  aarch64 (`blake3_neon.c`, 6 `unsafe` FFI calls, 13 `unsafe` dispatch
+  sites); with `pure` its build script compiles nothing, every `unsafe` block
+  is cfg'd out on aarch64, and the code that runs (`portable.rs`, `lib.rs`,
+  `guts.rs`) has none. It brings `arrayvec` and `constant_time_eq` (new to the
+  tree) and `cfg-if`, plus `cc` at build time (already present). Writing it
+  ourselves was considered and declined: a published standard with no
+  secrets in play is checkable, but the authors' code is the most reviewed
+  there is.
+- **XXH3-128: ours** (`src/xxh3.rs`), next to the codec's XXH64, written from
+  xxHash 0.8.2's reference — seed 0 and the default secret only, one-shot and
+  streaming. Every Rust port carries `unsafe` for reads `first_chunk` does
+  safely, and none is the authors'.
+- **The oracle is xxHash's own C.** zstd vendors `xxhash.h` with XXH3 switched
+  off by a "local adaptations" block; `zsta-seekable-probe/c/xxhash.h` is that
+  file with the block removed, compiled by the probe's build script. Our XXH3
+  matches it on every length to 2200 and at the buffer and block boundaries
+  beyond, whole and in every piece size the streaming buffer cares about, and
+  over 5.2 M runs of a new fuzz target, `archive_hash`. Six deliberate bugs —
+  one per path — all failed it. The empty input also matches xxHash's
+  published value (`99aa06d3…497f`), which depends on neither.
+
+**Where hashing happens.** The writer hashes content as it is read, chunk by
+chunk for chunked members. `copy_entry` hashes as it streams, and fails after
+the last byte, so extraction now removes a file whose content failed —
+hash, checksum or decode — rather than leaving it complete-looking. `verify`
+hashes inside its window loop: members tile the stream, so at most one is
+mid-hash when a window ends, and it carries over. A test with a 3 MiB member
+and a 160 KiB cache still decodes 1.0x. Appending keeps the archive's
+algorithm (an index has one). Recovery hashes what it keeps as its tar walk
+passes, with the options' algorithm, so a recovered archive's records equal
+the original's; a mutant that dropped the bytes carried between frames
+failed two oracle tests.
+
+The probe's independent §7 reader now parses `HASH` too, and the oracle
+tests check every digest against the content as libzstd decodes it — never
+through our reader — hashed by the `blake3` crate or the reference C.
+
+**What it cost, single-threaded** (2026-10-14; `corpus/`, three interleaved
+rounds, medians; swap 84–87%, language servers paused; each run 0.1–0.3 s, so
+single figures are rough but the BLAKE3 penalty was the same in all three):
+
+| operation | none | XXH3 | BLAKE3 | `gtar \| zstd -3` |
+|---|---:|---:|---:|---:|
+| create | 1.00x | 0.83x | 1.55x | 0.45x |
+| verify | 1.00x | 1.09x | 2.10x | 0.43x |
+| extract | 1.00x | 1.02x | 1.85x | 0.51x |
+
+XXH3 is lost in the noise. BLAKE3 added a steady 0.10–0.12 s per 59 MB in
+every operation — the `pure` build hashing about 500 MB/s on one core, slower
+than zalt decodes, while everything around it ran on every core. (This corpus
+is mostly one 61 MB file, where zalt's slower decode dominates the comparison
+with `gtar | zstd`; it is not comparable with the registry bench.)
+
+**So BLAKE3 now runs on every core** (`hash::ParallelBlake3`), without new
+dependencies or `unsafe`: the crate's `hazmat` module — always built,
+`pure` included — computes the chaining value of any aligned power-of-two
+subtree, and merges them. Content is cut into 256 KiB pieces; batches of
+four per thread are hashed in parallel, each at its offset in the input;
+the chaining values are merged at the end, splitting each range where
+BLAKE3's own tree does (`left_subtree_len`) — the recipe the crate's
+documentation gives. A piece is only finalized once more input follows it,
+since a piece that turned out to be the whole input is the root and hashed
+differently; one piece or less is plain `blake3::hash`. Tests compare with
+`blake3::hash` on every tree shape (1 KiB pieces, every length to 3 KiB and
+every chunk boundary to 70 chunks, four batch/thread/feeding combinations),
+larger pieces, and the production geometry around its piece and batch
+edges; `archive_hash` fuzzes it with geometry from the input (1.4 M runs).
+Four deliberate bugs — the wrong split, a missing offset, swapped children,
+pieces out of order — all failed. **Re-timing is pending** (swap was 93%).
 
 ### M6 — `zalt::native` cache codec (gated)
 - [ ] Design: interleaved rANS (8/16 lanes matching NEON width), NEON-friendly

@@ -76,6 +76,11 @@ opt-level = 1
 [profile.dev.package.zstd-sys]
 opt-level = 3
 
+# BLAKE3, the default archive entry hash: tests hash megabytes through it,
+# which at -O0 takes seconds where it should take milliseconds.
+[profile.dev.package.blake3]
+opt-level = 3
+
 # Benchmarks need unwinding for harness reporting; keep it separate.
 [profile.bench]
 opt-level = 3

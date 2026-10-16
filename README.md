@@ -39,14 +39,7 @@ real document; this file is the map.
   and a global budget across live decoders.
 - Expose a C ABI with a hand-written header and a panic-proof boundary.
 
-**Not yet**
-
-- **Compress.** The encoder is M5: correctness first, ratio second, and
-  explicitly not trying to beat `zstd -19` on ratio. Its eventual size is an
-  open question — if request-body compression is never needed, M5 shrinks to
-  only what dictionary support and round-trip testing require.
-- **Dictionaries.** Loading is M4. Decode-side loading is the easy half and
-  belongs in the codec; *training* is a dev-time tool, off the critical path.
+**Not yet**   
 
 **Deliberately never**
 
@@ -54,7 +47,7 @@ real document; this file is the map.
   the reference library cannot make and we can.
 - **Runtime CPU dispatch.** NEON is mandatory on aarch64; backend selection is
   compile-time.
-
+  
 ---
 
 ## Quick start
@@ -87,11 +80,138 @@ match history lives in the decoder rather than in that buffer.
 
 ### As a CLI
 
+`zalt(1)` compresses, decompresses and inspects zstd frames, and makes and
+reads ZSTA archives. Build it once and call the binary, or go through `just`,
+which builds in release mode first:
+
 ```sh
-just zalt info file.zst          # frame and block structure, without decoding
-just zalt d --in-buf 1 file.zst  # decode a byte at a time, exercising every boundary
-just zalt check *.zst            # decode and discard; non-zero if any input fails
+cargo build --release -p zalt-cli   # → target/release/zalt
+just zalt help                      # the same binary, via just
 ```
+
+`zalt help` and `zalt archive help` print every option; what follows is how
+they fit together.
+
+#### Compressing
+
+```sh
+zalt c -o notes.txt.zst notes.txt   # level 3, the default
+zalt c -19 -o notes.txt.zst notes.txt
+zalt c -L 9 notes.txt > notes.txt.zst
+tar -c dir | zalt c > dir.tar.zst   # no input file: reads stdin
+```
+
+- **Levels run 1 to 19**, as in `zstd(1)`: `-1` … `-19`, or `-L N`. Each
+  comes out about the size of `zstd` at the same level, often a little
+  smaller. 16 and up parse optimally and are much slower. `zstd`'s 20–22 are
+  refused: they exist to declare windows past 8 MiB.
+- **Every frame is one an untrusted decoder accepts.** No level declares a
+  window above 8 MiB, the ceiling browsers decode. `--max-window-log N`
+  lowers that (it never raises a level's own window).
+- `--no-check` leaves out the content checksum (on by default, as in `zstd`).
+  `--stored` writes raw and RLE blocks only, which is useful for testing.
+- Each input becomes **one frame, read whole into memory**. Several inputs go
+  to stdout as consecutive frames, which decode to their concatenation; `-o`
+  takes one input.
+- It refuses to write compressed data to a terminal. Redirect, or use `-o`.
+
+#### Decompressing
+
+```sh
+zalt d -o notes.txt notes.txt.zst   # also: zalt -d
+zalt d notes.txt.zst | less
+zalt d < notes.txt.zst > notes.txt  # stdin to stdout
+zalt d -f -o notes.txt notes.txt.zst  # -f to overwrite
+```
+
+Decoding streams, so memory does not grow with the file. Frames from any
+`zstd` encoder decode, with **one limit**: by default a frame may declare at
+most an 8 MiB window, the ceiling appropriate to network input. A large file
+made with `zstd --long`, or `--ultra -20` and up, can declare more and is
+then refused.
+`--trusted` lifts the ceiling for files you made yourself, and
+`--max-window-log N` sets it exactly. `--max-decoded SIZE` refuses frames that
+expand past a size, and `--budget SIZE` caps total decoder memory. Sizes
+accept suffixes: `512`, `64K`, `8MiB`, `1G`.
+
+#### Inspecting
+
+```sh
+zalt info notes.txt.zst          # frame and block structure, without decoding
+zalt check *.zst                 # decode and discard; non-zero if any input fails
+zalt d --in-buf 1 notes.txt.zst  # decode a byte at a time, exercising every boundary
+zalt version                     # version, and the decode backend (neon or scalar)
+```
+
+#### Archives
+
+A ZSTA archive is a `.tar.zst` that also carries an index, so one member can
+be listed or extracted without decoding the rest. Any stock tool still reads
+it: `zstd -dc a.tar.zst | tar -x`. `zalt a` is short for `zalt archive`, and
+create, list, extract, verify and append are `c`, `t`, `x`, `v` and `r`.
+
+```sh
+zalt archive create -o src.tar.zst src/ README.md   # zalt a c
+zalt a c -19 --threads 4 -o src.tar.zst src/
+zalt a c --hash xxh3 -o src.tar.zst src/     # faster hash; see below
+zalt a t src.tar.zst                    # list paths
+zalt a t -l src.tar.zst                 # type, mode, uid, gid, size, mtime
+zalt a x src.tar.zst -C out/            # extract everything into out/
+zalt a x src.tar.zst src/main.rs docs/  # only these, and anything under them
+zalt a v src.tar.zst                    # check every frame and every hash
+zalt a r src.tar.zst CHANGELOG.md       # append
+```
+
+- **Creating.** Paths are stored as given, minus a leading `/`, as tar
+  stores them. Frames compress in parallel, one thread per core by default.
+  `-f` overwrites an existing archive.
+- **Every file's content is hashed**, and the hash is checked whenever the
+  file is read: by `verify`, and on extraction, which removes a file that
+  fails rather than leave it looking complete. The default is BLAKE3, a
+  cryptographic hash, so that a future signed index or deduplication can rely
+  on it. `--hash xxh3` is faster to compute and catches accidental damage just as
+  well, but not deliberate tampering; `--hash none` leaves hashes out (every
+  frame still has its checksum).
+- **macOS metadata is kept by default:** extended attributes (resource forks
+  included), ACLs and BSD file flags (`hidden`, `uchg`, …). `--no-xattrs`,
+  `--no-acls` and `--no-fflags` leave each out. `com.apple.provenance` is left
+  out unless `--keep-provenance`, because it only means something on the
+  machine that wrote it.
+- **Extraction is conservative.** It never writes outside `-C DIR`, whatever
+  the paths or links in the archive say. It refuses to overwrite without `-f`
+  and strips setuid, setgid and sticky bits without `--keep-setid`. It
+  restores owners only with `--same-owner` and creates device nodes only with
+  `--devices` (both normally need root). A quarantined archive passes its
+  quarantine on to what it extracts.
+- **Appending** adds members after the last one and takes `create`'s options,
+  except `--hash`: new members get the archive's own. It works on a copy that replaces the archive only once complete, so a
+  failure leaves the archive as it was. A path already in the archive is
+  refused: members are never replaced.
+
+**Recovering a damaged archive.** An archive whose write was cut short, or
+which has damaged frames, will not open. `recover` rebuilds it, keeping every
+member the damage did not touch byte for byte, and lists the ones it lost. The
+damaged file is only read. Kept members are hashed again with BLAKE3, since
+only the lost index recorded which hash the archive used.
+
+```sh
+zalt a recover broken.tar.zst -o fixed.tar.zst
+zalt a recover --search broken.tar.zst -o fixed.tar.zst
+```
+
+`--search` is for damage that took member headers *and* the index with it: it
+resumes at the next frame that starts with a tar header. That is a guess,
+because an archived `.tar` file's contents can look like members, so it lists
+everything it found that way for you to check.
+
+#### Exit status
+
+`0` success; `1` an input was refused or failed (including a refused
+overwrite or a duplicate append); `2` the command line was wrong, including a
+level above 19. Commands that report — `info`, `check`, `version`,
+`archive list` — write the report to stdout. Commands that produce files
+write their summaries and per-member lines to stderr, and `-q` silences
+those.
 
 ---
 
