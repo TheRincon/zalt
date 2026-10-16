@@ -21,6 +21,12 @@ zalt-recipe = { path = "../crates/zalt-recipe", default-features = false, featur
 # ZSTA archives: the trailer, the Central Index and VarInt are untrusted input
 # (spec §13, §14.3).
 zalt-archive = { path = "../crates/zalt-archive" }
+# The reference XXH3-128 (xxHash's own C), for `archive_hash`. Test-only, as
+# everywhere it appears.
+zsta-seekable-probe = { path = "../crates/zsta-seekable-probe" }
+# BLAKE3's own one-shot digest, the oracle for the parallel hasher in
+# `archive_hash`. Already in the tree, as zalt-archive's.
+blake3 = { version = "1.8", default-features = false, features = ["std", "pure"] }
 
 # The oracle. A C dependency, which is acceptable in a dev-only crate and would
 # not be anywhere else — the layering forbids it below L3. `zstd-sys` here
@@ -122,3 +128,9 @@ path = "fuzz_targets/archive_recover.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "archive_hash"
+path = "fuzz_targets/archive_hash.rs"
+test = false
+doc = false
