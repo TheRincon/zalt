@@ -23,12 +23,12 @@ The design is described in [`doc/ZALT-MAC.md`](doc/ZALT-MAC.md).
 
 | Milestone | | |
 |---|---|---|
-| M0 | Skeleton, backend seam, CI | ✅ |
-| M1 | Correct scalar decoder, conformance, fuzzing | ✅ |
+| M0 | Skeleton, backend choice, CI | ✅ |
+| M1 | Correct decoder, conformance, fuzzing | ✅ |
 | M2 | Embedding: budget, pool, allocators, C FFI, CLI | ✅ |
 | M3 | Apple Silicon tuning | ✅ |
-| M4 | Recipes and dictionaries | ✅ |
-| M5 | Encoder — correctness first, then ratio | ✅ |
+| M4 | `Justfile` Recipes and dictionaries | ✅ |
+| M5 | Encoder — correctness first, then performance | ✅ |
 | M6 | `zalt::native` cache codec | gated: ships only if it beats `zstd -3` |
 | M7 | ZSTA archives: create, extract, append, recover | ✅ |
 
