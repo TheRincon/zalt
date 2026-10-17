@@ -1,21 +1,19 @@
 # zalt
 
 An independent **Zstandard (RFC 8878)** implementation in Rust, built to be
-embedded in a hostile-input setting — a browser, an app, anything that handles
-bytes it did not create. The decoder is written from the RFC; the encoder uses
-libzstd as its reference, and says where (see
+embedded in a hostile-input setting — a browser, an app, or anything that handles
+bytes it did not create. The decoder is written from the RFC, and the encoder uses
+`libzstd` as its reference, and says where (see
 [Acknowledgements](#acknowledgements)).
 
 Three things it tries to be, in order. Each is useful without the ones below it:
 
-1. A clean, general, reliable Rust zstd implementation — modern format only, no
-   legacy cruft.
-2. An embeddable library — streaming, memory-bounded, hostile-input-safe.
+1. A clean Rust zstd implementation with no legacy formats.
+2. An embeddable library geared towards streaming, memory-bounded, hostile-input-safe.
 3. A tuned specialization for Apple Silicon, and separately for specific content
-   classes, expressed as **data** rather than code.
+   classes.
 
-The design rationale lives in [`doc/ZALT-MAC.md`](doc/ZALT-MAC.md). It is the
-real document; this file is the map.
+The design is described in [`doc/ZALT-MAC.md`](doc/ZALT-MAC.md).
 
 ---
 
