@@ -74,7 +74,7 @@ fn golden_frames() -> Vec<PathBuf> {
 
 /// Decode with the third-party implementation, or `None` if it declines.
 fn ruzstd_decode(frame: &[u8]) -> Option<Vec<u8>> {
-    let mut decoder = ruzstd::StreamingDecoder::new(frame).ok()?;
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(frame).ok()?;
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).ok()?;
     Some(out)

@@ -16,7 +16,7 @@ fn main() {
         std::process::exit(2);
     }
     let frame = std::fs::read(&args[0]).expect("readable input");
-    let mut decoder = match ruzstd::StreamingDecoder::new(&frame[..]) {
+    let mut decoder = match ruzstd::decoding::StreamingDecoder::new(&frame[..]) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("ruzstd refused the frame: {e}");

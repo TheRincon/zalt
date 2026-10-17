@@ -19,7 +19,7 @@ zalt-embed.workspace = true
 # against libzstd that is mostly the cost of being written in safe Rust looks
 # very different from one that is not, and only a second Rust implementation
 # distinguishes them.
-ruzstd = "0.7"
+ruzstd = "0.9.1"
 # libzstd, in process, for the *encode* comparison only.
 #
 # The decode mode times the reference through its CLI and says in its own

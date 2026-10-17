@@ -221,9 +221,9 @@ impl Decoder {
     ///
     /// Use when a pooled decoder has grown large serving one big response and
     /// should not keep that memory reserved while idle. With a
-    /// [`BufferSource`] the buffers go back to it rather than to the system
-    /// allocator, so the peak stays available to the next decoder that needs
-    /// one instead of being re-faulted from scratch.
+    /// [`BufferSource`](crate::BufferSource) the buffers go back to it rather
+    /// than to the system allocator, so the peak stays available to the next
+    /// decoder that needs one instead of being re-faulted from scratch.
     pub fn shrink(&mut self) {
         match self.source.clone() {
             Some(source) => source.release(self.inner.take_buffers()),

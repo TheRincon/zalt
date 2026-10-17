@@ -1,6 +1,6 @@
 //! # zalt-neon — L1a
 //!
-//! aarch64 NEON implementations of the [`Backend`] seam.
+//! aarch64 NEON implementations of the [`Backend`](zalt_codec::Backend) seam.
 //!
 //! ## aarch64 is not macOS
 //!
@@ -22,9 +22,9 @@
 //! every use is confined to the kernels below. `zalt-codec` is
 //! `forbid(unsafe_code)` and stays that way.
 //!
-//! The kernels assume the [`Backend`] contract has been established by
-//! `zalt_codec::lz`, which validates before dispatching. They are correct only
-//! under that contract; see each function's safety note.
+//! The kernels assume the [`Backend`](zalt_codec::Backend) contract has been
+//! established by `zalt_codec::lz`, which validates before dispatching. They
+//! are correct only under that contract; see each function's safety note.
 
 #![no_std]
 #![deny(missing_docs)]

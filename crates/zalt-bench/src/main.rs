@@ -817,14 +817,8 @@ fn bench_decode(dir: &Path, level: Option<u32>) {
     );
 }
 
-/// Time one whole-frame decode, reported in MB/s of decoded output.
-///
-/// A fresh decoder per iteration on purpose: that is the shape of the target
-/// workload — many small resources, each a new frame — so per-frame setup
-/// belongs *inside* the measurement. Hoisting it out would flatter exactly the
-/// cost that dominates a 4 KB response.
-/// Time the same decode through a zero-copy [`Sink`], which is what a host
-/// that can consume borrowed runs actually does.
+/// Time the same decode through a zero-copy [`Sink`](zalt_codec::Sink), which
+/// is what a host that can consume borrowed runs actually does.
 ///
 /// The sink here only counts bytes. That is not cheating by measuring nothing:
 /// the decoder still writes every byte to its window and still checksums it,
@@ -878,8 +872,8 @@ fn time_decode_sink<B: Backend>(compressed: &[u8], decoded_len: usize) -> Sample
 fn time_decode_ruzstd(compressed: &[u8], decoded_len: usize) -> Sample {
     use std::io::Read;
     let s = measure(decoded_len, || {
-        let mut decoder =
-            ruzstd::StreamingDecoder::new(compressed).expect("verified decodable before timing");
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed)
+            .expect("verified decodable before timing");
         let mut out = Vec::with_capacity(decoded_len);
         decoder
             .read_to_end(&mut out)
@@ -893,6 +887,12 @@ fn time_decode_ruzstd(compressed: &[u8], decoded_len: usize) -> Sample {
     }
 }
 
+/// Time one whole-frame decode, reported in MB/s of decoded output.
+///
+/// A fresh decoder per iteration on purpose: that is the shape of the target
+/// workload — many small resources, each a new frame — so per-frame setup
+/// belongs *inside* the measurement. Hoisting it out would flatter exactly the
+/// cost that dominates a 4 KB response.
 fn time_decode<B: Backend>(compressed: &[u8], decoded_len: usize) -> Sample {
     let limits = permissive_limits();
     // `measure` reports GB/s, which is the right unit for a kernel moving bytes

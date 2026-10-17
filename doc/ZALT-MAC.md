@@ -159,7 +159,9 @@ no benefit.
 
 ## 4. L1 — The codec
 
-A clean-room RFC 8878 implementation. Modern frames only.
+An independent RFC 8878 implementation. Modern frames only. The decoder is
+written from the RFC; the encoder (M5) uses libzstd 1.5.7 as its reference, and
+each encoder module names what it follows.
 
 ### Frame
 
@@ -4061,8 +4063,8 @@ checks, lazy steps and offset coding unchanged — through `find` and `insert`.
 **Tag matching is SWAR in safe Rust** (`tag_matches`: XOR with the tag
 repeated, an exact zero-byte test, a multiply to gather the flags), tested
 against byte-by-byte comparison at every width and on the tags that break
-cheaper tricks. **A NEON version belongs in `zalt-neon`** — the user asked for
-it to be noted; it is kept to that one function so the backend can replace it.
+cheaper tricks. **A NEON version belongs in `zalt-neon`**; it is kept to that one function so
+the backend can replace it.
 
 Sizes on `corpus/` (deterministic; the machine was too loaded to time):
 
@@ -4297,7 +4299,7 @@ format decision.
 
 ### M7 — ZSTA archives: portable R1
 
-`doc/zstd-archives_new.md` (draft 0.2) specifies **ZSTA**: a multi-file archive
+`doc/ZSTA_SPEC.md` (draft 0.2) specifies **ZSTA**: a multi-file archive
 built entirely from standard zstd frames, at once a valid `.tar.zst` —
 `zstd -dc a.tar.zst | tar -x` extracts it — and randomly accessible, through a
 trailing seek table and a Central Index that list the contents and locate any
@@ -4413,7 +4415,7 @@ edges to 1 761; `archive_index` from 19 to 1 982.
 
 #### Findings for the spec
 
-Recorded here for the next draft; `doc/zstd-archives_new.md` is unchanged.
+Recorded here for the next draft; `doc/ZSTA_SPEC.md` is unchanged.
 
 - **§7.2 does not say XXH3-128's byte order.** "Raw digest" fits BLAKE3 and
   SHA-256, whose digests are bytes, but XXH3-128 is a 128-bit integer. zalt
@@ -4766,7 +4768,7 @@ parsers directly — random bytes rarely get a tar header past its checksum:
 Every member with content now carries a hash of it, written by the writer,
 checked whenever the member is read, by `verify`, and on extraction.
 
-**BLAKE3 is the default — the user's decision on Q6.** A non-cryptographic
+**BLAKE3 is the default — the decision on Q6.** A non-cryptographic
 hash catches accidental damage as well as any (a random corruption slips past
 128 bits with odds of about 2⁻¹²⁸), but anyone choosing the input can collide
 it. That breaks the two uses Q3 and Q4 propose: deduplicating by hash, and a

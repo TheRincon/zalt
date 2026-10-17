@@ -56,6 +56,19 @@ jobs:
       - uses: extractions/setup-just@v2
       - run: just layering
 
+  # What may enter the dependency tree, from deny.toml: permissive licenses
+  # only, no known security advisories, crates.io only. Its own job because the
+  # advisory database changes without any commit here, and a new advisory
+  # should be visible on its own rather than mixed into a test failure.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-deny
+      - run: just deny
+
   # Fuzz targets are dev-only, so nothing else builds them. Without this they
   # rot silently: a target referencing a renamed API compiles nowhere and nobody
   # notices until someone tries to fuzz.

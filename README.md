@@ -357,6 +357,9 @@ zalt builds on other people's work, and tries to say exactly where.
   - canonical Huffman code assignment;
   - the order sequences are written in (`ZSTD_encodeSequences_body`).
 
+  The last four are close enough to libzstd's code to be treated as derived
+  from it, and stay under its BSD license; see [License](#license).
+
   zstd's own regression and golden corpora are vendored in `zstd-fixtures/`.
 - **xxHash**, by Yann Collet. XXH64 is the frame checksum. XXH3 is one of the
   archive entry hashes; it was written from the reference `xxhash.h`, which is
@@ -389,6 +392,15 @@ patent grant.
 Third-party files keep their own licenses: `zstd-fixtures/` and
 `crates/zsta-seekable-probe/c/xxhash.h` are from zstd (BSD, with a `LICENSE`
 beside each), and `doc/rfc*.txt` are IETF RFCs.
+
+Four of the encoder's modules follow libzstd's source closely enough to be
+treated as derived from it: `optimal.rs`, `sequences.rs`, `fse.rs` and
+`huffman.rs` in `crates/zalt-codec/src/encode/`. Those parts remain under
+zstd's BSD license (Copyright (c) Meta Platforms, Inc. and affiliates), in
+[`crates/zalt-codec/LICENSE-ZSTD`](crates/zalt-codec/LICENSE-ZSTD), so
+`zalt-codec` is licensed `(Unlicense OR MIT OR Apache-2.0) AND BSD-3-Clause`.
+In practice: if you redistribute `zalt-codec`, or anything built on it, in
+source or binary form, include that notice, as you would for zstd itself.
 
 Unless you state otherwise, any contribution you submit for inclusion is
 offered under the same terms.

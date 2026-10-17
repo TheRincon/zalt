@@ -9,8 +9,8 @@
 //!
 //! - **Hash chains.** Each hash keeps a chain of earlier positions rather than
 //!   only the most recent, and the search takes the longest match among the
-//!   first [`SEARCH_DEPTH`]. One slot means the *newest* candidate wins, which
-//!   is frequently not the longest.
+//!   first [`search_depth`](Tuning::search_depth). One slot means the *newest*
+//!   candidate wins, which is frequently not the longest.
 //! - **Lazy matching.** A match found at `pos` is not taken until the position
 //!   after it has been checked; if `pos + 1` starts a longer match, the byte at
 //!   `pos` becomes a literal instead. Greedy parsing takes the first match it
@@ -104,8 +104,8 @@ const HASH_LOG_MAX: u32 = 17;
 /// Smallest hash table worth building.
 ///
 /// Below a few thousand slots the table stops separating anything and the chain
-/// walk does all the work, spending its [`SEARCH_DEPTH`] budget on collisions
-/// instead of candidates.
+/// walk does all the work, spending its [`search_depth`](Tuning::search_depth)
+/// budget on collisions instead of candidates.
 const HASH_LOG_MIN: u32 = 12;
 
 /// Hash bits for an input of this size.

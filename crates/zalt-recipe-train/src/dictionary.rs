@@ -1,6 +1,6 @@
 //! Building a content-prefix dictionary, and recording what went into it.
 //!
-//! §7 stages v1 as "a concatenation of representative samples [that] needs no
+//! §7 stages v1 as "a concatenation of representative samples \[that\] needs no
 //! algorithm at all". That is true of the *contents* and false of the
 //! *arrangement*, which is the only thing this module is careful about.
 //!

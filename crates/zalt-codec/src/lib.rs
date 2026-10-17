@@ -1,7 +1,9 @@
 //! # zalt-codec — L1
 //!
-//! A clean-room Zstandard (RFC 8878) implementation. **Modern frames only**:
-//! the legacy v0.1–v0.7 formats are deliberately unsupported.
+//! An independent Zstandard (RFC 8878) implementation. The decoder is written
+//! from the RFC. The encoder uses libzstd 1.5.7 as its reference, and each
+//! module that follows libzstd says where and how closely. **Modern frames
+//! only**: the legacy v0.1–v0.7 formats are deliberately unsupported.
 //!
 //! ## Layering contract
 //!
