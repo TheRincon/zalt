@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: (Unlicense OR MIT OR Apache-2.0) AND BSD-3-Clause
+//
+// Derived in part from zstd 1.5.7, `lib/compress/zstd_compress_sequences.c`:
+//   Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+// The derived parts are under zstd's BSD license, in `LICENSE-ZSTD` at this
+// crate's root. The module docs below say what follows zstd and how closely.
+
 //! The literals and sequences sections of a compressed block.
 //!
 //! ## Codes are derived from the decoder's tables, not transcribed

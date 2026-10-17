@@ -56,7 +56,7 @@ fn reference_decode(zstd: &str, frame: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Decode with the independent third-party implementation.
 fn third_party_decode(frame: &[u8]) -> Option<Vec<u8>> {
-    let mut decoder = ruzstd::StreamingDecoder::new(frame).ok()?;
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(frame).ok()?;
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).ok()?;
     Some(out)

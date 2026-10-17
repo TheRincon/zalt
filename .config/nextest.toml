@@ -1,9 +1,6 @@
 # nextest configuration.
 #
-# nextest runs each test in its own process, in parallel. That isolation is
-# worth more here than usual: a decoder bug that corrupts memory or aborts takes
-# down one test process rather than the whole run, and the failure names itself.
-
+# nextest runs each test in its own process, in parallel.
 [profile.default]
 # Fail fast in the inner loop — the first failure is the one being worked on.
 fail-fast = true

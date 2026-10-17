@@ -112,6 +112,14 @@ archive-huge:
 layering:
     @bash ci/layering.sh
 
+# What may enter the dependency tree (deny.toml): permissive licenses only,
+# no known advisories, crates.io only. Both workspaces, since fuzz/ has its own
+# lockfile. Not in `gate`: the advisory database is fetched over the network.
+[doc("Check dependency licenses, advisories and sources (cargo-deny).")]
+deny:
+    cargo deny check
+    cargo deny --manifest-path fuzz/Cargo.toml check
+
 # Check the hand-written C header still matches the Rust ABI.
 abi-check:
     @bash ci/check-abi.sh
@@ -212,14 +220,14 @@ gate: fmt-check clippy layering ztml-dict-check abi-check test test-release
 
 # What the pre-push hook runs.
 #
-# `gate` is not by itself what CI checks. The workflow has four jobs, and gate
+# `gate` is not by itself what CI checks. The workflow has five jobs, and gate
 # is one of them; `no-std` is a separate job and gate does not cover it. That
 # gap is the one worth closing here, because it is the cheapest to break without
 # noticing — a `std` import in `zalt-codec` compiles fine on this laptop and
 # fails only on the cross-compile that proves the crate is still general.
 #
-# Left out: `fuzz-build` (needs nightly and cargo-fuzz), which still runs in CI,
-# and `miri`, which no longer does — it had grown past six hours a run — and is
+# Left out: `fuzz-build` (needs nightly and cargo-fuzz) and `deny` (needs the
+# network), which still run in CI, and `miri`, which no longer does — it had grown past six hours a run — and is
 # local only. Both are excluded on the reasoning that **a hook people bypass is
 # worse than a shorter hook they run**: past a few minutes, `--no-verify`
 # becomes the habit and then nothing is checked at all. `just pre-push-full`
@@ -235,10 +243,10 @@ pre-push: gate no-std
 # so it validates the scalar oracle rather than the accelerated path. What
 # guards the kernels is `test-release` (already in gate, where `debug_assert` is
 # compiled out) and the `backend_equivalence` tests and fuzz target.
-[doc("Everything CI runs, plus Miri (adds fuzz-build + miri).")]
-pre-push-full: gate no-std fuzz-build miri
+[doc("Everything CI runs, plus Miri (adds fuzz-build + deny + miri).")]
+pre-push-full: gate no-std fuzz-build deny miri
     @echo
-    @echo "pre-push-full passed (gate + no-std + fuzz-build + miri)."
+    @echo "pre-push-full passed (gate + no-std + fuzz-build + deny + miri)."
 
 # Activate the repo's git hooks.
 #
@@ -1127,6 +1135,7 @@ install-tools:
     cargo install cargo-nextest --locked
     cargo install cargo-instruments --locked
     cargo install cargo-fuzz --locked
+    cargo install cargo-deny --locked
 
 # Report what is taking disk space, and whether it is worth keeping.
 [doc("Show disk usage of build and fuzz caches.")]

@@ -33,9 +33,7 @@ jobs:
       - name: kernel benchmarks (smoke)
         run: just bench
 
-  # zalt-codec claims to be a general zstd crate. This job is what makes that
-  # claim true rather than aspirational: if it only ever built on aarch64, the
-  # portability story would rot silently.
+  # zalt-codec is a general zstd crate, and it needs a Linux test.
   portable:
     runs-on: ubuntu-latest
     steps:
@@ -56,9 +54,18 @@ jobs:
       - uses: extractions/setup-just@v2
       - run: just layering
 
-  # Fuzz targets are dev-only, so nothing else builds them. Without this they
-  # rot silently: a target referencing a renamed API compiles nowhere and nobody
-  # notices until someone tries to fuzz.
+  # From deny.toml: permissive licenses only, no known security
+  # advisories, crates.io only.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-deny
+      - run: just deny
+
+  # Fuzz targets are dev-only, so nothing else builds them.
   fuzz-build:
     runs-on: macos-14
     # `-D warnings` is deliberately not inherited here. It is right for the
@@ -77,8 +84,5 @@ jobs:
           tool: just,cargo-fuzz
       - run: just fuzz-build
 
-  # Miri is not run here. It ran over the scalar path until 2026-10, when the
-  # encoder's tests had grown it from about four minutes to over six hours a
-  # run. It is still the only UB detection this code gets — NEON intrinsics
-  # are beyond it, which is why the scalar backend is never deleted — so it is
-  # run locally when a change warrants it: `just miri`, or `just pre-push-full`.
+  # Miri is not run here. Run locally when a change warrants it:
+  # `just miri`, or `just pre-push-full`.

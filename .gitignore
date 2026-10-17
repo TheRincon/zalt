@@ -17,5 +17,6 @@
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/target
+/fuzz/*.log
 
 .DS_Store

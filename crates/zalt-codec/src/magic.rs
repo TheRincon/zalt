@@ -1,7 +1,7 @@
 //! Four-byte signature registry.
 //!
 //! Every magic number zalt recognises or emits lives here, in one place, so
-//! that [`tests`] can assert they cannot collide. A magic number invented in
+//! that the tests below can assert they cannot collide. A magic number invented in
 //! the module that happens to need it is a magic number nobody checks against
 //! the others.
 //!

@@ -4,7 +4,9 @@ description = "Zstandard (RFC 8878) codec core. Modern frames only, no_std, no l
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Four encoder modules are derived in part from libzstd and stay under its BSD
+# license (`LICENSE-ZSTD`); see the headers in `src/encode/`.
+license = "(Unlicense OR MIT OR Apache-2.0) AND BSD-3-Clause"
 repository.workspace = true
 
 [dependencies]
@@ -20,7 +22,7 @@ proptest = "1"
 # be invisible to every test here. An implementation written separately from
 # both is the cheapest defence against that, and disagreement is a strong signal
 # precisely because nothing is shared but the spec.
-ruzstd = "0.7"
+ruzstd = "0.9.1"
 
 [features]
 default = []

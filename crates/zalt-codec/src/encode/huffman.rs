@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: (Unlicense OR MIT OR Apache-2.0) AND BSD-3-Clause
+//
+// Derived in part from zstd 1.5.7, `lib/compress/huf_compress.c`:
+//   Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+// The derived parts are under zstd's BSD license, in `LICENSE-ZSTD` at this
+// crate's root. The module docs below say what follows zstd and how closely.
+
 //! Huffman-coded literals (RFC 8878 §3.1.1.3.1.1).
 //!
 //! Raw literals cost a byte each, and §8 says this content is

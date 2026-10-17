@@ -1,4 +1,4 @@
-//! Probe for Open Question Q1 of the ZSTA archive spec (`zstd-archives.md`).
+//! Probe for Open Question Q1 of the ZSTA archive spec (`doc/ZSTA_SPEC.md`).
 //!
 //! > Q1. Confirm the behavior of `contrib/seekable_format` with a leading skippable
 //! > frame and zero-size seek table entries.

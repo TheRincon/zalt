@@ -4,8 +4,9 @@
 //! point rather than an oversight — `doc/ZALT-MAC.md` §7 requires three load
 //! paths (a directory, an embedded blob compiled into the binary, an ad-hoc
 //! file), and a struct a host can simply *write* covers the middle one with no
-//! parser in the binary at all. The text parser in [`crate::parse`] is one
-//! producer of these values, not their definition.
+//! parser in the binary at all. The text parser in
+//! [`crate::parse`](mod@crate::parse) is one producer of these values, not
+//! their definition.
 
 use alloc::string::String;
 use alloc::vec::Vec;

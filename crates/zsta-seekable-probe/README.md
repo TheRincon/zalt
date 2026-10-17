@@ -1,6 +1,6 @@
 # zsta-seekable-probe
 
-This crate answers **Open Question Q1** of the ZSTA spec (`zstd-archives.md`), and Q7 along the way:
+This crate answers **Open Question Q1** of the ZSTA spec (`doc/ZSTA_SPEC.md`), and Q7 along the way:
 
 > **Q1.** Confirm the behavior of `contrib/seekable_format` with a leading skippable
 > frame and zero-size seek table entries.

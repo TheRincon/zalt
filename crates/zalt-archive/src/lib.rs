@@ -1,7 +1,7 @@
 //! # zalt-archive — ZSTA archives
 //!
 //! A multi-file archive built entirely from standard Zstandard frames, per the
-//! ZSTA draft in `doc/zstd-archives_new.md` (format 0.2). An archive is at once:
+//! ZSTA draft in `doc/ZSTA_SPEC.md` (format 0.2). An archive is at once:
 //!
 //! - **a valid `.tar.zst`** — `zstd -dc a.tar.zst | tar -x` extracts it, because
 //!   every piece of metadata lives in skippable frames a stock decoder steps

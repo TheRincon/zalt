@@ -3,6 +3,7 @@ name = "zalt-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
+license = "Unlicense OR MIT OR Apache-2.0"
 
 # Its own workspace: fuzz targets build with different flags (sanitizers,
 # coverage instrumentation) and must not perturb the main workspace's lockfile
