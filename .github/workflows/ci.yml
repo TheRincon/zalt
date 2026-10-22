@@ -14,7 +14,7 @@ jobs:
   # The primary target. Apple Silicon runners exercise the NEON kernels and the
   # equivalence tests that make the backend seam trustworthy.
   apple-silicon:
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -67,7 +67,7 @@ jobs:
 
   # Fuzz targets are dev-only, so nothing else builds them.
   fuzz-build:
-    runs-on: macos-14
+    runs-on: macos-26
     # `-D warnings` is deliberately not inherited here. It is right for the
     # stable jobs, whose toolchain `rust-toolchain.toml` pins and whose warning
     # set is therefore reproducible. This job floats on the latest nightly, so
