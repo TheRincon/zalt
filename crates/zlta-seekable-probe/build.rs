@@ -8,5 +8,5 @@ fn main() {
         .file("c/xxh3_ref.c")
         .include("c")
         .opt_level(2)
-        .compile("zsta_probe_xxh3");
+        .compile("zlta_probe_xxh3");
 }

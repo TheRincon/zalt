@@ -29,7 +29,7 @@ pub const MAX_WINDOW_LOG: u8 = 27;
 /// for some frames under 256 bytes; every frame an archive holds is either a
 /// multiple of 512 or a single-segment index body, so it is always present
 /// today — but that is a coupling between two crates, and a frame silently
-/// missing its size would be refused by every conformant ZSTA reader.
+/// missing its size would be refused by every conformant ZLTA reader.
 pub fn encode(content: &[u8], level: i32) -> Result<Vec<u8>> {
     let params = EncodeParams {
         strategy: Strategy::Compress,

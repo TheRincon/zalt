@@ -1,6 +1,6 @@
 [package]
 name = "zalt-cli"
-description = "zalt(1): compress, decompress and inspect zstd frames, and create and extract ZSTA archives, from the shell."
+description = "zalt(1): compress, decompress and inspect zstd frames, and create and extract ZALT-archives, from the shell."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

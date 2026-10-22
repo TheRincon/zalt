@@ -1,4 +1,4 @@
-//! Open Question Q1 (and Q7) of the ZSTA spec, tested against zstd's reference
+//! Open Question Q1 (and Q7) of the ZLTA spec, tested against zstd's reference
 //! seekable reader, the reference streaming decoder, and, when available, the
 //! `zstd` CLI and a system `tar`.
 //!
@@ -13,7 +13,7 @@ use std::{
 };
 
 use common::*;
-use zsta_seekable_probe::{
+use zlta_seekable_probe::{
     archive::{self, *},
     corpus,
     frame::{self, FrameKind},
@@ -169,7 +169,7 @@ fn empty_archive_is_terminator_only() {
 
 // ------------------------------------------------------------------ the Q1 fallback
 
-const CHILD_ENV: &str = "ZSTA_PROBE_CHILD";
+const CHILD_ENV: &str = "ZLTA_PROBE_CHILD";
 
 /// The fallback named in Q1: list only data frames. An unmodified reference
 /// reader then computes every file offset from 0, so it is off by the size of the
@@ -308,7 +308,7 @@ fn stock_cli_zstd_and_tar() {
             ..small_frames()
         },
     );
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("zsta-cli");
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("zlta-cli");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let archive_path = dir.join("probe.tar.zst");
@@ -401,7 +401,7 @@ fn stock_cli_zstd_and_tar() {
         .arg("--use-compress-program")
         // GNU tar adds `-d` when it reads through a compress program; bsdtar
         // does not, and runs it as a *compressor* — which fails the same way on
-        // any .tar.zst, ZSTA or not. So bsdtar is handed the decompress flag.
+        // any .tar.zst, ZLTA or not. So bsdtar is handed the decompress flag.
         .arg(if bsdtar {
             format!("{} -d", zstd.display())
         } else {

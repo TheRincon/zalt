@@ -62,7 +62,7 @@ fn members() -> Vec<(Entry, Vec<u8>)> {
     let long = format!("proj/{}/end.txt", "deep".repeat(40));
     vec![
         (dir, vec![]),
-        file("proj/small_0.txt", b"hello zsta\n".repeat(10)),
+        file("proj/small_0.txt", b"hello zlta\n".repeat(10)),
         file("proj/small_1.txt", pseudo(900, 1)),
         file("proj/small_2.txt", pseudo(1500, 2)),
         file("proj/empty.txt", vec![]),
@@ -570,7 +570,7 @@ fn xxh3_hashes_match_the_reference_implementation() {
             continue;
         }
         let e = a.entries().iter().find(|e| e.path == want.path).unwrap();
-        let reference = zsta_seekable_probe::xxh3::xxh3_128(content);
+        let reference = zlta_seekable_probe::xxh3::xxh3_128(content);
         assert_eq!(
             e.hash.as_deref(),
             Some(reference.as_slice()),
@@ -604,7 +604,7 @@ fn xxh3_matches_the_reference_on_every_length_and_split() {
     use zalt_archive::xxh3;
     let data = pseudo(200_000, 9);
     for len in 0..=2200 {
-        let reference = zsta_seekable_probe::xxh3::xxh3_128(&data[..len]);
+        let reference = zlta_seekable_probe::xxh3::xxh3_128(&data[..len]);
         assert_eq!(
             xxh3::canonical(xxh3::hash(&data[..len])),
             reference,
@@ -614,7 +614,7 @@ fn xxh3_matches_the_reference_on_every_length_and_split() {
     for len in [
         240, 241, 255, 256, 257, 4095, 4096, 4097, 16_383, 16_384, 16_385, 100_003, 200_000,
     ] {
-        let reference = zsta_seekable_probe::xxh3::xxh3_128(&data[..len]);
+        let reference = zlta_seekable_probe::xxh3::xxh3_128(&data[..len]);
         assert_eq!(
             xxh3::canonical(xxh3::hash(&data[..len])),
             reference,

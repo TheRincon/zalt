@@ -1,11 +1,11 @@
-//! Probe for Open Question Q1 of the ZSTA archive spec (`doc/ZSTA_SPEC.md`).
+//! Probe for Open Question Q1 of the ZALT-archive spec (`doc/ZLTA_SPEC.md`).
 //!
 //! > Q1. Confirm the behavior of `contrib/seekable_format` with a leading skippable
 //! > frame and zero-size seek table entries.
 //!
 //! The crate contains just enough to answer that question with real archives:
 //!
-//! * [`archive`]  – a minimal ZSTA writer (header, data frames, terminator, central
+//! * [`archive`]  – a minimal ZLTA writer (header, data frames, terminator, central
 //!   index, seek table) with switches for the layouts being compared;
 //! * [`index`]    – Central Index encode/decode (§7), including the VarInt rules (§2);
 //! * [`seekable`] – a safe wrapper over zstd's *reference* seekable reader;

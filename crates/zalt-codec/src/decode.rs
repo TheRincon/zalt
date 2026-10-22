@@ -218,7 +218,7 @@ impl<B: Backend> Decoder<B> {
     /// reports [`Status::NeedMoreInput`] because, mid-stream, more frames may
     /// follow. At the end of the input that is a clean finish, not a truncated
     /// one — `zstd(1)` agrees — and a caller deciding which needs this, not the
-    /// last status. Every ZSTA archive ends in skippable frames, as does any
+    /// last status. Every ZALT-archive ends in skippable frames, as does any
     /// file carrying zstd's seekable-format seek table.
     pub fn is_between_frames(&self) -> bool {
         matches!(self.state, State::Magic) && self.scratch.len == 0

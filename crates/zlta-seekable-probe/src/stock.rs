@@ -1,4 +1,4 @@
-//! What a stock decoder does with a ZSTA file: stream-decode it from the start,
+//! What a stock decoder does with a ZLTA file: stream-decode it from the start,
 //! exactly like `zstd -dc`, with libzstd's default memory limits.
 
 use crate::{error_name, is_error};

@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 
 use zalt_archive::read::Archive;
 use zalt_archive::{Entry, FramePolicy, Kind, ReadLimits, Writer, WriterOptions};
-use zsta_seekable_probe::{index as probe_index, seekable::RefSeekable, stock};
+use zlta_seekable_probe::{index as probe_index, seekable::RefSeekable, stock};
 
 fn pseudo(n: usize, seed: u32) -> Vec<u8> {
     let mut s = seed;
@@ -219,7 +219,7 @@ fn index_agrees(name: &str, bytes: &[u8]) {
         let from = t.data_offset() as usize;
         let content = &stream[from..from + t.size as usize];
         let expect = match theirs.hash_algorithm {
-            1 => zsta_seekable_probe::xxh3::xxh3_128(content).to_vec(),
+            1 => zlta_seekable_probe::xxh3::xxh3_128(content).to_vec(),
             2 => blake3::hash(content).as_bytes().to_vec(),
             n => panic!("{name}: Hash_Algorithm {n} written"),
         };
@@ -583,7 +583,7 @@ fn appended_and_recovered_archives_satisfy_the_reference_reader() {
 /// An archive libzstd wrote, with vendor frames between its data frames (Q7),
 /// as the probe's own writer lays it out.
 fn libzstd_archive() -> (Vec<u8>, usize) {
-    let mut t = zsta_seekable_probe::tar::TarWriter::new();
+    let mut t = zlta_seekable_probe::tar::TarWriter::new();
     t.add_dir("lib", 0o755, 1_700_000_000);
     for i in 0..12 {
         t.add_file(
@@ -596,14 +596,14 @@ fn libzstd_archive() -> (Vec<u8>, usize) {
     t.add_file("lib/big.dat", &pseudo(40_000, 99), 0o644, 1_700_000_000);
     t.add_symlink("lib/latest", "f00.dat", 1_700_000_000);
     let (body, entries) = t.finish();
-    let opts = zsta_seekable_probe::archive::WriterOptions {
+    let opts = zlta_seekable_probe::archive::WriterOptions {
         solid_target: 4096,
         chunk: 8192,
         vendor_every: Some(2),
         ..Default::default()
     };
-    let mut enc = zsta_seekable_probe::encoder::ReferenceEncoder::new(19);
-    let a = zsta_seekable_probe::archive::write(&body, &entries, &mut enc, &opts).unwrap();
+    let mut enc = zlta_seekable_probe::encoder::ReferenceEncoder::new(19);
+    let a = zlta_seekable_probe::archive::write(&body, &entries, &mut enc, &opts).unwrap();
     (a.bytes, entries.len())
 }
 
@@ -667,7 +667,7 @@ fn frame_lengths_agree_with_libzstd() {
     for bytes in &archives {
         let mut off = 0usize;
         while off < bytes.len() {
-            let (_, theirs) = zsta_seekable_probe::frame::inspect(&bytes[off..]).unwrap();
+            let (_, theirs) = zlta_seekable_probe::frame::inspect(&bytes[off..]).unwrap();
             let ours = zalt_codec::frame::compressed_size(&bytes[off..]).unwrap();
             assert_eq!(ours as u64, theirs, "frame at {off}");
             let end = off + ours;
@@ -680,7 +680,7 @@ fn frame_lengths_agree_with_libzstd() {
                     "cut {cut}"
                 );
                 assert!(
-                    zsta_seekable_probe::frame::inspect(&bytes[off..cut]).is_err(),
+                    zlta_seekable_probe::frame::inspect(&bytes[off..cut]).is_err(),
                     "cut {cut}"
                 );
             }

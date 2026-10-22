@@ -1,12 +1,12 @@
 [package]
-name = "zsta-seekable-probe"
+name = "zlta-seekable-probe"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
 # The vendored reference C in `c/` is zstd's, under its BSD license (`c/LICENSE`).
 license = "(Unlicense OR MIT OR Apache-2.0) AND BSD-3-Clause"
 publish = false
-description = "Answers ZSTA spec Open Question Q1: does zstd's reference seekable reader accept the ZSTA seek-table profile?"
+description = "Answers ZLTA spec Open Question Q1: does zstd's reference seekable reader accept the ZLTA seek-table profile?"
 
 [dependencies]
 # `seekable`     compiles zstd's contrib/seekable_format: the reference reader under test.

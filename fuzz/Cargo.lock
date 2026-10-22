@@ -223,7 +223,7 @@ dependencies = [
  "zalt-codec",
  "zalt-neon",
  "zalt-recipe",
- "zsta-seekable-probe",
+ "zlta-seekable-probe",
  "zstd",
 ]
 
@@ -243,7 +243,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zsta-seekable-probe"
+name = "zlta-seekable-probe"
 version = "0.1.0"
 dependencies = [
  "cc",

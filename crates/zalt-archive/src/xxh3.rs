@@ -4,7 +4,7 @@
 //! and the default secret only — the only variant §7.3 names. It sits next to
 //! the codec's own XXH64 rather than coming from a crate: the Rust ports all
 //! carry `unsafe` for reads this does with `first_chunk`, and none is the
-//! authors' own. The reference C is the oracle instead: `zsta-seekable-probe`
+//! authors' own. The reference C is the oracle instead: `zlta-seekable-probe`
 //! compiles it, and `tests/hash.rs` and the `archive_hash` fuzz target hold
 //! this to it on every length class and every way of splitting the input.
 //!

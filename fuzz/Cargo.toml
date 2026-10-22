@@ -19,12 +19,12 @@ zalt-codec = { path = "../crates/zalt-codec" }
 zalt-neon = { path = "../crates/zalt-neon" }
 # The dcz header is untrusted wire input; its parser is fuzzed like any other.
 zalt-recipe = { path = "../crates/zalt-recipe", default-features = false, features = ["parse"] }
-# ZSTA archives: the trailer, the Central Index and VarInt are untrusted input
+# ZALT-archives: the trailer, the Central Index and VarInt are untrusted input
 # (spec §13, §14.3).
 zalt-archive = { path = "../crates/zalt-archive" }
 # The reference XXH3-128 (xxHash's own C), for `archive_hash`. Test-only, as
 # everywhere it appears.
-zsta-seekable-probe = { path = "../crates/zsta-seekable-probe" }
+zlta-seekable-probe = { path = "../crates/zlta-seekable-probe" }
 # BLAKE3's own one-shot digest, the oracle for the parallel hasher in
 # `archive_hash`. Already in the tree, as zalt-archive's.
 blake3 = { version = "1.8", default-features = false, features = ["std", "pure"] }

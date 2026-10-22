@@ -1,25 +1,25 @@
-# Zstandard Archive Format (ZSTA)
+# ZALT-archive Format (ZLTA)
 
 **Version:** 0.2 (draft)
 **Status:** Early working draft. Incompatible changes are expected between drafts; there is no 1.0 yet.
-**Working name:** "ZSTA" is a placeholder and may be renamed without changing the format.
+**Name:** ZALT-archives, abbreviated ZLTA, are part of the ZALT project. The format is built on standard Zstandard frames but is not affiliated with or endorsed by the Zstandard project.
 
 ---
 
 ## 1. Introduction
 
-ZSTA is a multi-file archive format built entirely from standard Zstandard frames.
-A ZSTA archive is at the same time:
+A ZALT-archive (ZLTA) is a multi-file archive built entirely from standard Zstandard frames.
+A ZALT-archive is at the same time:
 
 1. **A valid `.tar.zst` file.** Any conformant Zstandard decoder followed by any POSIX tar reader can extract it: `zstd -dc a.tar.zst | tar -x`.
-2. **A randomly accessible archive.** A trailing seek table and a central index let a ZSTA-aware reader list the contents without decompressing anything. The reader can extract any single file by decoding only the frames that contain it, and can decode frames in parallel.
+2. **A randomly accessible archive.** A trailing seek table and a central index let a ZLTA-aware reader list the contents without decompressing anything. The reader can extract any single file by decoding only the frames that contain it, and can decode frames in parallel.
 
-ZSTA achieves this through two properties of the Zstandard format (RFC 8878):
+ZLTA achieves this through two properties of the Zstandard format (RFC 8878):
 
 - Decoders concatenate the output of consecutive frames.
 - Decoders silently skip *skippable frames*.
 
-All ZSTA metadata lives in skippable frames. All file content lives in ordinary Zstandard frames whose concatenated output is a POSIX pax tar stream.
+All ZLTA metadata lives in skippable frames. All file content lives in ordinary Zstandard frames whose concatenated output is a POSIX pax tar stream.
 
 ### 1.1 Goals
 
@@ -130,7 +130,7 @@ tar reader:                    hdr file hdr file ...     EOF (2 × 512 zero byte
 | `0x184D2A50` | Archive Header (§4) |
 | `0x184D2A51` | Dictionary (§6) |
 | `0x184D2A52` | Central Index (§7) |
-| `0x184D2A53`–`0x184D2A5D` | Reserved for future ZSTA versions |
+| `0x184D2A53`–`0x184D2A5D` | Reserved for future ZLTA versions |
 | `0x184D2A5E` | Seek Table (§8), as defined by [SEEKABLE] |
 | `0x184D2A5F` | Vendor/private. User_Data begins with a 4-byte vendor tag. |
 
@@ -151,7 +151,7 @@ The Archive Header is the first frame in the file, at file offset 0, with Magic 
 
 ```
 Offset  Size  Field
-0       4     Archive_Magic     "ZSTA" (0x5A 0x53 0x54 0x41)
+0       4     Archive_Magic     "ZLTA" (0x5A 0x4C 0x54 0x41)
 4       1     Major_Version     = 0
 5       1     Minor_Version     = 2
 6       2     Archive_Flags     u16
@@ -391,7 +391,7 @@ Seek_Table_Footer (9 bytes):
     u32 Seekable_Magic_Number   0x8F92EAB1
 ```
 
-### 8.2 ZSTA profile of the seek table
+### 8.2 ZLTA profile of the seek table
 
 The seek table **MUST** list **every frame** from file offset 0 up to and including the Central Index, in file order. The Seek Table frame itself is not listed. Therefore:
 
@@ -599,7 +599,7 @@ A conformant writer produces files satisfying §3–§9. In particular, every ou
 
 ### 14.3 Test corpus *(to be built)*
 
-The `zsta-seekable-probe` crate provides initial coverage: the seek table against the reference reader, stock-tool compatibility, the empty archive, long and non-ASCII paths, §5.2 frame conformance and the §11.3 recovery scan.
+The `zlta-seekable-probe` crate provides initial coverage: the seek table against the reference reader, stock-tool compatibility, the empty archive, long and non-ASCII paths, §5.2 frame conformance and the §11.3 recovery scan.
 
 The full test corpus should cover:
 
@@ -646,7 +646,7 @@ Question numbers are permanent; resolved questions move to §15.2.
 ### 15.2 Resolved
 
 - **Q1** *(resolved in 0.2)*. Does `contrib/seekable_format` work with a leading skippable frame and zero-size seek table entries?
-  - **Yes.** It was tested with the reference reader from zstd 1.5.7 (through `zstd-sys` 2.1.0), the `zstd` 1.5.7 CLI and GNU tar 1.35, using the `zsta-seekable-probe` crate.
+  - **Yes.** It was tested with the reference reader from zstd 1.5.7 (through `zstd-sys` 2.1.0), the `zstd` 1.5.7 CLI and GNU tar 1.35, using the `zlta-seekable-probe` crate.
   - The §8.2 profile stays as written, with the added rule that readers do not verify checksums of zero-size entries.
   - The fallback (list only data frames and store the data-region base offset in the Central Index) was dropped, because the unmodified reference reader cannot read such archives.
 
@@ -659,7 +659,7 @@ This example archive has three small files and one 70 MiB file. The frame sizes 
 ```
 #  Frame            Csize      Dsize        Stream range            Contents
 ─  ───────────────  ─────────  ───────────  ──────────────────────  ──────────────────────────
-0  Archive Header   8+24       0            —                       "ZSTA" v0.2, flags 0, Created
+0  Archive Header   8+24       0            —                       "ZLTA" v0.2, flags 0, Created
 1  Data             1 210 334  3 145 728    [0, 3 145 728)          a.txt, b.json, c.plist (solid)
 2  Data             9 876 001  33 554 432   [3 145 728, 36 700 160) big.bin: pax+header, first chunk
 3  Data             9 870 112  33 554 432   [36 700 160, 70 254 592)
@@ -675,6 +675,8 @@ To extract `b.json`, a reader decodes only frame 1. To extract bytes 40–41 MiB
 
 ## Changelog
 
+- **0.2-draft, amended** (2026-10-22):
+  - The format is named ZALT-archive (ZLTA). `Archive_Magic` is now `"ZLTA"`; files written with the earlier magic are not read.
 - **0.2-draft** (2026-09-28):
   - Drafts renumbered: the initial draft is 0.1, and there is no 1.0 yet. The on-disk version is now 0.2 (`Major_Version` 0, `Minor_Version` 2), and §4.1 requires an exact version match while the major version is 0.
   - Resolved Q1: kept the §8.2 all-frames seek table profile and dropped the data-frames-only fallback.

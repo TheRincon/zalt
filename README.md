@@ -30,7 +30,7 @@ The design is described in [`doc/ZALT-MAC.md`](doc/ZALT-MAC.md).
 | M4 | `Justfile` Recipes and dictionaries | ✅ |
 | M5 | Encoder — correctness first, then performance | ✅ |
 | M6 | `zalt::native` cache codec | gated: ships only if it beats `zstd -3` |
-| M7 | ZSTA archives: create, extract, append, recover | ✅ |
+| M7 | ZALT-archives: create, extract, append, recover | ✅ |
 
 ---
 
@@ -49,7 +49,7 @@ The design is described in [`doc/ZALT-MAC.md`](doc/ZALT-MAC.md).
 - Encode zstd frames at levels 1–19 that the reference `zstd` decodes; the
   scalar and NEON backends produce identical bytes.
 - Decode with dictionaries, and build content-prefix dictionaries from samples.
-- Write and read ZSTA archives: a valid `.tar.zst` that is also randomly
+- Write and read ZALT-archives: a valid `.tar.zst` that is also randomly
   accessible, with per-entry BLAKE3 (or XXH3) hashes and recovery past damage.
 
 **Deliberately never**
@@ -92,7 +92,7 @@ match history lives in the decoder rather than in that buffer.
 ### As a CLI
 
 `zalt(1)` compresses, decompresses and inspects zstd frames, and makes and
-reads ZSTA archives. Build it once and call the binary, or go through `just`,
+reads ZALT-archives. Build it once and call the binary, or go through `just`,
 which builds in release mode first:
 
 ```sh
@@ -156,7 +156,7 @@ zalt version                     # version, and the decode backend (neon or scal
 
 #### Archives
 
-A ZSTA archive is a `.tar.zst` that also carries an index, so one member can
+A ZALT-archive (ZLTA) is a `.tar.zst` that also carries an index, so one member can
 be listed or extracted without decoding the rest. Any stock tool still reads
 it: `zstd -dc a.tar.zst | tar -x`. `zalt a` is short for `zalt archive`, and
 create, list, extract, verify and append are `c`, `t`, `x`, `v` and `r`.
@@ -240,12 +240,12 @@ crates for higher-layer vocabulary and fails the build on a hit.
 | L2 | `zalt-embed` | Streaming, budget, pooling, allocators | Host process constraints |
 | L3 | `zalt-recipe` | Tuning manifests and dictionary selection, as data | Recipes, not content |
 | L3 | `zalt-ztml` | The ZTML recipe: a manifest and a dictionary | One content class |
-| — | `zalt-archive` | ZSTA archives built from standard zstd frames | Files and metadata |
+| — | `zalt-archive` | ZALT-archives built from standard zstd frames | Files and metadata |
 | — | `zalt-ffi` | C ABI, hand-written header | The boundary |
 | — | `zalt-cli` | `zalt(1)` | Files and flags |
 | — | `zalt-bench` | Throughput harness, profiling | Corpora |
 | — | `zalt-recipe-train` | Dev tool: build and measure dictionaries | Sample sets |
-| — | `zsta-seekable-probe` | Test-only: checks ZSTA against zstd's seekable reader | The reference C |
+| — | `zlta-seekable-probe` | Test-only: checks ZLTA against zstd's seekable reader | The reference C |
 
 `zalt-codec` is `no_std + alloc` and architecture-neutral: it may not contain
 the words `neon`, `aarch64`, `darwin`, or any content class. Acceleration
@@ -327,7 +327,7 @@ both now pinned as regression tests.
 ```
 crates/          the workspace (see the layering table above)
 doc/ZALT-MAC.md  the design document — rationale, milestones, every measurement
-doc/ZSTA_SPEC.md the ZSTA archive format specification (draft 0.2)
+doc/ZLTA_SPEC.md the ZALT-archive format specification (draft 0.2)
 doc/rfc8878.txt  the zstd spec, vendored
 ci/              layering and ABI checks, git hooks
 fuzz/            cargo-fuzz targets (its own workspace)
@@ -388,7 +388,7 @@ license, you may instead use it under [MIT](LICENSE-MIT) or
 patent grant.
 
 Third-party files keep their own licenses: `zstd-fixtures/` and
-`crates/zsta-seekable-probe/c/xxhash.h` are from zstd (BSD, with a `LICENSE`
+`crates/zlta-seekable-probe/c/xxhash.h` are from zstd (BSD, with a `LICENSE`
 beside each), and `doc/rfc*.txt` are IETF RFCs.
 
 Four of the encoder's modules follow libzstd's source closely enough to be
