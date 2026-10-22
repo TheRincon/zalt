@@ -9,7 +9,7 @@
  * You may select, at your option, one of the above-listed licenses.
  */
 
-/* zsta-seekable-probe: copied from zstd 1.5.7's lib/common/xxhash.h (xxHash
+/* zlta-seekable-probe: copied from zstd 1.5.7's lib/common/xxhash.h (xxHash
  * 0.8.2) with zstd's "Local adaptations" block removed — it switched XXH3 off
  * and namespaced the symbols. Unmodified otherwise. The reference XXH3-128
  * that zalt-archive's own is tested against; test-only, never shipped. */

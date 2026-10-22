@@ -1,6 +1,6 @@
 [package]
 name = "zalt-archive"
-description = "ZSTA: multi-file archives built entirely from standard zstd frames — a valid .tar.zst that is also randomly accessible."
+description = "ZALT-archives (ZLTA): multi-file archives built entirely from standard zstd frames — a valid .tar.zst that is also randomly accessible."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -46,7 +46,7 @@ native-fs = ["dep:cap-std", "dep:cap-fs-ext", "dep:rustix", "dep:nix", "dep:exac
 # The oracle: libzstd's reference seekable reader, an independent reading of
 # the Central Index (§7), and zstd(1) and tar, judging every archive the
 # writer produces. Test-only — it links C through zstd-sys.
-zsta-seekable-probe = { path = "../zsta-seekable-probe" }
+zlta-seekable-probe = { path = "../zlta-seekable-probe" }
 
 # To inspect what extraction restored, by readers independent of the ones
 # the crate uses. (`xattr` is fine for the small values the tests check with

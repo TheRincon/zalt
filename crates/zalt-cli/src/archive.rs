@@ -1,4 +1,4 @@
-//! `zalt archive` — ZSTA archives from the shell.
+//! `zalt archive` — ZALT-archives from the shell.
 //!
 //! ```text
 //! zalt archive create -o out.tar.zst [-19] [--threads N] [--hash blake3|xxh3|none] [--no-xattrs] [--no-acls] [--no-fflags] PATH...
@@ -29,7 +29,7 @@ use zalt_archive::read::Archive;
 use zalt_archive::{Entry, Kind, ReadLimits, Writer, WriterOptions};
 
 pub const USAGE: &str = "\
-zalt archive — ZSTA archives: a .tar.zst that is also randomly accessible
+zalt archive — ZALT-archives: a .tar.zst that is also randomly accessible
 
 USAGE
     zalt archive create -o ARCHIVE [options] PATH...

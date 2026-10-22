@@ -3,7 +3,7 @@
 //!
 //! Only what the probe needs: regular files, directories and symlinks, with a pax
 //! `x` header for long or non-ASCII names. The end-of-archive marker is *not*
-//! written; in ZSTA it lives in its own Terminator frame (§5.4).
+//! written; in ZLTA it lives in its own Terminator frame (§5.4).
 
 pub const BLOCK: usize = 512;
 pub const UID: u32 = 501;

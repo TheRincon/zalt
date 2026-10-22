@@ -174,8 +174,8 @@ done
 #
 # And one test-only crate, with its argument:
 #
-#   zsta-seekable-probe
-#              the oracle for ZSTA archives. Its whole job is to run libzstd's
+#   zlta-seekable-probe
+#              the oracle for ZALT-archives. Its whole job is to run libzstd's
 #              *reference* seekable reader and frame inspector over zalt's
 #              archives, and those exist only as C (`contrib/seekable_format`),
 #              reached through `zstd-sys`. A safe re-implementation would not be
@@ -190,7 +190,7 @@ done
 # Adding a third name to this list should be an argument, not an edit.
 for dir in crates/*/src; do
     crate=$(basename "$(dirname "${dir}")")
-    case "${crate}" in zalt-neon | zalt-ffi | zsta-seekable-probe) continue ;; esac
+    case "${crate}" in zalt-neon | zalt-ffi | zlta-seekable-probe) continue ;; esac
     unsafe_hits=$(grep -rnw 'unsafe' "${dir}" 2>/dev/null | strip_comments || true)
     if [ -n "${unsafe_hits}" ]; then
         echo "SAFETY VIOLATION in ${crate}"
@@ -206,11 +206,11 @@ done
 for manifest in crates/*/Cargo.toml; do
     hits=$(awk '
         /^\[/ { section = $0 }
-        /zsta-seekable-probe/ && section !~ /dev-dependencies/ && section !~ /^\[package\]/ {
+        /zlta-seekable-probe/ && section !~ /dev-dependencies/ && section !~ /^\[package\]/ {
             print FILENAME ": " section ": " $0
         }' "${manifest}")
     if [ -n "${hits}" ]; then
-        echo "SAFETY VIOLATION: zsta-seekable-probe outside dev-dependencies"
+        echo "SAFETY VIOLATION: zlta-seekable-probe outside dev-dependencies"
         echo "  It contains unsafe FFI and is exempt only as a test oracle."
         echo "${hits}" | sed 's/^/    /'
         echo

@@ -553,7 +553,7 @@ fn what_is_not_an_archive_cannot_be_recovered() {
 /// since ours cannot write a bad header.
 #[test]
 fn a_bad_tar_header_inside_a_good_frame_drops_its_run() {
-    let mut t = zsta_seekable_probe::tar::TarWriter::new();
+    let mut t = zlta_seekable_probe::tar::TarWriter::new();
     for i in 0..12 {
         t.add_file(
             &format!("lib/f{i:02}"),
@@ -569,13 +569,13 @@ fn a_bad_tar_header_inside_a_good_frame_drops_its_run() {
     let victim = &entries[7];
     // The ustar block's first name byte: its checksum no longer matches.
     body[(victim.data_offset - 512) as usize] ^= 0x20;
-    let opts = zsta_seekable_probe::archive::WriterOptions {
+    let opts = zlta_seekable_probe::archive::WriterOptions {
         solid_target: 4096,
         chunk: 8192,
         ..Default::default()
     };
-    let mut enc = zsta_seekable_probe::encoder::ReferenceEncoder::new(3);
-    let bytes = zsta_seekable_probe::archive::write(&body, &entries, &mut enc, &opts)
+    let mut enc = zlta_seekable_probe::encoder::ReferenceEncoder::new(3);
+    let bytes = zlta_seekable_probe::archive::write(&body, &entries, &mut enc, &opts)
         .unwrap()
         .bytes;
     let original = open(&bytes);

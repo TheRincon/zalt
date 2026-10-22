@@ -10,7 +10,7 @@ use libfuzzer_sys::fuzz_target;
 use zalt_archive::xxh3;
 
 fuzz_target!(|data: &[u8]| {
-    let reference = zsta_seekable_probe::xxh3::xxh3_128(data);
+    let reference = zlta_seekable_probe::xxh3::xxh3_128(data);
     assert_eq!(xxh3::canonical(xxh3::hash(data)), reference, "one-shot");
 
     // Piece sizes from the input's first bytes, cycling; at least one byte.

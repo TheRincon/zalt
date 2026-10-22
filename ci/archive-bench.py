@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ZSTA archives at size: zalt against `gtar | zstd`, interleaved.
+"""ZALT-archives at size: zalt against `gtar | zstd`, interleaved.
 
     just archive-bench [CORPUS] [ROUNDS]
 

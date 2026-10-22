@@ -425,7 +425,7 @@ pub fn parse_member_prefix(stream: &[u8]) -> Result<Option<Member>> {
             }
             b'L' | b'K' => {
                 return Err(Error::Unsupported(
-                    "GNU long-name members; ZSTA requires pax (§5.1)".into(),
+                    "GNU long-name members; ZLTA requires pax (§5.1)".into(),
                 ));
             }
             _ => {}

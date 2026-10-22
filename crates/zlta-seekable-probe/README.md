@@ -1,6 +1,6 @@
-# zsta-seekable-probe
+# zlta-seekable-probe
 
-This crate answers **Open Question Q1** of the ZSTA spec (`doc/ZSTA_SPEC.md`), and Q7 along the way:
+This crate answers **Open Question Q1** of the ZLTA spec (`doc/ZLTA_SPEC.md`), and Q7 along the way:
 
 > **Q1.** Confirm the behavior of `contrib/seekable_format` with a leading skippable
 > frame and zero-size seek table entries.
@@ -9,7 +9,7 @@ It writes real archives in the spec's layout. It then reads them back with zstd'
 
 ## Result
 
-Q1 is **confirmed: keep the §8.2 profile as written**. The unmodified reference reader reads ZSTA archives correctly when every frame is listed:
+Q1 is **confirmed: keep the §8.2 profile as written**. The unmodified reference reader reads ZALT-archives correctly when every frame is listed:
 
 - the Archive Header is entry 0;
 - skippable frames are listed with `Decompressed_Size = 0`;
@@ -46,7 +46,7 @@ That test runs in a child process, because the reference C code has live `assert
 3. **§3.1:** data frames are now "0 or more". An empty archive (listed in §14.3) is just the Terminator.
 4. **§15 Q7:** findings recorded. Interleaved skippable frames work with the reference seekable reader and with stock decoders, so allowing them is a design choice, not a compatibility risk. The decision is still open.
 5. **§5.2(3):** frames are capped at 1 GiB instead of 2³²−1 bytes, matching the reference seekable *compressor* (`ZSTD_SEEKABLE_MAX_FRAME_DECOMPRESSED_SIZE`). The reader itself doesn't enforce it, and the §12 default of 64 MiB is far below either limit.
-6. **§11.1 step 4:** now notes that the reference reader does **not** check that the table covers the file, so ZSTA readers must perform that check themselves.
+6. **§11.1 step 4:** now notes that the reference reader does **not** check that the table covers the file, so ZLTA readers must perform that check themselves.
 
 The probe writes archives stamped with format version 0.2 (`Major_Version` 0, `Minor_Version` 2), matching the spec.
 
@@ -57,7 +57,7 @@ cargo test -- --nocapture
 ```
 
 - `ZSTD_BIN` / `TAR_BIN` pick the CLI tools; otherwise they are looked up on `PATH`. The CLI test prints `SKIPPED` if `zstd` isn't found. On macOS, `brew install zstd`. The system `tar` there is bsdtar, which the test is written to handle, though it has only been run with GNU tar here.
-- `ZSTA_LEVEL` sets the compression level for most tests. The default is 3. The §5.2 test always runs levels −5, 1, 3, 9 and 19.
+- `ZLTA_LEVEL` sets the compression level for most tests. The default is 3. The §5.2 test always runs levels −5, 1, 3, 9 and 19.
 
 Tested here with:
 
@@ -68,7 +68,7 @@ Tested here with:
 
 ## Testing your encoder
 
-Implement `zsta_seekable_probe::encoder::FrameEncoder` for your encoder:
+Implement `zlta_seekable_probe::encoder::FrameEncoder` for your encoder:
 
 ```rust
 pub trait FrameEncoder {
@@ -91,7 +91,7 @@ Then return it from `encoder_at()` in `tests/common/mod.rs`. Every archive in th
 
 | Path | What it is |
 |---|---|
-| `src/archive.rs` | Minimal ZSTA writer. `SeekProfile`, `SkippableChecksum`, leading and interleaved skippable frames are all switchable. |
+| `src/archive.rs` | Minimal ZLTA writer. `SeekProfile`, `SkippableChecksum`, leading and interleaved skippable frames are all switchable. |
 | `src/index.rs` | Central Index encode/decode (§7), strict VarInt (§2), path validation and resource limits (§13) |
 | `src/seekable.rs` | Safe wrapper over the reference `ZSTD_seekable_*` API |
 | `src/stock.rs` | Plain streaming decode (what `zstd -dc` does) |

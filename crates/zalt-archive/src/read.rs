@@ -722,7 +722,7 @@ fn check_layout(frames: &[Frame]) -> Result<Vec<usize>> {
         }
         match f.magic {
             MAGIC_HEADER | MAGIC_INDEX | MAGIC_SEEK_TABLE => {
-                return format_err(format!("frame {i} is a ZSTA structure out of place (§3.1)"));
+                return format_err(format!("frame {i} is a ZLTA structure out of place (§3.1)"));
             }
             MAGIC_DICTIONARY => {
                 // §6 puts dictionaries before the first data frame; this

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use zsta_seekable_probe::{
+use zlta_seekable_probe::{
     archive::{self, Archive, SeekProfile, WriterOptions, MAGIC_INDEX},
     corpus::{Corpus, Rng},
     encoder::{FrameEncoder, ReferenceEncoder},
@@ -13,11 +13,11 @@ use zsta_seekable_probe::{
 /// The one place to plug in your own encoder.
 ///
 /// Replace the body with e.g. `Box::new(my_zstd::ProbeEncoder::new(level))`, where
-/// `ProbeEncoder` implements `zsta_seekable_probe::encoder::FrameEncoder`. Every
+/// `ProbeEncoder` implements `zlta_seekable_probe::encoder::FrameEncoder`. Every
 /// test then writes its archives with your encoder and reads them back with the
 /// *reference* decoder and seekable reader.
 pub fn encoder_at(level: i32) -> Box<dyn FrameEncoder> {
-    if std::env::var("ZSTA_ENCODER").as_deref() == Ok("reference") {
+    if std::env::var("ZLTA_ENCODER").as_deref() == Ok("reference") {
         return Box::new(ReferenceEncoder::new(level));
     }
     Box::new(ZaltEncoder { level })
@@ -26,7 +26,7 @@ pub fn encoder_at(level: i32) -> Box<dyn FrameEncoder> {
 /// zalt's encoder, as §5.2 asks of a data frame: a content checksum, at the
 /// level the test requested. Since the probe moved into the zalt workspace this
 /// is the default — the probe is the oracle *for zalt* — and
-/// `ZSTA_ENCODER=reference` puts libzstd back, which is how a failure here is
+/// `ZLTA_ENCODER=reference` puts libzstd back, which is how a failure here is
 /// told apart from a failure of the probe. zalt has no negative levels; they
 /// clamp to 1, which `describe` says so a failure is not misattributed.
 pub struct ZaltEncoder {
@@ -53,9 +53,9 @@ impl FrameEncoder for ZaltEncoder {
     }
 }
 
-/// Compression level for most tests: `ZSTA_LEVEL`, default 3.
+/// Compression level for most tests: `ZLTA_LEVEL`, default 3.
 pub fn level() -> i32 {
-    std::env::var("ZSTA_LEVEL")
+    std::env::var("ZLTA_LEVEL")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3)
@@ -118,7 +118,7 @@ fn assert_bytes(got: &[u8], want: &[u8], what: &str) {
 pub fn verify_reference_reader(a: &Archive, c: &Corpus) {
     assert_eq!(a.options.profile, SeekProfile::AllFrames);
     let mut zs =
-        RefSeekable::open(&a.bytes).expect("reference reader rejected the ZSTA seek table");
+        RefSeekable::open(&a.bytes).expect("reference reader rejected the ZLTA seek table");
     let n = zs.num_frames();
     let stream_len = a.tar_stream.len() as u64;
     assert_eq!(n as usize, a.listed.len(), "number of seek-table entries");

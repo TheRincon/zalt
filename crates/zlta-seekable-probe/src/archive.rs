@@ -1,4 +1,4 @@
-//! Minimal ZSTA writer (§3–§8), with switches for the layouts that Q1 compares.
+//! Minimal ZLTA writer (§3–§8), with switches for the layouts that Q1 compares.
 
 use std::ops::Range;
 
@@ -87,7 +87,7 @@ impl Default for WriterOptions {
             chunk: 32 << 20,
             leading_frames: Vec::new(),
             vendor_every: None,
-            creator: "zsta-seekable-probe".into(),
+            creator: "zlta-seekable-probe".into(),
         }
     }
 }
@@ -201,7 +201,7 @@ impl Out {
 
 fn header_payload(creator: &str) -> Vec<u8> {
     let mut p = Vec::new();
-    p.extend_from_slice(b"ZSTA");
+    p.extend_from_slice(b"ZLTA");
     p.push(0); // Major_Version (spec draft 0.2)
     p.push(2); // Minor_Version
     p.extend_from_slice(&0u16.to_le_bytes()); // Archive_Flags

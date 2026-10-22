@@ -21,7 +21,7 @@ pub const MAGIC_INDEX: u32 = 0x184D_2A52;
 /// The same value as Compression Dictionary Transport's prelude
 /// (`zalt_codec::magic::ZSTD_SKIPPABLE_DCZ`). The two coexist by position
 /// alone: `dcz` is at the head of a stream with a payload of exactly 32 bytes,
-/// the seek table is at the tail and ends with [`SEEKABLE_MAGIC`]. A ZSTA
+/// the seek table is at the tail and ends with [`SEEKABLE_MAGIC`]. A ZLTA
 /// archive begins with [`MAGIC_HEADER`], so a `dcz` reader never mistakes it.
 pub const MAGIC_SEEK_TABLE: u32 = 0x184D_2A5E;
 /// Vendor-private skippable frame; `User_Data` begins with a vendor tag.
@@ -30,7 +30,7 @@ pub const MAGIC_VENDOR: u32 = 0x184D_2A5F;
 pub const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
 
 /// Start of the Archive Header's `User_Data`.
-pub const ARCHIVE_MAGIC: [u8; 4] = *b"ZSTA";
+pub const ARCHIVE_MAGIC: [u8; 4] = *b"ZLTA";
 /// The format this crate reads and writes: 0.2. While the major version is 0,
 /// §4.1 requires an exact match in both directions.
 pub const VERSION: (u8, u8) = (0, 2);
@@ -140,7 +140,7 @@ impl Header {
             return format_err("Archive Header shorter than 8 bytes");
         }
         if data[..4] != ARCHIVE_MAGIC {
-            return format_err("Archive Header does not begin with \"ZSTA\"");
+            return format_err("Archive Header does not begin with \"ZLTA\"");
         }
         if (data[4], data[5]) != VERSION {
             // §4.1: while the major version is 0, every draft may change the
@@ -268,7 +268,7 @@ mod tests {
     use super::*;
     use zalt_codec::magic;
 
-    /// Every ZSTA magic is a zstd skippable magic, and none is a frame,
+    /// Every ZLTA magic is a zstd skippable magic, and none is a frame,
     /// dictionary or zalt container magic — the collision check the codec's
     /// own registry makes, extended to the values this crate adds.
     ///
@@ -314,7 +314,7 @@ mod tests {
             ],
         };
         let data = h.encode().unwrap();
-        assert_eq!(&data[..8], b"ZSTA\x00\x02\x00\x00");
+        assert_eq!(&data[..8], b"ZLTA\x00\x02\x00\x00");
         assert_eq!(Header::parse(&data).unwrap(), h);
         assert_eq!(h.creator(), Some(&b"zalt 0.0.1"[..]));
 

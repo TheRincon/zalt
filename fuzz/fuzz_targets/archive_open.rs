@@ -1,4 +1,4 @@
-//! Arbitrary bytes, opened as a ZSTA archive: never a panic, a hang or an
+//! Arbitrary bytes, opened as a ZALT-archive: never a panic, a hang or an
 //! unbounded allocation — whatever the trailer, header or index claims.
 //!
 //! When an archive does open, everything a reader would then do is exercised

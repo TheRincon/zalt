@@ -125,8 +125,8 @@ zalt/
     ├── zalt-recipe/            # L3 mechanism. Generic. Manifest + dict loading.
     ├── zalt-recipe-train/      # L3 dev tool. Dictionary training, param search.
     ├── zalt-ztml/              # L3 instance. Mostly DATA. Depends on nothing above.
-    ├── zalt-archive/           # ZSTA archives: a .tar.zst that is also random-access
-    ├── zsta-seekable-probe/    # test-only oracle: libzstd's seekable reader, zstd(1), tar
+    ├── zalt-archive/           # ZALT-archives: a .tar.zst that is also random-access
+    ├── zlta-seekable-probe/    # test-only oracle: libzstd's seekable reader, zstd(1), tar
     ├── zalt-ffi/               # C API, hand-written header + ABI drift check
     ├── zalt-cli/               # zalt(1): decompress, info, check
     ├── zalt-fuzz/              # cargo-fuzz targets
@@ -4297,9 +4297,9 @@ against a local attacker needs a MAC keyed to something unreadable by them,
 which is a browser threat-model decision with a real cost, not a container
 format decision.
 
-### M7 — ZSTA archives: portable R1
+### M7 — ZALT-archives: portable R1
 
-`doc/ZSTA_SPEC.md` (draft 0.2) specifies **ZSTA**: a multi-file archive
+`doc/ZLTA_SPEC.md` (draft 0.2) specifies **ZALT-archives (ZLTA)**: a multi-file archive
 built entirely from standard zstd frames, at once a valid `.tar.zst` —
 `zstd -dc a.tar.zst | tar -x` extracts it — and randomly accessible, through a
 trailing seek table and a Central Index that list the contents and locate any
@@ -4321,7 +4321,7 @@ first milestone: the **portable profile** and an **R1 reader** (spec §14.2).
 
 #### Where it sits
 
-Above the codec, and the only crate that knows the ZSTA layout exists.
+Above the codec, and the only crate that knows the ZLTA layout exists.
 `zalt-codec` writes and reads frames and has never heard of tar; the dependency
 rule of §1 holds in the usual direction. The crate is `forbid(unsafe_code)`,
 which is exactly why §9.3's macOS metadata is not in this milestone — extended
@@ -4347,7 +4347,7 @@ are not `zalt-archive`:
 And before any of that, the probe's own suite — written for libzstd as the
 encoder — passes **16/16 with zalt as the encoder** at levels 1, 3, 9, 16 and
 19, including §5.2's frame conformance at every level it checks. zalt was a
-conformant ZSTA encoder before a line of `zalt-archive` existed.
+conformant ZLTA encoder before a line of `zalt-archive` existed.
 
 #### Safety, and the tests that can fail
 
@@ -4377,9 +4377,9 @@ destination closes the race in practice.
 independently and written in order, so one thread and eight produce identical
 bytes — §12.4's reproducibility at any parallelism, asserted by a test.
 
-#### What ZSTA found in the codec
+#### What ZLTA found in the codec
 
-**zalt could not decode a stream that ends in a skippable frame.** Every ZSTA
+**zalt could not decode a stream that ends in a skippable frame.** Every ZLTA
 archive ends in two — the Central Index and the seek table — and so does any
 file carrying zstd's seekable-format seek table; `zstd(1)` reads them.
 
@@ -4415,7 +4415,7 @@ edges to 1 761; `archive_index` from 19 to 1 982.
 
 #### Findings for the spec
 
-Recorded here for the next draft; `doc/ZSTA_SPEC.md` is unchanged.
+Recorded here for the next draft; `doc/ZLTA_SPEC.md` is unchanged.
 
 - **§7.2 does not say XXH3-128's byte order.** "Raw digest" fits BLAKE3 and
   SHA-256, whose digests are bytes, but XXH3-128 is a 128-bit integer. zalt
@@ -4439,7 +4439,7 @@ Recorded here for the next draft; `doc/ZSTA_SPEC.md` is unchanged.
   precomposed. The archive is right — §9.3 stores paths as given — but §14.1
   requires listings to pass "with bsdtar", so either it needs a
   normalization-insensitive comparison for bsdtar or the requirement needs a
-  note. A second bsdtar difference is *not* a ZSTA property, and is recorded so
+  note. A second bsdtar difference is *not* a ZLTA property, and is recorded so
   it is not mistaken for one: `--use-compress-program zstd` fails on **any**
   `.tar.zst` under bsdtar, a plain `gtar | zstd` one included, because GNU tar
   appends `-d` when reading through the program and bsdtar does not. The
@@ -4450,7 +4450,7 @@ Recorded here for the next draft; `doc/ZSTA_SPEC.md` is unchanged.
   `zstd --ultra -22`, and with parallel decode that is 128 MiB per frame in
   flight. `zalt-archive` reads to 2^27, deliberately.
 - **`Frame_Content_Size` is present in zalt's frames only by coupling.** zalt's
-  writer omits it for some frames under 256 bytes; ZSTA's data frames are
+  writer omits it for some frames under 256 bytes; ZLTA's data frames are
   always at least 512 and its index bodies single-segment, so it holds — and
   the archive writer now checks it on every frame rather than relying on that.
 - **`Path_Shared` need not be maximal.** §7.1 does not say a writer must share
@@ -4796,7 +4796,7 @@ for none.
   streaming. Every Rust port carries `unsafe` for reads `first_chunk` does
   safely, and none is the authors'.
 - **The oracle is xxHash's own C.** zstd vendors `xxhash.h` with XXH3 switched
-  off by a "local adaptations" block; `zsta-seekable-probe/c/xxhash.h` is that
+  off by a "local adaptations" block; `zlta-seekable-probe/c/xxhash.h` is that
   file with the block removed, compiled by the probe's build script. Our XXH3
   matches it on every length to 2200 and at the buffer and block boundaries
   beyond, whole and in every piece size the streaming buffer cares about, and

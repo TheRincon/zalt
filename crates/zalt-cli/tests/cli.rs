@@ -1099,7 +1099,7 @@ fn a_plain_zstd_file_is_not_mistaken_for_an_archive() {
     let out = zalt(&["archive", "list", &plain]);
     assert_eq!(code(&out), EXIT_INPUT);
     assert!(
-        stderr(&out).contains("not a valid ZSTA archive"),
+        stderr(&out).contains("not a valid ZALT-archive"),
         "{}",
         stderr(&out)
     );

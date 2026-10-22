@@ -364,7 +364,7 @@ impl<'a> Session<'a> {
         }
 
         // The decoder's own state decides, not the last status it returned: a
-        // stream that ends on a skippable frame — every ZSTA archive does, and
+        // stream that ends on a skippable frame — every ZALT-archive does, and
         // so does anything carrying a seekable-format seek table — finishes
         // with `NeedMoreInput`, and is complete. Judging by the last status
         // reported those as truncated.

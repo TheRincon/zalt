@@ -877,7 +877,7 @@ dependencies = [
  "xattr",
  "zalt-codec",
  "zalt-embed",
- "zsta-seekable-probe",
+ "zlta-seekable-probe",
 ]
 
 [[package]]
@@ -976,7 +976,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zsta-seekable-probe"
+name = "zlta-seekable-probe"
 version = "0.1.0"
 dependencies = [
  "cc",

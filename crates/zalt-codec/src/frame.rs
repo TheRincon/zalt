@@ -214,7 +214,7 @@ pub fn classify(magic_number: u32) -> Result<FrameKind> {
 /// A zstd frame is walked header, then block header by block header to the
 /// last block, then its checksum: RFC 8878 makes every frame self-delimiting
 /// this way, which is what lets a damaged file be walked frame by frame
-/// (ZSTA §11.3). libzstd's `ZSTD_findFrameCompressedSize` does the same.
+/// (ZLTA §11.3). libzstd's `ZSTD_findFrameCompressedSize` does the same.
 ///
 /// [`Error::Truncated`] if `src` ends before the frame does — the answer for
 /// a file cut short, and also for a slice that is merely too small yet, so a

@@ -14,7 +14,7 @@ members = [
     # Test-only: libzstd's reference seekable reader, zstd(1) and tar as the
     # oracle for every archive zalt-archive writes. Links C through zstd-sys,
     # which is why it is a crate of its own and never a library dependency.
-    "crates/zsta-seekable-probe",
+    "crates/zlta-seekable-probe",
 ]
 # `fuzz` is its own workspace: fuzz targets build with sanitizers and coverage
 # instrumentation and must not perturb this workspace's lockfile or profiles.
@@ -70,7 +70,7 @@ panic = "unwind"
 [profile.dev.package.zalt-codec]
 opt-level = 1
 
-# libzstd under the ZSTA probe: the reference seekable reader is exercised
+# libzstd under the ZLTA probe: the reference seekable reader is exercised
 # heavily by its tests, so it is not run at -O0. (Moved from the probe's own
 # manifest, since cargo honours profiles only at the workspace root.)
 [profile.dev.package.zstd-sys]

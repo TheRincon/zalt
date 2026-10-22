@@ -1,7 +1,7 @@
-//! # zalt-archive — ZSTA archives
+//! # zalt-archive — ZALT-archives (ZLTA)
 //!
 //! A multi-file archive built entirely from standard Zstandard frames, per the
-//! ZSTA draft in `doc/ZSTA_SPEC.md` (format 0.2). An archive is at once:
+//! ZLTA draft in `doc/ZLTA_SPEC.md` (format 0.2). An archive is at once:
 //!
 //! - **a valid `.tar.zst`** — `zstd -dc a.tar.zst | tar -x` extracts it, because
 //!   every piece of metadata lives in skippable frames a stock decoder steps
@@ -14,7 +14,7 @@
 //!
 //! Above the codec, never inside it. `zalt-codec` writes and reads frames and
 //! has never heard of tar, paths or archives; this crate arranges frames into
-//! the ZSTA layout and is the only crate that knows the layout exists. The
+//! the ZLTA layout and is the only crate that knows the layout exists. The
 //! layering rule from `doc/ZALT-MAC.md` §1 holds in the usual direction:
 //! dependencies point down.
 //!
@@ -49,7 +49,7 @@
 //! The spec defines conformance by what *other* software accepts (§14.1), so
 //! the tests do too: every archive the writer produces is read back by
 //! libzstd's reference seekable reader, `zstd(1)` and `tar`, through the
-//! `zsta-seekable-probe` crate.
+//! `zlta-seekable-probe` crate.
 
 #![forbid(unsafe_code)]
 
@@ -80,7 +80,7 @@ use core::fmt;
 /// Everything that can go wrong reading or writing an archive.
 #[derive(Debug)]
 pub enum Error {
-    /// The file is not a ZSTA archive, or not one this version reads. The
+    /// The file is not a ZALT-archive, or not one this version reads. The
     /// string says which check failed.
     Format(String),
     /// The archive uses a feature this build does not implement.
@@ -100,7 +100,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Format(s) => write!(f, "not a valid ZSTA archive: {s}"),
+            Self::Format(s) => write!(f, "not a valid ZALT-archive: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::Inconsistent(s) => write!(f, "index disagrees with the tar stream: {s}"),
             Self::Refused(s) => write!(f, "refused: {s}"),

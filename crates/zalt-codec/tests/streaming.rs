@@ -205,7 +205,7 @@ fn skippable_frame_before_a_real_one() {
 /// one, and the one-shot decoder, the CLI and this file's own chunked helper
 /// all judged the end of a stream by the last status returned — which after a
 /// skippable frame is `NeedMoreInput`. So a stream ending on one was reported
-/// truncated, by all three, and no test noticed. ZSTA archives end that way by
+/// truncated, by all three, and no test noticed. ZALT-archives end that way by
 /// construction, which is how it was found; so does any file carrying zstd's
 /// seekable-format seek table. `zstd(1)` decodes them.
 #[test]
