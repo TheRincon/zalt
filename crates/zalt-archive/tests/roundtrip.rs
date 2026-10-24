@@ -26,6 +26,7 @@ fn options(threads: usize) -> WriterOptions {
         threads,
         creator: Some(b"test".to_vec()),
         hash: zalt_archive::Hash::default(),
+        dictionary: None,
     }
 }
 

@@ -4317,7 +4317,9 @@ first milestone: the **portable profile** and an **R1 reader** (spec §14.2).
 - [x] The probe imported as the oracle; three fuzz targets (§14.3).
 - [x] macOS metadata (§9.3), entry hashes (§7.3), append and recovery (R2,
       §10–§11.3), FIFOs and device nodes.
-- [ ] Dictionaries (§6).
+- [x] Dictionaries (§6): writer, reader, append, recovery, `-D` on the CLI
+      (2026-10-22/24). Not done: training our own, the portable conversion
+      §6 asks for, and group sizes on the CLI — see *Dictionaries*.
 
 #### Where it sits
 
@@ -4852,6 +4854,148 @@ larger pieces, and the production geometry around its piece and batch
 edges; `archive_hash` fuzzes it with geometry from the input (1.4 M runs).
 Four deliberate bugs — the wrong split, a missing offset, swapped children,
 pieces out of order — all failed. **Re-timing is pending** (swap was 93%).
+
+#### Dictionaries (§6, 2026-10-22/24)
+
+**The encoder could not compress against a dictionary.** It could write a
+`Dictionary_ID` into a frame header and nothing more; decoding with one has
+worked since M4. So this began in `zalt-codec`.
+
+- **Dictionary as history.** `encode::compress_with_dictionary` puts the
+  dictionary's content in the buffer in front of the input, so a match into
+  it is an ordinary backwards offset — the decoder's own view (RFC 8878 §5).
+  The matcher's tables are sized for window plus dictionary, and
+  `Matcher::prime` indexes every dictionary position for each finder (fast,
+  dfast, rows, chains, trees) before the first block.
+- **One reach rule replaces the window cap.** `Matcher::reach(pos)`: a match
+  may reach back to the dictionary's first byte while the frame has produced
+  at most `Window_Size` bytes, and only `Window_Size` after — the rule the
+  decoder applies at each match's start (`Window::dict_reach`). Without a
+  dictionary it is `min(pos, window)`, what every finder already checked, and
+  **all 76 frames of the baseline set (4 inputs × levels 1–19) are byte for
+  byte unchanged.** Repeat offsets are checked against it too: one that
+  reached into the dictionary early names nothing once it drops out.
+- **The frame starts from the dictionary's repeat offsets**, as the decoder
+  will. Its entropy tables are not used — every block writes its own, which
+  is always legal; reusing them would help small frames, unmeasured.
+
+Judged as the codec's encoder always is: `tests/encode_dictionary.rs` has
+libzstd (`zstd -D`), ruzstd and zalt's decoder read every frame, every level,
+against a zstd-trained dictionary, the same with unusual repeat offsets, the
+golden `http-dict-missing-symbols`, and raw content — 285 frames — plus frames
+many windows long whose content is the dictionary repeated, with a 1 KiB
+window. **Three mutants each fail it:** reaching into the dictionary for the
+whole frame (the phase test — zalt's decoder refuses), starting from `{1, 4,
+8}` (only after a test input led with a run, since zstd trains `{1, 4, 8}`
+itself — the first version of the test let this mutant through), and not
+priming (the ratio test). ruzstd cannot load the golden dictionary — its
+Huffman table log is 12, legal for a dictionary and not a block — and is not
+asked to judge it. NEON and scalar write identical frames
+(`zalt-neon/tests/equivalence.rs`). Fuzz target `encode_dictionary`: raw
+dictionaries from the fuzzer, often part of the content, windows from 1 KiB,
+every level, against libzstd and with both backends: 348 k runs, clean.
+
+**Ratio against `zstd -D`**, same dictionary (110 KiB, `zstd --train` on half
+of this repository's `.rs` files), the other half compressed file by file —
+51 files, 779 KB; sizes, so deterministic:
+
+| level | zalt / zstd, no dictionary | zalt / zstd, with it | dictionary's gain (zalt) |
+|---|---:|---:|---:|
+| 1 | 1.030 | 0.994 | 9.8% |
+| 3 | 1.006 | 0.988 | 13.9% |
+| 5 | 0.997 | 0.968 | 15.5% |
+| 9 | 1.018 | 1.022 | 16.5% |
+| 12 | 1.028 | 1.044 | 16.5% |
+| 16 | 1.005 | 1.010 | 19.4% |
+| 19 | 1.004 | 1.005 | 19.6% |
+
+The 2–4% at levels 9 and 12 is the encoder's gap without a dictionary, not
+something the dictionary adds.
+
+**The CLI:** `-D FILE` on `compress`, `decompress` and `check`, as zstd(1)'s;
+`zalt-embed` gained `compress_with_dictionary` and
+`Decoder::load_dictionary`, which survives `shrink`. Frames interchange with
+`zstd -D` both ways (tested); a frame needing a dictionary it was not given
+fails with the ID it needs.
+
+**The archive.** `WriterOptions::dictionary` (a `zalt_archive::Dictionary`:
+formatted only, as §6 requires — raw content is refused) puts it in a
+Dictionary frame after the header, sets `DICT_REQUIRED`, and compresses
+**every** data frame against it, Terminator included, so the flag is always
+true of the archive and an appender can see what to go on using. The index
+never uses it. The reader loads Dictionary frames only when the flag is set
+(§11.1 step 7), only before the first data frame, IDs unique, at most
+`ReadLimits::max_dictionary_bytes` (32 MiB); a frame naming a dictionary the
+reader does not hold is refused when read, and a frame naming none is
+decoded with none — the codec would otherwise apply a loaded one. **Append**
+keeps using the dictionary the old Terminator named, and refuses one the
+archive does not hold (§10 cannot add a Dictionary frame). **Recovery** loads
+whatever dictionaries survive, keeps their frames, and loses exactly the
+members whose frames needed a damaged one. `zalt archive create -D`,
+`append -D`, and `zalt archive dict A -o FILE`, which writes the dictionary
+out so that `zstd -dc -D FILE A | tar -x` extracts it — tested with GNU tar.
+`tests/dictionary.rs` (10): round trip, every frame naming it, reproducible
+at 1 and 8 threads, stock tools with and without the dictionary, the flag
+cleared, the size limit, append both ways, recovery with the trailer cut and
+with the dictionary damaged, and the probe's libzstd-based §7 decoder
+reading the index with no dictionary at all. Fuzz `archive_open` and
+`archive_recover`, seeded with a dictionary archive: clean (1.3 k and 34 k
+runs — both slowed by their seed, below).
+
+**What dictionaries are worth in an archive** — less than in a single frame,
+for a reason the spec sets. Held-out half of this repository's text files
+(97 files, 1.4 MB), dictionaries trained on the other half, archive size as a
+multiple of `gtar | zstd` at the same level:
+
+| groups | L3 none | L3 8 KiB dict | L3 110 KiB | L19 none | L19 8 KiB | L19 110 KiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 8 MiB (default) | 1.004 | 1.026 | 1.297 | 1.005 | 1.029 | 1.352 |
+| 1 MiB | 1.037 | 1.056 | 1.323 | 1.055 | 1.076 | 1.390 |
+| 256 KiB | 1.063 | 1.076 | 1.324 | 1.114 | 1.123 | 1.411 |
+| 64 KiB | 1.113 | 1.107 | 1.333 | 1.197 | 1.181 | 1.432 |
+| 16 KiB | 1.162 | 1.135 | 1.347 | 1.272 | 1.223 | 1.453 |
+
+Net of its own frame, the 110 KiB dictionary saves 2% at 8 MiB groups and
+16% at 16 KiB (about 600 bytes per frame at L19); but §6 stores it
+uncompressed, and on an archive this size that costs more than it saves.
+Dictionaries pay where frames are small **and** the archive is large beside
+the dictionary — which this corpus is not, and a typical one would need to be
+measured on (one the user provides).
+
+**Decoding costs more per frame than libzstd's.** `verify` on one thread, 16
+KiB groups, interleaved best of 15: +13% with the 8 KiB dictionary, +27% with
+110 KiB (+3.5% and +11% at 256 KiB groups). `zstd -t -D` on the same archives:
++6% and +14%. zalt copies the dictionary three times per frame — the clone
+`decode_exactly` hands the decoder, its tables, its content into the window —
+where libzstd digests it once. Not yet optimized.
+
+**Fuzz harness, not dictionaries:** `archive_open`'s 64 KiB frame cache is
+smaller than the seed's one 300 KB frame, so every member read decodes it
+again; the portable seed takes 2.5 s a run under ASan, the dictionary seed
+4.8. Smaller seeds would serve the fuzzer better.
+
+**Findings for the spec:**
+
+- **§6 stores the dictionary raw.** The 110 KiB one compresses to 42 KB with
+  `zstd -19`, the 8 KiB one to 4.4 KB. A compressed Dictionary frame (a zstd
+  frame in its `User_Data`, as the Central Index does) would recover most of
+  the table above's loss; stock tools need the dictionary extracted either
+  way. A format decision.
+- **§10 step 6 cannot happen for a conforming writer.** Patching
+  `DICT_REQUIRED` on append presumes appended frames may use a dictionary
+  the archive did not already need — but §6 forbids adding one, so the only
+  archive it applies to holds Dictionary frames with the flag clear, which
+  §4.2 does not forbid. The spec could require the flag whenever a
+  Dictionary frame is written, and drop the step.
+- **§6 does not say whether the Terminator may name a dictionary.** zalt's
+  does; stock `zstd -D` reads it. Worth a sentence either way.
+- **§11.3 does not mention dictionaries.** One damaged Dictionary frame
+  costs every frame written against it — all of them, in zalt's archives.
+  The Archive Header could carry each dictionary's hash, so recovery can tell
+  damage from a different dictionary.
+- **§6's stock-tool recipe** — `zstd -dc -D <the Dictionary frame's
+  User_Data>` — is worth stating, since it is what keeps a dictionary archive
+  readable without zalt.
 
 ### M6 — `zalt::native` cache codec (gated)
 - [ ] Design: interleaved rANS (8/16 lanes matching NEON width), NEON-friendly

@@ -50,3 +50,14 @@ pub fn compress(
 ) -> zalt_codec::Result<std::vec::Vec<u8>> {
     zalt_codec::encode::compress_with::<DefaultBackend>(input, params)
 }
+
+/// [`compress`], against `dictionary`: see
+/// `zalt_codec::encode::compress_with_dictionary`. Byte-identical to the
+/// scalar backend's frame, as `compress` is.
+pub fn compress_with_dictionary(
+    input: &[u8],
+    dictionary: &zalt_codec::dict::Dictionary,
+    params: &zalt_codec::encode::EncodeParams,
+) -> zalt_codec::Result<std::vec::Vec<u8>> {
+    zalt_codec::encode::compress_with_dictionary::<DefaultBackend>(input, dictionary, params)
+}

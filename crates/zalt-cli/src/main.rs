@@ -45,6 +45,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use zalt_codec::decode::Status;
+use zalt_codec::dict::Dictionary;
 use zalt_embed::{Budget, Decoder, Recycler, RecyclerConfig, SharedSource};
 
 use args::{Args, Command, USAGE, human};
@@ -136,6 +137,8 @@ fn compress(args: &Args) -> Result<(), Failure> {
         .validate()
         .map_err(|e| Failure::Usage(format!("cannot encode with these settings: {e}")))?;
 
+    let dictionary = load_dictionary(args)?;
+
     let stdout = io::stdout();
     // zstd(1) refuses this too, for the same reason: a frame on a terminal is
     // noise that can leave the terminal in a strange state, and it is almost
@@ -151,8 +154,11 @@ fn compress(args: &Args) -> Result<(), Failure> {
     };
 
     let mut encode_one = |name: &str, content: &[u8]| -> Result<(), Failure> {
-        let frame = zalt_embed::compress(content, &params)
-            .map_err(|e| Failure::Input(format!("{name}: {e}")))?;
+        let frame = match &dictionary {
+            Some(d) => zalt_embed::compress_with_dictionary(content, d, &params),
+            None => zalt_embed::compress(content, &params),
+        }
+        .map_err(|e| Failure::Input(format!("{name}: {e}")))?;
         sink.write_all(&frame)
             .map_err(|e| Failure::Input(format!("write failed: {e}")))?;
         report_compress(
@@ -161,6 +167,7 @@ fn compress(args: &Args) -> Result<(), Failure> {
             content.len() as u64,
             frame.len() as u64,
             &params,
+            dictionary.as_ref(),
         );
         Ok(())
     };
@@ -190,6 +197,7 @@ fn report_compress(
     read: u64,
     written: u64,
     params: &zalt_codec::encode::EncodeParams,
+    dictionary: Option<&Dictionary>,
 ) {
     if args.quiet {
         return;
@@ -207,8 +215,13 @@ fn report_compress(
             zalt_codec::encode::level::effective(params.level)
         )
     };
+    let dict = match dictionary.map(Dictionary::id) {
+        Some(0) => ", raw-content dictionary".to_string(),
+        Some(id) => format!(", dictionary {id:#010x}"),
+        None => String::new(),
+    };
     eprintln!(
-        "{name}: {} -> {} ({ratio:.2}x, {how}{})",
+        "{name}: {} -> {} ({ratio:.2}x, {how}{}{dict})",
         human(read),
         human(written),
         if params.checksum { ", checksum" } else { "" },
@@ -218,7 +231,7 @@ fn report_compress(
 // ------------------------------------------------------------- decompress
 
 fn decompress(args: &Args) -> Result<(), Failure> {
-    let session = Session::new(args);
+    let session = Session::new(args)?;
 
     // stdin and stdout are locked once, outside the loop. Rust re-acquires the
     // lock on every unlocked write otherwise, which turns a byte-at-a-time
@@ -275,10 +288,12 @@ struct Session<'a> {
     args: &'a Args,
     budget: Option<Budget>,
     source: Option<SharedSource>,
+    /// `--dict`, loaded once and given to every decoder.
+    dictionary: Option<Dictionary>,
 }
 
 impl<'a> Session<'a> {
-    fn new(args: &'a Args) -> Self {
+    fn new(args: &'a Args) -> Result<Self, Failure> {
         let budget = args.budget.map(Budget::new);
         let source: Option<SharedSource> = args.recycle.then(|| {
             let config = RecyclerConfig::default();
@@ -288,14 +303,23 @@ impl<'a> Session<'a> {
             };
             Arc::new(recycler) as SharedSource
         });
-        Self {
+        Ok(Self {
             args,
             budget,
             source,
-        }
+            dictionary: load_dictionary(args)?,
+        })
     }
 
     fn decoder(&self) -> io::Result<Decoder> {
+        let mut decoder = self.bare_decoder()?;
+        if let Some(dictionary) = &self.dictionary {
+            decoder.load_dictionary(dictionary.clone());
+        }
+        Ok(decoder)
+    }
+
+    fn bare_decoder(&self) -> io::Result<Decoder> {
         match (&self.budget, &self.source) {
             (Some(budget), Some(source)) => {
                 Decoder::with_source(self.args.policy, budget, source.clone())
@@ -429,7 +453,7 @@ fn check(args: &Args) -> Result<(), Failure> {
     if args.inputs.is_empty() {
         return Err(Failure::Usage("check needs at least one file".into()));
     }
-    let session = Session::new(args);
+    let session = Session::new(args)?;
     let mut failures = 0usize;
 
     for path in &args.inputs {
@@ -464,6 +488,22 @@ fn check(args: &Args) -> Result<(), Failure> {
 }
 
 // ------------------------------------------------------------------ shared
+
+/// `--dict`, read and parsed, if one was given.
+///
+/// A file of eight bytes or more that is not a formatted dictionary is raw
+/// content — the format's rule, and zstd(1)'s — so the only refusals are a
+/// file that cannot be read, one too short, and a formatted one whose tables
+/// do not parse.
+fn load_dictionary(args: &Args) -> Result<Option<Dictionary>, Failure> {
+    let Some(path) = &args.dictionary else {
+        return Ok(None);
+    };
+    let raw = std::fs::read(path).map_err(|e| Failure::Input(format!("{path}: {e}")))?;
+    Dictionary::parse(&raw)
+        .map(Some)
+        .map_err(|e| Failure::Input(format!("{path}: not a usable dictionary: {e}")))
+}
 
 fn open_output(path: &str, force: bool) -> Result<File, Failure> {
     // Refusing to clobber by default: `zalt -d x.zst -o x` with the argument

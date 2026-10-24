@@ -151,6 +151,29 @@ pub struct Sequence {
     pub offset_value: u32,
 }
 
+/// Dictionary history in front of a frame, as the matcher sees it.
+///
+/// The encoder puts the dictionary's content in the same buffer as the frame,
+/// first, so a match into it is an ordinary backwards offset — the very
+/// arithmetic the decoder does, with the dictionary as history before the
+/// frame's first byte (RFC 8878 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prefix {
+    /// Bytes of dictionary content at the start of the buffer.
+    pub len: usize,
+    /// The repeat table the frame starts from: a formatted dictionary's own
+    /// three offsets, which the decoder loads in place of `{1, 4, 8}`.
+    pub repeats: [u32; REP_COUNT],
+}
+
+impl Prefix {
+    /// No dictionary.
+    pub const NONE: Self = Self {
+        len: 0,
+        repeats: REP_INITIAL,
+    };
+}
+
 /// What one block decomposed into.
 pub struct Parse {
     pub sequences: Vec<Sequence>,
@@ -390,6 +413,15 @@ pub struct Matcher<B = Scalar> {
     unsorted: Vec<u32>,
     /// Largest offset the frame's declared window admits.
     max_offset: usize,
+    /// Bytes of dictionary in front of the frame: `input[..dict_len]` is
+    /// history the decoder holds before the frame begins. Zero without one.
+    dict_len: usize,
+    /// Last position from which a match may still reach into the dictionary:
+    /// `dict_len + max_offset`. See [`Matcher::reach`].
+    reach_end: usize,
+    /// The repeat table the frame starts from — the dictionary's, or the
+    /// format's `{1, 4, 8}` — kept so a scout can start where this did.
+    first_repeats: [u32; REP_COUNT],
     /// Chain candidates examined per search.
     depth: usize,
     /// How the candidates found are chosen among.
@@ -458,18 +490,30 @@ impl<B: Backend> Matcher<B> {
     /// be smaller than the level's. The level's own window is not consulted here
     /// for exactly that reason: an offset past the declared window names history
     /// the decoder has been told it may drop.
+    #[cfg(test)]
     pub fn with_tuning(tuning: Tuning, window_log: u8, input_len: usize) -> Self {
+        Self::with_prefix(tuning, window_log, input_len, Prefix::NONE)
+    }
+
+    /// A matcher for a frame encoded after `prefix.len` bytes of dictionary.
+    ///
+    /// `input_len` counts the dictionary too: it is the length of the buffer
+    /// [`Matcher::parse`] will see, `input[..prefix.len]` being the
+    /// dictionary. [`Matcher::prime`] must index it before the first parse.
+    pub fn with_prefix(tuning: Tuning, window_log: u8, input_len: usize, prefix: Prefix) -> Self {
         let window = 1usize << window_log.min(31);
         // The chain is indexed modulo its own size, so entries older than the
         // window are overwritten and drop out — which is exactly the set of
-        // positions an offset could no longer reach anyway.
+        // positions an offset could no longer reach anyway. A dictionary
+        // reaches further, a window *plus* the dictionary (see `reach`), so
+        // the table covers both.
         //
         // Capping it at the input length as well is free of consequence rather
         // than a trade: a chain at least as long as the input never has two
         // live positions sharing a slot, so nothing that could have been found
         // in the larger table is missing from this one. It only declines to
         // clear slots no position can reach.
-        let chain_size = window.next_power_of_two().min(
+        let chain_size = (window + prefix.len).next_power_of_two().min(
             input_len
                 .max(1)
                 .checked_next_power_of_two()
@@ -526,6 +570,9 @@ impl<B: Backend> Matcher<B> {
             deferred: finder == Finder::Tree && !matches!(tuning.parse, ParseMode::Optimal { .. }),
             unsorted: Vec::new(),
             max_offset: window,
+            dict_len: prefix.len,
+            reach_end: prefix.len + window,
+            first_repeats: prefix.repeats,
             depth: tuning.search_depth.max(1),
             mode: tuning.parse,
             target_length: tuning.target_length.max(MIN_MATCH),
@@ -537,8 +584,65 @@ impl<B: Backend> Matcher<B> {
             opt: Vec::new(),
             candidates: Vec::new(),
             path: Vec::new(),
-            repeats: REP_INITIAL,
+            repeats: prefix.repeats,
             backend: PhantomData,
+        }
+    }
+
+    /// The largest offset a match starting at `pos` may name.
+    ///
+    /// RFC 8878 §5: a frame may reach into its dictionary — even further back
+    /// than `Window_Size` — "as long as the amount of data decoded from this
+    /// frame is less than or equal to `Window_Size`", and not at all after.
+    /// The decoder applies that at each match's start (`Window::dict_reach`),
+    /// so this does too: until the frame has produced a window's worth, a
+    /// match may reach back to the dictionary's first byte, which is position
+    /// 0 here; after it, only the window.
+    ///
+    /// With no dictionary this is `min(pos, window)` — the bound every finder
+    /// applied before dictionaries existed, as `c < pos` and `pos - c <=
+    /// window` — so frames without one are unchanged.
+    #[inline]
+    fn reach(&self, pos: usize) -> usize {
+        if pos <= self.reach_end {
+            pos
+        } else {
+            self.max_offset
+        }
+    }
+
+    /// Index the dictionary, `input[..dict_len]`, so the frame's first block
+    /// can match into it. Call once, before the first [`Matcher::parse`].
+    ///
+    /// Every position goes in, for every finder, as libzstd's dictionary
+    /// loading fills its tables: the dictionary is indexed once per frame
+    /// rather than searched, so the fast finders' skipping, which saves
+    /// searches, saves nothing here.
+    pub fn prime(&mut self, input: &[u8]) {
+        let d = self.dict_len;
+        match self.finder {
+            Finder::Fast { min_match } => {
+                for pos in 0..d {
+                    if let Some(w) = word_at(input, pos) {
+                        self.head[hash_n(w, min_match, self.hash_log)] = pos as u32;
+                    }
+                }
+            }
+            Finder::DoubleFast { min_match, .. } => {
+                for pos in 0..d {
+                    if let Some(w) = word_at(input, pos) {
+                        self.long[hash_n(w, 8, self.long_log)] = pos as u32;
+                        self.head[hash_n(w, min_match, self.hash_log)] = pos as u32;
+                    }
+                }
+            }
+            Finder::Row { .. } => {
+                self.index_range(input, 0, d);
+                self.indexed = d;
+            }
+            // Through the cursor, which the tree needs in order and the
+            // optimal parser continues from.
+            Finder::Chain | Finder::Tree => self.insert_up_to(input, d),
         }
     }
 
@@ -607,6 +711,7 @@ impl<B: Backend> Matcher<B> {
             ((matches >> head) | (matches << (entries - head))) & all
         };
 
+        let reach = self.reach(pos);
         let mut best_len = 0usize;
         let mut best_offset = 0usize;
         let mut attempts = self.depth;
@@ -619,7 +724,7 @@ impl<B: Backend> Matcher<B> {
                 continue;
             }
             // Newest first, so every later candidate is further back still.
-            if pos - c > self.max_offset {
+            if pos - c > reach {
                 break;
             }
             attempts -= 1;
@@ -688,7 +793,7 @@ impl<B: Backend> Matcher<B> {
         // slot still belongs to the position that names it, and each strictly
         // older than the last — anything else is stale.
         let reused_below = pos.saturating_sub(self.tree_mask);
-        let floor = pos.saturating_sub(self.max_offset);
+        let floor = pos - self.reach(pos);
         let mut walked = core::mem::take(&mut self.unsorted);
         walked.clear();
         let mut budget = self.depth;
@@ -759,7 +864,7 @@ impl<B: Backend> Matcher<B> {
         if available < MIN_MATCH {
             return None;
         }
-        let floor = pos.saturating_sub(self.max_offset);
+        let floor = pos - self.reach(pos);
 
         let mut best_len = 0usize;
         let mut best_offset = 0usize;
@@ -881,7 +986,9 @@ impl<B: Backend> Matcher<B> {
         floor: usize,
     ) -> usize {
         let offset = offset as usize;
-        if offset == 0 || offset > pos {
+        // `reach`, not `pos`: a repeat that reached into the dictionary early
+        // in the frame names nothing once the dictionary has dropped out.
+        if offset == 0 || offset > self.reach(pos) {
             return 0;
         }
         let available = limit - pos;
@@ -990,7 +1097,7 @@ impl<B: Backend> Matcher<B> {
         // Bytes compared for ordering. Never past the input, and never past
         // `TREE_COMPARE_MAX` — see there.
         let hi = input.len().min(pos + TREE_COMPARE_MAX);
-        let floor = pos.saturating_sub(self.max_offset);
+        let floor = pos - self.reach(pos);
         // A node at or below this may share its slots with a newer position
         // once the tree has wrapped, so its children are not followed.
         let reused_below = newest.saturating_sub(self.tree_mask);
@@ -1133,7 +1240,7 @@ impl<B: Backend> Matcher<B> {
         };
         for offset in codable {
             let offset = offset as usize;
-            if offset == 0 || offset > pos || offset > self.max_offset {
+            if offset == 0 || offset > self.reach(pos) {
                 continue;
             }
             if input[pos - offset + best] != input[pos + best] {
@@ -1160,7 +1267,7 @@ impl<B: Backend> Matcher<B> {
             return;
         }
 
-        let floor = pos.saturating_sub(self.max_offset);
+        let floor = pos - self.reach(pos);
         let mut candidate = self.head[hash4(&input[pos..], self.hash_log)];
         for _ in 0..self.depth {
             if candidate == EMPTY {
@@ -1207,11 +1314,18 @@ impl<B: Backend> Matcher<B> {
     /// discarded, and nothing it does touches this matcher's chain or repeat
     /// table, so it changes which path is preferred and never what is legal.
     fn prepare_statistics(&mut self, input: &[u8], start: usize, end: usize) {
+        // The frame begins after the dictionary, not at 0.
+        let first = self.dict_len;
         if let ParseMode::Optimal { passes: 2 } = self.mode
-            && start == 0
+            && start == first
             && !self.scouted
         {
-            let mut scout = Matcher::<B>::with_tuning(self.tuning, self.window_log, end);
+            let prefix = Prefix {
+                len: self.dict_len,
+                repeats: self.first_repeats,
+            };
+            let mut scout = Matcher::<B>::with_prefix(self.tuning, self.window_log, end, prefix);
+            scout.prime(input);
             scout.scouted = true;
             let _ = scout.parse_optimal(input, start, end);
             self.stats = scout.stats;
@@ -1221,7 +1335,7 @@ impl<B: Backend> Matcher<B> {
         let block = &input[start..end];
         match self.stats.as_mut() {
             None => self.stats = Some(Stats::first_block(block)),
-            Some(stats) if start > 0 => stats.next_block(block),
+            Some(stats) if start > first => stats.next_block(block),
             Some(_) => {}
         }
     }
@@ -1625,14 +1739,14 @@ impl<B: Backend> Matcher<B> {
     /// present, before it, and inside the window.
     fn usable(&self, candidate: u32, pos: usize) -> bool {
         let c = candidate as usize;
-        candidate != EMPTY && c < pos && pos - c <= self.max_offset
+        candidate != EMPTY && c < pos && pos - c <= self.reach(pos)
     }
 
     /// Length of a match at repeat `offset` from `pos`, if its first four bytes
     /// agree — libzstd's repcode check, which costs one compare when it fails.
     fn repeat_at(&self, input: &[u8], pos: usize, limit: usize, offset: u32) -> Option<usize> {
         let offset = offset as usize;
-        if offset == 0 || offset > pos || offset > self.max_offset || pos + MIN_MATCH > limit {
+        if offset == 0 || offset > self.reach(pos) || pos + MIN_MATCH > limit {
             return None;
         }
         if four_at(input, pos - offset)? != four_at(input, pos)? {

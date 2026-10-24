@@ -8,6 +8,7 @@ use zalt_codec::encode::{EncodeParams, Strategy};
 use zalt_codec::frame::{FrameHeader, header_len_after_descriptor};
 use zalt_codec::params::DecodeLimits;
 
+use crate::dict::{self, Dictionary};
 use crate::layout::{is_zstd_frame, le32};
 use crate::{Error, Result, format_err};
 
@@ -23,22 +24,35 @@ pub const MAX_FRAME_CONTENT: u64 = 1 << 30;
 pub const MAX_WINDOW_LOG: u8 = 27;
 
 /// Compress `content` as one standalone frame, as §5.2 requires a data frame
-/// to be: a content checksum, and `Frame_Content_Size` present.
+/// to be: a content checksum, and `Frame_Content_Size` present — against
+/// `dictionary`, if one is given, naming it by ID (§5.2 rule 6).
 ///
 /// The second is *checked*, not assumed. zalt's frame writer omits the field
 /// for some frames under 256 bytes; every frame an archive holds is either a
 /// multiple of 512 or a single-segment index body, so it is always present
 /// today — but that is a coupling between two crates, and a frame silently
 /// missing its size would be refused by every conformant ZLTA reader.
-pub fn encode(content: &[u8], level: i32) -> Result<Vec<u8>> {
+pub fn encode(content: &[u8], level: i32, dictionary: Option<&Dictionary>) -> Result<Vec<u8>> {
     let params = EncodeParams {
         strategy: Strategy::Compress,
         level,
         checksum: true,
         ..Default::default()
     };
-    let frame = zalt_embed::compress(content, &params)?;
+    let frame = match dictionary {
+        Some(d) => zalt_embed::compress_with_dictionary(content, d.loaded(), &params)?,
+        None => zalt_embed::compress(content, &params)?,
+    };
     let header = header_of(&frame, &DecodeLimits::default())?;
+    // Checked for the same reason as the size: a frame that did not name its
+    // dictionary would decode, wrongly, without it.
+    if header.dictionary_id != dictionary.map(Dictionary::id) {
+        return Err(Error::Format(format!(
+            "the encoder declared dictionary {:?} for a frame written against {:?}",
+            header.dictionary_id,
+            dictionary.map(Dictionary::id)
+        )));
+    }
     if header.frame_content_size != Some(content.len() as u64) {
         return Err(Error::Format(format!(
             "the encoder omitted Frame_Content_Size for a {}-byte frame (§5.2 rule 2)",
@@ -67,11 +81,16 @@ pub fn header_of(frame: &[u8], limits: &DecodeLimits) -> Result<FrameHeader> {
 /// Decode `frame`, which must be exactly one Zstandard frame of exactly
 /// `expected` decoded bytes — no more frames after it, nothing left over.
 ///
+/// A frame naming a dictionary is decoded with that one from `dictionaries`,
+/// and refused if there is none by that ID. A frame naming none is decoded
+/// with none, whatever the archive holds: the codec would otherwise apply a
+/// loaded dictionary to it.
+///
 /// The "exactly one" matters because a stock decoder would happily read a
 /// skippable frame tucked in after it, and so would any reader that decoded the
 /// region as a stream. The seek table says this region *is* one frame; a
 /// region that is not is a damaged or doctored archive, and should read as one.
-pub fn decode_exactly(frame: &[u8], expected: u64) -> Result<Vec<u8>> {
+pub fn decode_exactly(frame: &[u8], expected: u64, dictionaries: &[Dictionary]) -> Result<Vec<u8>> {
     if expected > MAX_FRAME_CONTENT {
         return Err(Error::Refused(format!(
             "a frame of {expected} bytes is over §5.2's 1 GiB limit"
@@ -88,13 +107,15 @@ pub fn decode_exactly(frame: &[u8], expected: u64) -> Result<Vec<u8>> {
             header.frame_content_size
         ));
     }
-    if header.dictionary_id.is_some() {
-        return Err(Error::Unsupported(
-            "dictionary-compressed frames (§6)".into(),
-        ));
-    }
-
     let mut decoder = Decoder::<zalt_embed::DefaultBackend>::new(limits);
+    if let Some(id) = header.dictionary_id {
+        let Some(d) = dict::find(dictionaries, id) else {
+            return format_err(format!(
+                "the frame names dictionary {id:#010x}, which the archive does not hold (§5.2)"
+            ));
+        };
+        decoder.load_dictionary(d.loaded().clone());
+    }
     let mut out = Vec::with_capacity(expected as usize);
     let mut cursor = 0usize;
     loop {
@@ -136,9 +157,9 @@ mod tests {
     fn a_frame_round_trips_and_declares_its_size() {
         for len in [0usize, 1, 255, 256, 512, 1024, 300_000] {
             let content: Vec<u8> = (0..len).map(|i| (i % 7) as u8).collect();
-            let frame = encode(&content, 3).unwrap();
+            let frame = encode(&content, 3, None).unwrap();
             assert_eq!(
-                decode_exactly(&frame, len as u64).unwrap(),
+                decode_exactly(&frame, len as u64, &[]).unwrap(),
                 content,
                 "{len}"
             );
@@ -147,21 +168,21 @@ mod tests {
 
     #[test]
     fn anything_after_the_frame_is_refused() {
-        let frame = encode(&[0u8; 1024], 3).unwrap();
+        let frame = encode(&[0u8; 1024], 3, None).unwrap();
         let mut padded = frame.clone();
         // A skippable frame a stock decoder would step over without comment.
         padded.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0]);
-        assert!(decode_exactly(&padded, 1024).is_err());
+        assert!(decode_exactly(&padded, 1024, &[]).is_err());
         let mut doubled = frame.clone();
         doubled.extend_from_slice(&frame);
-        assert!(decode_exactly(&doubled, 1024).is_err());
-        assert!(decode_exactly(&frame[..frame.len() - 1], 1024).is_err());
+        assert!(decode_exactly(&doubled, 1024, &[]).is_err());
+        assert!(decode_exactly(&frame[..frame.len() - 1], 1024, &[]).is_err());
     }
 
     #[test]
     fn the_declared_size_must_be_the_seek_tables() {
-        let frame = encode(&[0u8; 1024], 3).unwrap();
-        assert!(decode_exactly(&frame, 512).is_err());
-        assert!(decode_exactly(&frame, 2048).is_err());
+        let frame = encode(&[0u8; 1024], 3, None).unwrap();
+        assert!(decode_exactly(&frame, 512, &[]).is_err());
+        assert!(decode_exactly(&frame, 2048, &[]).is_err());
     }
 }

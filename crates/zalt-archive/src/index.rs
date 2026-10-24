@@ -278,7 +278,7 @@ impl Index {
             previous = &e.path;
         }
 
-        let frame = frames::encode(&body, level)?;
+        let frame = frames::encode(&body, level, None)?;
         let mut out = Vec::with_capacity(FIXED_LEN + frame.len() + 8);
         out.extend_from_slice(&INDEX_MAGIC);
         out.push(INDEX_VERSION);
@@ -341,7 +341,7 @@ impl Index {
                 limits.max_body
             )));
         }
-        let body = frames::decode_exactly(frame, body_len)?;
+        let body = frames::decode_exactly(frame, body_len, &[])?;
 
         let mut cursor = Cursor { buf: &body, pos: 0 };
         // At least eleven bytes a record (typeflag and ten one-byte VarInts),
@@ -837,7 +837,7 @@ mod tests {
             }
             previous.clone_from(&e.path);
         }
-        let frame = frames::encode(&body, 3).unwrap();
+        let frame = frames::encode(&body, 3, None).unwrap();
         let mut out = Vec::new();
         out.extend_from_slice(&INDEX_MAGIC);
         out.push(INDEX_VERSION);

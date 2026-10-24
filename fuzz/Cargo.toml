@@ -40,6 +40,13 @@ debug = true
 overflow-checks = true
 
 [[bin]]
+name = "encode_dictionary"
+path = "fuzz_targets/encode_dictionary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "decode_hostile"
 path = "fuzz_targets/decode_hostile.rs"
 test = false

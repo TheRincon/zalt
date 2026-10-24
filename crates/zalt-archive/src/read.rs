@@ -21,6 +21,7 @@
 
 use std::io::Write;
 
+use crate::dict::{self, Dictionary};
 use crate::hash::{self, Hasher};
 use crate::index::{Entry, Index, IndexLimits};
 use crate::layout::{
@@ -94,6 +95,11 @@ pub struct ReadLimits {
     /// solid group share its decode through this, and sequential reads
     /// decode a window of frames ahead, in parallel, into it.
     pub cache_bytes: u64,
+    /// Bytes of dictionary (§6) an archive may make the reader hold, all its
+    /// Dictionary frames together. zstd trains 110 KiB by default; the
+    /// default allows far more, and still bounds what a hostile archive can
+    /// ask for.
+    pub max_dictionary_bytes: u64,
 }
 
 impl Default for ReadLimits {
@@ -104,6 +110,7 @@ impl Default for ReadLimits {
             threads: 0,
             max_header_bytes: 64 << 20,
             cache_bytes: 64 << 20,
+            max_dictionary_bytes: 32 << 20,
         }
     }
 }
@@ -132,6 +139,9 @@ pub struct Archive<S: Source + ?Sized> {
     source: Box<S>,
     header: Header,
     index: Index,
+    /// The Dictionary frames' dictionaries (§6), in file order; empty unless
+    /// `DICT_REQUIRED` is set.
+    dictionaries: Vec<Dictionary>,
     frames: Vec<Frame>,
     /// Indices into `frames` of the data frames, Terminator last.
     data: Vec<usize>,
@@ -200,14 +210,34 @@ impl<S: Source + ?Sized> Archive<S> {
         let (seek, _) =
             read_seek_table(file_len, |at, n| source.read_at(at, n), limits.max_frames)?;
         let frames = locate(&*source, &seek)?;
-        let data = check_layout(&frames)?;
+        let (data, dictionary_frames) = check_layout(&frames)?;
 
         // Step 5: the header.
         let first = &frames[0];
         let header_frame = source.read_at(first.file_offset, first.compressed_size as usize)?;
         let header = Header::parse(skippable_payload(&header_frame, MAGIC_HEADER)?)?;
+
+        // Step 7, early: a frame naming a dictionary needs it to be read at
+        // all, and the dictionaries are small. Only when `DICT_REQUIRED` is
+        // set, as §11.1 says — without it no data frame may name one, and one
+        // that does is refused when it is decoded.
+        let mut dictionaries = Vec::new();
         if header.flags & FLAG_DICT_REQUIRED != 0 {
-            return Err(Error::Unsupported("dictionary archives (§6)".into()));
+            let mut held = 0u64;
+            for &i in &dictionary_frames {
+                let f = frames[i];
+                held += f.compressed_size;
+                if held > limits.max_dictionary_bytes {
+                    return Err(Error::Refused(format!(
+                        "the archive's dictionaries are over the limit of {} bytes",
+                        limits.max_dictionary_bytes
+                    )));
+                }
+                let frame = source.read_at(f.file_offset, f.compressed_size as usize)?;
+                let raw = skippable_payload(&frame, MAGIC_DICTIONARY)?.to_vec();
+                dictionaries.push(Dictionary::parse(raw)?);
+            }
+            dict::check_set(&dictionaries, limits.max_dictionary_bytes)?;
         }
 
         // Step 6: the index, the last listed frame.
@@ -239,6 +269,7 @@ impl<S: Source + ?Sized> Archive<S> {
             source,
             header,
             index,
+            dictionaries,
             frames,
             data,
             threads,
@@ -259,6 +290,12 @@ impl<S: Source + ?Sized> Archive<S> {
 
     pub fn header(&self) -> &Header {
         &self.header
+    }
+
+    /// The dictionaries data frames may name (§6), in file order. Empty for
+    /// a portable archive.
+    pub fn dictionaries(&self) -> &[Dictionary] {
+        &self.dictionaries
     }
 
     /// The members, in tar-stream order.
@@ -315,7 +352,7 @@ impl<S: Source + ?Sized> Archive<S> {
         let bytes = self
             .source
             .read_at(f.file_offset, f.compressed_size as usize)?;
-        let content = frames::decode_exactly(&bytes, f.decompressed_size)?;
+        let content = frames::decode_exactly(&bytes, f.decompressed_size, &self.dictionaries)?;
         // §8.2: data frames' checksums are verified; zero-size entries' never.
         if let Some(sum) = f.checksum
             && frames::seek_checksum(&content) != sum
@@ -690,7 +727,8 @@ fn locate<S: Source + ?Sized>(source: &S, seek: &[SeekEntry]) -> Result<Vec<Fram
 }
 
 /// Check the frame order of §3.1 and the §8.2 profile; return the data frames.
-fn check_layout(frames: &[Frame]) -> Result<Vec<usize>> {
+/// The data frames, Terminator last, and the Dictionary frames.
+fn check_layout(frames: &[Frame]) -> Result<(Vec<usize>, Vec<usize>)> {
     if frames.len() < 3 {
         return format_err("fewer frames than a header, a Terminator and an index");
     }
@@ -701,6 +739,7 @@ fn check_layout(frames: &[Frame]) -> Result<Vec<usize>> {
         return format_err("the last listed frame is not the Central Index (§8.2)");
     }
     let mut data = Vec::new();
+    let mut dictionaries = Vec::new();
     for (i, f) in frames.iter().enumerate().take(frames.len() - 1).skip(1) {
         if f.is_data() {
             let d = f.decompressed_size;
@@ -724,10 +763,13 @@ fn check_layout(frames: &[Frame]) -> Result<Vec<usize>> {
             MAGIC_HEADER | MAGIC_INDEX | MAGIC_SEEK_TABLE => {
                 return format_err(format!("frame {i} is a ZLTA structure out of place (§3.1)"));
             }
+            // §6: all before the first data frame, where a streaming reader
+            // meets them before anything that needs them.
+            MAGIC_DICTIONARY if data.is_empty() => dictionaries.push(i),
             MAGIC_DICTIONARY => {
-                // §6 puts dictionaries before the first data frame; this
-                // milestone does not read them at all.
-                return Err(Error::Unsupported("dictionary frames (§6)".into()));
+                return format_err(format!(
+                    "Dictionary frame {i} comes after a data frame (§6)"
+                ));
             }
             // Reserved and vendor frames: §3.2 forbids writers to place them
             // here, and Q7 is still open. A reader that skips them reads every
@@ -741,5 +783,5 @@ fn check_layout(frames: &[Frame]) -> Result<Vec<usize>> {
     if frames[terminator].decompressed_size < 2 * BLOCK as u64 {
         return format_err("the Terminator is shorter than 1024 bytes (§5.4)");
     }
-    Ok(data)
+    Ok((data, dictionaries))
 }

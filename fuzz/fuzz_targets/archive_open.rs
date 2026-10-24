@@ -28,6 +28,8 @@ fuzz_target!(|data: &[u8]| {
         // Small, so verifying and reading evict and refill the frame cache
         // rather than holding a whole fuzzed archive in it.
         cache_bytes: 64 << 10,
+        // Small too: a fuzzed Dictionary frame is parsed whole before use.
+        max_dictionary_bytes: 1 << 20,
     };
     let Ok(archive) = Archive::open(data.to_vec().into_boxed_slice(), limits) else {
         return;

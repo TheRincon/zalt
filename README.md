@@ -48,9 +48,11 @@ The design is described in [`doc/ZALT-MAC.md`](doc/ZALT-MAC.md).
 - Expose a C ABI with a hand-written header and a panic-proof boundary.
 - Encode zstd frames at levels 1–19 that the reference `zstd` decodes; the
   scalar and NEON backends produce identical bytes.
-- Decode with dictionaries, and build content-prefix dictionaries from samples.
+- Compress and decode with dictionaries (`-D`, interchangeable with
+  `zstd -D`), and build content-prefix dictionaries from samples.
 - Write and read ZALT-archives: a valid `.tar.zst` that is also randomly
-  accessible, with per-entry BLAKE3 (or XXH3) hashes and recovery past damage.
+  accessible, with per-entry BLAKE3 (or XXH3) hashes, recovery past damage,
+  and optional dictionaries (§6).
 
 **Deliberately never**
 
@@ -110,6 +112,7 @@ zalt c -o notes.txt.zst notes.txt   # level 3, the default
 zalt c -19 -o notes.txt.zst notes.txt
 zalt c -L 9 notes.txt > notes.txt.zst
 tar -c dir | zalt c > dir.tar.zst   # no input file: reads stdin
+zalt c -D docs.dict -o a.json.zst a.json   # against a dictionary
 ```
 
 - **Levels run 1 to 19**, as in `zstd(1)`: `-1` … `-19`, or `-L N`. Each
@@ -125,6 +128,12 @@ tar -c dir | zalt c > dir.tar.zst   # no input file: reads stdin
   to stdout as consecutive frames, which decode to their concatenation; `-o`
   takes one input.
 - It refuses to write compressed data to a terminal. Redirect, or use `-o`.
+- **`-D FILE` compresses against a dictionary** — a zstd dictionary as
+  `zstd --train` writes it, or any file as raw content — and `zalt d -D` and
+  `zalt check -D` decode with one. Frames are interchangeable with `zstd -D`'s
+  in both directions. A frame naming a dictionary is refused without it, and
+  the error says which it needs. zalt does not train dictionaries yet: use
+  `zstd --train`.
 
 #### Decompressing
 
@@ -194,6 +203,15 @@ zalt a r src.tar.zst CHANGELOG.md       # append
   restores owners only with `--same-owner` and creates device nodes only with
   `--devices` (both normally need root). A quarantined archive passes its
   quarantine on to what it extracts.
+- **Dictionaries** (`-D FILE`, from `zstd --train`) compress every frame
+  against one and store it in the archive (§6). `zstd -dc` alone then refuses
+  the archive; `zalt archive dict A -o FILE` writes the dictionary out, and
+  `zstd -dc -D FILE A | tar -x` extracts it. They pay only with small frames
+  and an archive much larger than the dictionary, which is stored
+  uncompressed: on 1.4 MB of this repository's text, an 8 KiB dictionary cut
+  a 16 KiB-group archive by 4% and made every archive with 1 MiB groups or
+  more larger (`doc/ZALT-MAC.md`, M7). The CLI does not yet set group sizes,
+  so from the shell they mostly cost.
 - **Appending** adds members after the last one and takes `create`'s options,
   except `--hash`: new members get the archive's own. It works on a copy that replaces the archive only once complete, so a
   failure leaves the archive as it was. A path already in the archive is

@@ -42,8 +42,11 @@
 use alloc::vec::Vec;
 
 use crate::backend::{Backend, Scalar};
+use crate::dict::Dictionary;
 use crate::error::{Error, Result};
 use crate::params::{WINDOWLOG_ABSOLUTE_MAX, WINDOWLOG_MIN};
+use crate::sequences::REP_INITIAL;
+use match_finder::Prefix;
 
 mod bitstream;
 mod block;
@@ -182,7 +185,50 @@ pub fn compress(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
 
 /// [`compress`], with matches measured by backend `B`.
 pub fn compress_with<B: Backend>(input: &[u8], params: &EncodeParams) -> Result<Vec<u8>> {
+    encode::<B>(input, Prefix::NONE, params)
+}
+
+/// Compress `input` into a single zstd frame against `dictionary`, with
+/// backend `B`.
+///
+/// The frame declares the dictionary's `Dictionary_ID` — whatever
+/// `params.dictionary_id` says, since a frame naming any other could not be
+/// decoded — except for a raw-content dictionary, which has none: such a
+/// frame decodes only where the reader is told which dictionary to use.
+///
+/// Matches reach into the dictionary's content exactly as far as RFC 8878 §5
+/// lets a decoder follow them, and the frame starts from the dictionary's
+/// repeat offsets, as the decoder will. Its pre-built entropy tables are not
+/// used: every block describes its own, which is always legal. The output for
+/// the same input and dictionary is the same on every backend.
+pub fn compress_with_dictionary<B: Backend>(
+    input: &[u8],
+    dictionary: &Dictionary,
+    params: &EncodeParams,
+) -> Result<Vec<u8>> {
+    let content = dictionary.content();
+    // One buffer, dictionary first: a match into it is then an ordinary
+    // backwards offset, the decoder's own view of a dictionary.
+    let mut buffer = Vec::with_capacity(content.len() + input.len());
+    buffer.extend_from_slice(content);
+    buffer.extend_from_slice(input);
+    let prefix = Prefix {
+        len: content.len(),
+        repeats: dictionary.entropy().map_or(REP_INITIAL, |e| e.repeats),
+    };
+    let id = dictionary.id();
+    let params = EncodeParams {
+        dictionary_id: (id != 0).then_some(id),
+        ..*params
+    };
+    encode::<B>(&buffer, prefix, &params)
+}
+
+/// Encode the frame `buffer[prefix.len..]`, whose dictionary, if any, is
+/// `buffer[..prefix.len]`.
+fn encode<B: Backend>(buffer: &[u8], prefix: Prefix, params: &EncodeParams) -> Result<Vec<u8>> {
     params.validate()?;
+    let input = &buffer[prefix.len..];
 
     let tuning = (params.strategy == Strategy::Compress).then(|| level::tuning(params.level));
     let compress = tuning.is_some();
@@ -230,12 +276,23 @@ pub fn compress_with<B: Backend>(input: &[u8], params: &EncodeParams) -> Result<
     } else {
         Vec::new()
     };
-    let boundaries = if proposed.is_empty() {
+    let mut boundaries = if proposed.is_empty() {
         split::fixed(input.len(), block_size)
     } else {
         proposed
     };
-    block::write_all::<B>(&mut out, input, &boundaries, tuning, params.window_log);
+    // Found in the frame; placed in the buffer, after the dictionary.
+    for b in &mut boundaries {
+        *b += prefix.len;
+    }
+    block::write_all::<B>(
+        &mut out,
+        buffer,
+        prefix,
+        &boundaries,
+        tuning,
+        params.window_log,
+    );
 
     frame::write_epilogue(&mut out, input, params);
     Ok(out)

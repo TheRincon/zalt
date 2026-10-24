@@ -22,6 +22,7 @@ fuzz_target!(|data: &[u8]| {
         threads: 1,
         creator: None,
         hash: zalt_archive::Hash::default(),
+        dictionary: None,
     };
     // Both modes: the search guesses where members start, so it is the one
     // most able to assemble something that does not hold together.

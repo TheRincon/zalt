@@ -78,6 +78,7 @@ fn options(level: i32) -> WriterOptions {
         threads: 4,
         creator: None,
         hash: zalt_archive::Hash::default(),
+        dictionary: None,
     }
 }
 
