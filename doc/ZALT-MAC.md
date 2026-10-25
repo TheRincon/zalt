@@ -4997,6 +4997,26 @@ again; the portable seed takes 2.5 s a run under ASan, the dictionary seed
   User_Data>` — is worth stating, since it is what keeps a dictionary archive
   readable without zalt.
 
+### M8 — Dictionary archives that pay
+
+M7's dictionaries worked and mostly cost (*Dictionaries*, above): §6 stored
+the dictionary raw, the CLI could not make the small groups dictionaries are
+for, and training needed `zstd --train`. Decided 2026-10-25:
+
+- [ ] **Compress the Dictionary frame** — a spec change to §6, documented in
+      `doc/ZLTA_SPEC.md` and its changelog.
+- [ ] **Our own dictionary trainer**, no dependency on `zstd --train`.
+- [x] **A group-size option** on `zalt archive create` and `append`; 8 MiB
+      stays the default (2026-10-25). `--group SIZE` sets both the
+      small-file threshold and the group size, 512 B to 1 GiB (§5.2's
+      limit; §12.1 suggests at most 64 MiB). Tested in `zalt-cli/tests/cli.rs`:
+      4 KiB groups give many frames where the default gives one, every
+      archive verifies, out-of-range sizes are usage errors.
+- [ ] **A converter to portable archives**, as §6 asks implementations to
+      offer.
+
+Deferred: signing (Q3), with `ed25519-dalek` 2 chosen for it (2026-10-23).
+
 ### M6 — `zalt::native` cache codec (gated)
 - [ ] Design: interleaved rANS (8/16 lanes matching NEON width), NEON-friendly
       match encoding, incompressibility detector.

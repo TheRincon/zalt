@@ -47,6 +47,10 @@ CREATE
     -o, --output PATH     the archive to write (required)
     -1 .. -19             compression level (default 3)
     --threads N           frames compressed in parallel (default: one per core)
+    --group SIZE          files smaller than SIZE share frames of up to SIZE
+                          (default 8MiB). Smaller groups make extracting one
+                          file decode less and cost ratio; -D wins some back.
+                          512 to 1GiB; the spec suggests at most 64MiB.
     --hash ALGORITHM      each member's content hash: blake3 (the default),
                           xxh3 (faster; catches accidents, not tampering),
                           or none
@@ -149,6 +153,7 @@ struct Opts {
     search: bool,
     hash: Option<zalt_archive::Hash>,
     dictionary: Option<PathBuf>,
+    group: Option<u64>,
     paths: Vec<String>,
 }
 
@@ -213,6 +218,15 @@ fn parse(argv: &[String], allowed: &[&str]) -> Result<Opts, Outcome> {
                     _ => usage!("--hash: expected blake3, xxh3 or none, got {raw}"),
                 });
             }
+            "--group" => {
+                let raw = take(&mut it, arg)?;
+                let n = crate::args::parse_size(&raw)
+                    .map_err(|e| Outcome::Usage(Usage(format!("--group: {}", e.0))))?;
+                if !(512..=zalt_archive::frames::MAX_FRAME_CONTENT).contains(&n) {
+                    usage!("--group must be 512 bytes to 1GiB, got {raw}");
+                }
+                o.group = Some(n);
+            }
             "--threads" => {
                 let raw = take(&mut it, arg)?;
                 o.threads = raw.parse().map_err(|_| {
@@ -245,6 +259,7 @@ pub fn run(argv: &[String]) -> Result<(), Outcome> {
                 "-o",
                 "-N",
                 "--threads",
+                "--group",
                 "--hash",
                 "-D",
                 "-f",
@@ -276,6 +291,7 @@ pub fn run(argv: &[String]) -> Result<(), Outcome> {
             &[
                 "-N",
                 "--threads",
+                "--group",
                 "-D",
                 "-q",
                 "--no-xattrs",
@@ -321,6 +337,7 @@ fn create(o: Opts) -> Result<(), Outcome> {
         threads: o.threads,
         hash: o.hash.unwrap_or_default(),
         dictionary: dictionary_option(&o)?,
+        policy: policy_option(&o),
         ..WriterOptions::default()
     };
     let mut writer = Writer::new(BufWriter::new(file), options)?;
@@ -346,6 +363,20 @@ fn create(o: Opts) -> Result<(), Outcome> {
         );
     }
     Ok(())
+}
+
+/// `--group SIZE`: small files share frames of up to SIZE, which is both the
+/// threshold and the group's size, as in the default policy.
+fn policy_option(o: &Opts) -> zalt_archive::FramePolicy {
+    let default = zalt_archive::FramePolicy::default();
+    match o.group {
+        Some(n) => zalt_archive::FramePolicy {
+            small_file_threshold: n,
+            solid_target: n,
+            ..default
+        },
+        None => default,
+    }
 }
 
 /// `-D FILE`, read and checked against §6, if given.
@@ -443,6 +474,7 @@ fn append_cmd(o: Opts) -> Result<(), Outcome> {
             level: o.level.unwrap_or(zalt_codec::encode::level::LEVEL_DEFAULT),
             threads: o.threads,
             dictionary: dictionary_option(&o)?,
+            policy: policy_option(&o),
             ..WriterOptions::default()
         };
         let mut writer =

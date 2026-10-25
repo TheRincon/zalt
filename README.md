@@ -174,6 +174,7 @@ create, list, extract, verify and append are `c`, `t`, `x`, `v` and `r`.
 zalt archive create -o src.tar.zst src/ README.md   # zalt a c
 zalt a c -19 --threads 4 -o src.tar.zst src/
 zalt a c --hash xxh3 -o src.tar.zst src/     # faster hash; see below
+zalt a c --group 256K -o src.tar.zst src/    # smaller frames: faster one-file extract
 zalt a t src.tar.zst                    # list paths
 zalt a t -l src.tar.zst                 # type, mode, uid, gid, size, mtime
 zalt a x src.tar.zst -C out/            # extract everything into out/
@@ -210,8 +211,8 @@ zalt a r src.tar.zst CHANGELOG.md       # append
   and an archive much larger than the dictionary, which is stored
   uncompressed: on 1.4 MB of this repository's text, an 8 KiB dictionary cut
   a 16 KiB-group archive by 4% and made every archive with 1 MiB groups or
-  more larger (`doc/ZALT-MAC.md`, M7). The CLI does not yet set group sizes,
-  so from the shell they mostly cost.
+  more larger (`doc/ZALT-MAC.md`, M7). `--group SIZE` sets the group size
+  (default 8 MiB).
 - **Appending** adds members after the last one and takes `create`'s options,
   except `--hash`: new members get the archive's own. It works on a copy that replaces the archive only once complete, so a
   failure leaves the archive as it was. A path already in the archive is

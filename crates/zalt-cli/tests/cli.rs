@@ -1358,3 +1358,56 @@ fn a_dictionary_archive_through_the_cli() {
     assert_eq!(code(&none), 1);
     assert!(stderr(&none).contains("portable"), "{}", stderr(&none));
 }
+
+/// `--group` sets the solid-group size: smaller groups, more frames, the
+/// same members; sizes outside 512 B to 1 GiB are refused.
+#[test]
+fn the_group_size_sets_how_many_frames_small_files_share() {
+    let t = TempDir::new("arch-group");
+    fs::create_dir_all(t.0.join("docs")).unwrap();
+    for (i, chunk) in compressible().chunks(600).enumerate() {
+        fs::write(t.0.join(format!("docs/d{i:03}.xml")), chunk).unwrap();
+    }
+    let frames = |extra: &[&str], name: &str| {
+        let archive = t.s(name);
+        let mut args = vec!["archive", "create", "-o", &archive];
+        args.extend_from_slice(extra);
+        args.push("docs");
+        let out = Command::new(ZALT)
+            .args(&args)
+            .current_dir(&t.0)
+            .output()
+            .unwrap();
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        let verified = zalt(&["archive", "verify", "-q", &archive]);
+        assert_eq!(code(&verified), 0, "{}", stderr(&verified));
+        // "... in N data frames" from the summary.
+        let summary = stderr(&out);
+        let n: u64 = summary
+            .split(", ")
+            .find_map(|part| {
+                part.strip_suffix(" data frames\n")
+                    .or(part.strip_suffix(" data frames"))
+            })
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no frame count in {summary}"));
+        n
+    };
+    let default = frames(&[], "default.tar.zst");
+    let small = frames(&["--group", "4K"], "small.tar.zst");
+    assert_eq!(default, 2, "one group and the Terminator by default");
+    assert!(small > 10, "4K groups: {small} data frames");
+
+    for bad in ["100", "2G", "lots"] {
+        let out = zalt(&[
+            "archive",
+            "create",
+            "--group",
+            bad,
+            "-o",
+            &t.s("x.tar.zst"),
+            "docs",
+        ]);
+        assert_eq!(code(&out), EXIT_USAGE, "--group {bad}: {}", stderr(&out));
+    }
+}
