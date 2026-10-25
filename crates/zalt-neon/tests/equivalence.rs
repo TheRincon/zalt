@@ -248,3 +248,41 @@ fn every_level_encodes_identically_with_either_backend() {
         assert!(scalar == neon, "level {level}: frames differ");
     }
 }
+
+/// The same with a dictionary in front: the matcher indexes it and reaches
+/// into it through `common_prefix` like any other history, so a backend that
+/// measured a match spanning the dictionary and the frame differently would
+/// change the frame here.
+#[test]
+fn every_level_encodes_identically_against_a_dictionary() {
+    use zalt_codec::dict::Dictionary;
+    use zalt_codec::encode::{EncodeParams, Strategy, compress_with_dictionary};
+
+    let row = |i: u32| {
+        format!(
+            "<row id=\"{i}\" kind=\"{}\">value {}</row>\n",
+            i % 7,
+            (i * 13) % 101
+        )
+    };
+    let content: String = (0..300).map(row).collect();
+    let dictionary = Dictionary::parse(content.as_bytes()).expect("raw content");
+    let mut input: Vec<u8> = (150..700).flat_map(|i| row(i).into_bytes()).collect();
+    let mut noise = vec![0u8; 2000];
+    fill(&mut noise, 0x31);
+    input.extend_from_slice(&noise);
+
+    for level in 1..=19 {
+        let params = EncodeParams {
+            strategy: Strategy::Compress,
+            level,
+            checksum: true,
+            ..Default::default()
+        };
+        let scalar =
+            compress_with_dictionary::<Scalar>(&input, &dictionary, &params).expect("encodable");
+        let neon =
+            compress_with_dictionary::<Neon>(&input, &dictionary, &params).expect("encodable");
+        assert!(scalar == neon, "level {level}: frames differ");
+    }
+}

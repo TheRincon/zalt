@@ -79,6 +79,9 @@ pub struct Decoder {
     /// Where working buffers come from and go back to. `None` means the system
     /// allocator, which is the common case and costs nothing to represent.
     source: Option<SharedSource>,
+    /// The dictionary loaded, kept so [`Decoder::shrink`] — which may replace
+    /// the inner decoder — does not forget it.
+    dictionary: Option<zalt_codec::dict::Dictionary>,
 }
 
 impl fmt::Debug for Decoder {
@@ -105,6 +108,7 @@ impl Decoder {
             policy,
             lease: None,
             source: None,
+            dictionary: None,
         }
     }
 
@@ -122,6 +126,7 @@ impl Decoder {
             policy,
             lease: Some(lease),
             source: None,
+            dictionary: None,
         })
     }
 
@@ -139,6 +144,7 @@ impl Decoder {
             policy,
             lease: Some(lease),
             source: Some(source),
+            dictionary: None,
         };
         decoder.refill();
         Some(decoder)
@@ -175,6 +181,18 @@ impl Decoder {
             // Back to nothing held, so this cannot fail.
             let _ = self.settle_lease();
         }
+    }
+
+    /// Decode frames from the next frame boundary on with `dictionary`: see
+    /// [`zalt_codec::Decoder::load_dictionary`]. A frame naming another
+    /// dictionary is refused, never decoded against this one.
+    ///
+    /// The dictionary is the caller's memory, not the decoder's working
+    /// buffers, and is not charged to the budget: a host serving many
+    /// responses with one dictionary holds it once, whatever the budget says.
+    pub fn load_dictionary(&mut self, dictionary: zalt_codec::dict::Dictionary) {
+        self.inner.load_dictionary(dictionary.clone());
+        self.dictionary = Some(dictionary);
     }
 
     /// The policy in force.
@@ -227,7 +245,12 @@ impl Decoder {
     pub fn shrink(&mut self) {
         match self.source.clone() {
             Some(source) => source.release(self.inner.take_buffers()),
-            None => self.inner = zalt_codec::Decoder::new(self.policy.limits),
+            None => {
+                self.inner = zalt_codec::Decoder::new(self.policy.limits);
+                if let Some(dictionary) = &self.dictionary {
+                    self.inner.load_dictionary(dictionary.clone());
+                }
+            }
         }
         if let Some(lease) = self.lease.as_mut() {
             lease.resize(0);

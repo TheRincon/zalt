@@ -40,6 +40,15 @@
 //!   from a frame that begins a member. So it is opt-in, and every member it
 //!   finds is reported in [`Recovered::found_by_search`].
 //!
+//! ## Dictionaries
+//!
+//! A dictionary archive (§6) is recovered like any other: its Dictionary
+//! frames, which precede every data frame, are loaded before the walk and
+//! kept as they were. One that is damaged is dropped, and the frames written
+//! against it fail to decode — damage, like any other, costing the members in
+//! them. The new Terminator is written without a dictionary, whatever the
+//! options say: recovery cannot add a Dictionary frame (§6 puts them first).
+//!
 //! ## What is kept
 //!
 //! The tar stream is cut into *runs*: stretches between member boundaries
@@ -60,6 +69,7 @@ use std::io::Write;
 
 use zalt_codec::params::DecodeLimits;
 
+use crate::dict::{self, Dictionary};
 use crate::frames::{self, MAX_FRAME_CONTENT, MAX_WINDOW_LOG};
 use crate::hash::Hasher;
 use crate::index::{Entry, Index, IndexLimits};
@@ -442,6 +452,42 @@ fn extents<S: Source + ?Sized>(src: &S, header_len: u64) -> (Vec<Extent>, Option
 
 // ---------------------------------------------------- pass 2: frame content
 
+/// The dictionaries a damaged archive still holds: every Dictionary frame
+/// before its first data frame that loads, its ID not seen before, within the
+/// reader's limit — and the offsets of those frames, to keep them.
+fn load_dictionaries<S: Source + ?Sized>(
+    src: &S,
+    extents: &[Extent],
+) -> (Vec<Dictionary>, Vec<u64>) {
+    let limit = ReadLimits::default().max_dictionary_bytes;
+    let (mut loaded, mut kept, mut held) = (Vec::new(), Vec::new(), 0u64);
+    for x in extents {
+        let Ok(frame) = src.read_at(x.offset, x.size as usize) else {
+            break;
+        };
+        let magic = if frame.len() >= 4 { le32(&frame) } else { 0 };
+        if !zalt_codec::magic::is_zstd_skippable(magic) || x.listed.is_some_and(|(n, _)| n > 0) {
+            break;
+        }
+        if magic != MAGIC_DICTIONARY || held + x.size > limit {
+            continue;
+        }
+        let Ok(payload) = skippable_payload(&frame, MAGIC_DICTIONARY) else {
+            continue;
+        };
+        let Ok(d) = Dictionary::parse(payload.to_vec()) else {
+            continue;
+        };
+        if dict::find(&loaded, d.id()).is_some() {
+            continue;
+        }
+        held += x.size;
+        kept.push(x.offset);
+        loaded.push(d);
+    }
+    (loaded, kept)
+}
+
 fn data_limits() -> DecodeLimits {
     DecodeLimits {
         max_window_log: MAX_WINDOW_LOG,
@@ -454,12 +500,14 @@ fn data_limits() -> DecodeLimits {
 fn decode_data_frame(
     frame: &[u8],
     listed: Option<(u64, u32)>,
+    dictionaries: &[Dictionary],
 ) -> std::result::Result<Vec<u8>, String> {
     let declared = frames::header_of(frame, &data_limits())
         .map_err(|e| e.to_string())?
         .frame_content_size
         .ok_or("a data frame without Frame_Content_Size (§5.2)")?;
-    let content = frames::decode_exactly(frame, declared).map_err(|e| e.to_string())?;
+    let content =
+        frames::decode_exactly(frame, declared, dictionaries).map_err(|e| e.to_string())?;
     if let Some((size, checksum)) = listed {
         if size != content.len() as u64 || frames::seek_checksum(&content) != checksum {
             return Err("decodes, but not to what the seek table recorded".into());
@@ -487,7 +535,11 @@ struct Prepared {
 }
 
 /// Read `batch` in order, and decode its data frames in parallel.
-fn prepare<S: Source + ?Sized>(src: &S, batch: &[Extent]) -> std::collections::VecDeque<Prepared> {
+fn prepare<S: Source + ?Sized>(
+    src: &S,
+    batch: &[Extent],
+    dictionaries: &[Dictionary],
+) -> std::collections::VecDeque<Prepared> {
     let frames: Vec<std::result::Result<Vec<u8>, String>> = batch
         .iter()
         .map(|x| {
@@ -506,7 +558,9 @@ fn prepare<S: Source + ?Sized>(src: &S, batch: &[Extent]) -> std::collections::V
             .iter()
             .zip(&frames)
             .map(|(x, f)| match f {
-                Ok(f) if is_data(x, f) => Some(scope.spawn(move || decode_data_frame(f, x.listed))),
+                Ok(f) if is_data(x, f) => {
+                    Some(scope.spawn(move || decode_data_frame(f, x.listed, dictionaries)))
+                }
                 _ => None,
             })
             .collect();
@@ -575,12 +629,20 @@ pub fn recover_with<S: Source + ?Sized, W: Write>(
     let header_len = 8 + u64::from(le32(&head[4..]));
     let header_frame = damaged.read_at(0, usize::try_from(header_len).unwrap_or(usize::MAX))?;
     let header = Header::parse(skippable_payload(&header_frame, MAGIC_HEADER)?)?;
-    if header.flags & FLAG_DICT_REQUIRED != 0 {
-        return Err(Error::Unsupported("dictionary archives (§6)".into()));
-    }
+    // A Dictionary frame cannot be added after the fact, so the Terminator
+    // this writes must not need one.
+    let options = WriterOptions {
+        dictionary: None,
+        ..options
+    };
 
     // Pass 1.
     let (extents, mut stopped) = extents(damaged, header_len);
+    let (dictionaries, kept_dictionaries) = if header.flags & FLAG_DICT_REQUIRED != 0 {
+        load_dictionaries(damaged, &extents)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let index = extents.iter().rev().find_map(|x| {
         let frame = damaged.read_at(x.offset, x.size as usize).ok()?;
         let payload = skippable_payload(&frame, MAGIC_INDEX).ok()?;
@@ -609,7 +671,11 @@ pub fn recover_with<S: Source + ?Sized, W: Write>(
     let mut ready: std::collections::VecDeque<Prepared> = std::collections::VecDeque::new();
     for (k, x) in extents.iter().enumerate() {
         if ready.is_empty() {
-            ready = prepare(damaged, &extents[k..extents.len().min(k + threads)]);
+            ready = prepare(
+                damaged,
+                &extents[k..extents.len().min(k + threads)],
+                &dictionaries,
+            );
         }
         let Some(Prepared { frame, decoded }) = ready.pop_front() else {
             break;
@@ -628,8 +694,21 @@ pub fn recover_with<S: Source + ?Sized, W: Write>(
         if zalt_codec::magic::is_zstd_skippable(magic) && !listed_data {
             match magic {
                 MAGIC_INDEX | MAGIC_SEEK_TABLE => break,
+                // Kept if it loaded — it then sits before every data frame,
+                // where kept frames that belong to no run are written.
                 MAGIC_DICTIONARY => {
-                    return Err(Error::Unsupported("dictionary frames (§6)".into()));
+                    if kept_dictionaries.contains(&x.offset) {
+                        walked.push(Walked {
+                            extent: *x,
+                            stream_offset: stream,
+                            content_len: 0,
+                            checksum: 0,
+                            data: false,
+                            good: true,
+                            boundary: false,
+                        });
+                    }
+                    continue;
                 }
                 MAGIC_HEADER => {
                     stopped = Some(format!("a second Archive Header at offset {}", x.offset));
@@ -652,7 +731,7 @@ pub fn recover_with<S: Source + ?Sized, W: Write>(
             }
         }
 
-        let decoded = decoded.unwrap_or_else(|| decode_data_frame(&frame, x.listed));
+        let decoded = decoded.unwrap_or_else(|| decode_data_frame(&frame, x.listed, &dictionaries));
         let mut boundary = tar.at_boundary();
         // Lost the thread at damage, and the index knows where a member
         // starts here: take it up again, if the tar header agrees.

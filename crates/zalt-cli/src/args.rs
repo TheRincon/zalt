@@ -56,6 +56,8 @@ pub struct Args {
     pub stored: bool,
     /// Append a content checksum. `None` means the command's default.
     pub checksum: Option<bool>,
+    /// Dictionary file for compress, decompress and check (`-D`).
+    pub dictionary: Option<String>,
     /// Flags that only make sense for one direction, by name, so a flag given
     /// to the wrong command is refused rather than quietly ignored.
     decode_only: Vec<String>,
@@ -96,6 +98,7 @@ impl Args {
             level: None,
             stored: false,
             checksum: None,
+            dictionary: None,
             decode_only: Vec::new(),
             encode_only: Vec::new(),
         };
@@ -158,6 +161,9 @@ impl Args {
                     let explicit = args.policy.limits.max_decoded_size;
                     args.policy = Policy::trusted();
                     args.policy.limits.max_decoded_size = explicit;
+                }
+                "-D" | "--dict" => {
+                    args.dictionary = Some(take(&mut it, "--dict")?);
                 }
                 "-c" | "--stdout" => args.output = None,
                 "-o" | "--output" => {
@@ -239,6 +245,13 @@ impl Args {
             }
         } else if let Some(flag) = self.encode_only.first() {
             usage!("{flag} applies to compress only");
+        }
+        let reads_frames = matches!(
+            self.command,
+            Command::Compress | Command::Decompress | Command::Check
+        );
+        if self.dictionary.is_some() && !reads_frames {
+            usage!("--dict applies to compress, decompress and check");
         }
         if self.command == Command::Check && self.output.is_some() {
             usage!("check produces no output; --output does not apply");
@@ -384,6 +397,9 @@ OPTIONS
     -c, --stdout          write to stdout (the default)
     -f, --force           overwrite an existing --output file
     -q, --quiet           suppress the per-file summary on stderr
+    -D, --dict FILE       compress against, or decode with, this dictionary:
+                          a zstd dictionary (as zstd --train writes) or raw
+                          content. As zstd(1)'s -D.
 
     --max-window-log N    window ceiling, 10..=31. Default 23 (8 MiB), the
                           ceiling appropriate to untrusted network input.

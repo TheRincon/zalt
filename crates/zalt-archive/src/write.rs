@@ -46,6 +46,14 @@
 //! in the batch — so the thread count cannot change the output, and §12.4's
 //! reproducibility holds at any parallelism. A test asserts exactly that.
 //!
+//! ## Dictionaries
+//!
+//! With [`WriterOptions::dictionary`], the dictionary goes in a Dictionary
+//! frame straight after the header (§6), `DICT_REQUIRED` is set, and every
+//! data frame — the Terminator too — is compressed against it. So the flag is
+//! always true of the archive (§4.2), and an appender finds the dictionary it
+//! should go on using. The Central Index never uses it (§6).
+//!
 //! ## Memory
 //!
 //! A batch holds at most `threads` payloads and at most [`BATCH_BYTES`] in
@@ -55,11 +63,12 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 
+use crate::dict::Dictionary;
 use crate::hash::{Hash, Hasher};
 use crate::index::{Entry, Index, Kind};
 use crate::layout::{
-    FLAG_DICT_REQUIRED, Header, MAGIC_HEADER, MAGIC_INDEX, SeekEntry, TAG_CREATOR,
-    encode_seek_table, skippable,
+    FLAG_DICT_REQUIRED, Header, MAGIC_DICTIONARY, MAGIC_HEADER, MAGIC_INDEX, SeekEntry,
+    TAG_CREATOR, encode_seek_table, skippable,
 };
 use crate::meta;
 use crate::tar::{self, BLOCK, Extras, pad};
@@ -125,6 +134,11 @@ pub struct WriterOptions {
     /// [`crate::hash`]. Ignored when appending: an index has one
     /// `Hash_Algorithm`, so an appended member gets the archive's own.
     pub hash: Hash,
+    /// Compress every data frame against this dictionary (§6). The archive is
+    /// then no longer readable by `zstd -dc` alone. When appending, it must be
+    /// one the archive already holds — `None` keeps using the archive's — and
+    /// recovery ignores it.
+    pub dictionary: Option<Dictionary>,
 }
 
 impl Default for WriterOptions {
@@ -135,6 +149,7 @@ impl Default for WriterOptions {
             threads: 0,
             creator: Some(format!("zalt {}", env!("CARGO_PKG_VERSION")).into_bytes()),
             hash: Hash::default(),
+            dictionary: None,
         }
     }
 }
@@ -221,9 +236,16 @@ impl<W: Write> Writer<W> {
         if let Some(creator) = &w.options.creator {
             header.tlvs.push((TAG_CREATOR, creator.clone()));
         }
-        debug_assert_eq!(header.flags & FLAG_DICT_REQUIRED, 0, "portable profile");
+        if w.options.dictionary.is_some() {
+            header.flags |= FLAG_DICT_REQUIRED;
+        }
         let frame = skippable(MAGIC_HEADER, &header.encode()?)?;
         w.emit_skippable(&frame, "Archive Header")?;
+        // §6: before the first data frame, so a streaming reader has it first.
+        if let Some(d) = &w.options.dictionary {
+            let frame = skippable(MAGIC_DICTIONARY, d.raw())?;
+            w.emit_skippable(&frame, "Dictionary")?;
+        }
         Ok(w)
     }
 
@@ -489,13 +511,17 @@ impl<W: Write> Writer<W> {
         let batch = std::mem::take(&mut self.batch);
         self.batch_bytes = 0;
         let level = self.options.level;
+        let dictionary = self.options.dictionary.as_ref();
         let compressed: Vec<Result<Vec<u8>>> = if batch.len() <= 1 {
-            batch.iter().map(|p| frames::encode(p, level)).collect()
+            batch
+                .iter()
+                .map(|p| frames::encode(p, level, dictionary))
+                .collect()
         } else {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = batch
                     .iter()
-                    .map(|p| scope.spawn(move || frames::encode(p, level)))
+                    .map(|p| scope.spawn(move || frames::encode(p, level, dictionary)))
                     .collect();
                 handles
                     .into_iter()

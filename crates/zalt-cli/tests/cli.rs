@@ -793,6 +793,137 @@ fn the_summary_goes_to_stderr_and_names_the_level() {
     );
 }
 
+// -------------------------------------------------------------- dictionary
+
+/// A small document of the kind a dictionary is for, and a dictionary that
+/// shares its vocabulary: rows from the same generator, earlier ids.
+fn dictionary_and_document(dir: &TempDir) -> (String, Vec<u8>) {
+    let rows = compressible();
+    let dict = dir.s("rows.dict");
+    fs::write(&dict, &rows[..20_000]).unwrap();
+    (dict, rows[40_000..40_400].to_vec())
+}
+
+#[test]
+fn a_dictionary_round_trips_and_pays_on_a_small_document() {
+    let dir = TempDir::new("dict-rt");
+    let (dict, doc) = dictionary_and_document(&dir);
+    let plain = zalt_stdin(&["c", "-q", "-19"], &doc);
+    let packed = zalt_stdin(&["c", "-19", "-D", &dict], &doc);
+    assert_eq!(code(&packed), 0, "{}", stderr(&packed));
+    assert!(
+        stderr(&packed).contains("raw-content dictionary"),
+        "the summary says a dictionary was used: {}",
+        stderr(&packed)
+    );
+    assert!(
+        packed.stdout.len() * 3 < plain.stdout.len() * 2,
+        "{} bytes with the dictionary, {} without",
+        packed.stdout.len(),
+        plain.stdout.len()
+    );
+    let back = zalt_stdin(&["d", "-q", "--dict", &dict], &packed.stdout);
+    assert_eq!(code(&back), 0, "{}", stderr(&back));
+    assert_eq!(back.stdout, doc);
+
+    // `check` takes it too, and fails without it.
+    let frame = dir.s("doc.zst");
+    fs::write(&frame, &packed.stdout).unwrap();
+    assert_eq!(code(&zalt(&["check", "-q", "-D", &dict, &frame])), 0);
+}
+
+/// A formatted dictionary is named in the frame, so decoding without it — or
+/// with another — is refused, and says which one it needed.
+#[test]
+fn a_frame_that_needs_a_dictionary_says_which() {
+    let dict = workspace_root().join("zstd-fixtures/golden-dictionaries/http-dict-missing-symbols");
+    let Some(dict) = dict.is_file().then(|| dict.to_str().unwrap().to_string()) else {
+        eprintln!("SKIP: zstd-fixtures not present");
+        return;
+    };
+    let packed = zalt_stdin(&["c", "-q", "-3", "-D", &dict], &compressible());
+    assert_eq!(code(&packed), 0, "{}", stderr(&packed));
+    let without = zalt_stdin(&["d", "-q"], &packed.stdout);
+    assert_eq!(code(&without), EXIT_INPUT);
+    assert!(
+        stderr(&without).contains("requires dictionary 0x"),
+        "{}",
+        stderr(&without)
+    );
+
+    let dir = TempDir::new("dict-other");
+    let other = dir.s("other.dict");
+    fs::write(&other, &compressible()[..4096]).unwrap();
+    let wrong = zalt_stdin(&["d", "-q", "-D", &other], &packed.stdout);
+    assert_eq!(
+        code(&wrong),
+        EXIT_INPUT,
+        "decoded against the wrong dictionary"
+    );
+}
+
+#[test]
+fn a_dictionary_means_nothing_to_info() {
+    let out = zalt(&["info", "-D", "x.dict", "x.zst"]);
+    assert_eq!(code(&out), EXIT_USAGE);
+    assert!(
+        stderr(&out).contains("--dict applies to"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// Both directions against zstd(1), with a dictionary zstd trained itself.
+#[test]
+fn zstd_and_zalt_read_each_others_dictionary_frames() {
+    let Ok(version) = Command::new("zstd").arg("--version").output() else {
+        eprintln!("SKIP: zstd(1) not on PATH");
+        return;
+    };
+    assert!(version.status.success());
+    let dir = TempDir::new("dict-zstd");
+    let rows = compressible();
+    let mut samples = Vec::new();
+    for (i, chunk) in rows[..40_000].chunks(400).enumerate() {
+        let path = dir.s(&format!("s{i:03}"));
+        fs::write(&path, chunk).unwrap();
+        samples.push(path);
+    }
+    let dict = dir.s("trained.dict");
+    let trained = Command::new("zstd")
+        .args(["-q", "--train", "--maxdict=8192", "-o", &dict])
+        .args(&samples)
+        .status()
+        .unwrap();
+    assert!(trained.success(), "zstd --train failed");
+    let doc = dir.s("doc");
+    fs::write(&doc, &rows[50_000..52_000]).unwrap();
+
+    // zalt compresses, zstd decodes.
+    let packed = zalt(&["c", "-q", "-9", "-D", &dict, "-o", &dir.s("zalt.zst"), &doc]);
+    assert_eq!(code(&packed), 0, "{}", stderr(&packed));
+    let theirs = Command::new("zstd")
+        .args(["-q", "-d", "-c", "-D", &dict, &dir.s("zalt.zst")])
+        .output()
+        .unwrap();
+    assert!(
+        theirs.status.success(),
+        "{}",
+        String::from_utf8_lossy(&theirs.stderr)
+    );
+    assert_eq!(theirs.stdout, fs::read(&doc).unwrap());
+
+    // zstd compresses, zalt decodes.
+    let made = Command::new("zstd")
+        .args(["-q", "-19", "-D", &dict, "-o", &dir.s("zstd.zst"), &doc])
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let ours = zalt(&["d", "-q", "-D", &dict, &dir.s("zstd.zst")]);
+    assert_eq!(code(&ours), 0, "{}", stderr(&ours));
+    assert_eq!(ours.stdout, fs::read(&doc).unwrap());
+}
+
 // ----------------------------------------------------------------- archive
 
 struct TempDir(std::path::PathBuf);
@@ -1117,4 +1248,166 @@ fn create_will_not_overwrite_an_archive_without_force() {
         .unwrap();
     assert_eq!(code(&out), EXIT_INPUT);
     assert_eq!(fs::read(t.0.join("a.tar.zst")).unwrap(), b"precious");
+}
+
+/// `-D` end to end: create, verify, extract, append, and the dictionary
+/// exported for stock tools — `zstd -dc -D | tar -t` lists what zalt wrote.
+#[test]
+fn a_dictionary_archive_through_the_cli() {
+    let Ok(version) = Command::new("zstd").arg("--version").output() else {
+        eprintln!("SKIP: zstd(1) not on PATH, nothing to train a dictionary with");
+        return;
+    };
+    assert!(version.status.success());
+    let t = TempDir::new("arch-dict");
+    let rows = compressible();
+    fs::create_dir_all(t.0.join("docs")).unwrap();
+    let mut samples = Vec::new();
+    for (i, chunk) in rows.chunks(500).enumerate() {
+        let path = t.0.join(format!("docs/d{i:03}.xml"));
+        fs::write(&path, chunk).unwrap();
+        samples.push(path);
+    }
+    let dict = t.s("docs.dict");
+    let trained = Command::new("zstd")
+        .args(["-q", "--train", "--maxdict=8192", "-o", &dict])
+        .args(&samples)
+        .status()
+        .unwrap();
+    assert!(trained.success());
+
+    let archive = t.s("a.tar.zst");
+    let run = |args: &[&str]| {
+        let out = Command::new(ZALT)
+            .args(args)
+            .current_dir(&t.0)
+            .output()
+            .unwrap();
+        assert_eq!(code(&out), 0, "{args:?}: {}", stderr(&out));
+        out
+    };
+    run(&[
+        "archive", "create", "-q", "-D", &dict, "-o", &archive, "docs",
+    ]);
+    run(&["archive", "verify", "-q", &archive]);
+    run(&["archive", "extract", "-q", &archive, "-C", &t.s("out")]);
+    assert_eq!(
+        fs::read(t.0.join("out/docs/d007.xml")).unwrap(),
+        rows[3500..4000]
+    );
+
+    fs::write(t.0.join("late.xml"), &rows[..700]).unwrap();
+    run(&["archive", "append", "-q", &archive, "late.xml"]);
+    run(&["archive", "verify", "-q", &archive]);
+
+    // Raw content is refused as an archive's dictionary (§6).
+    let refused = Command::new(ZALT)
+        .args([
+            "archive",
+            "create",
+            "-q",
+            "-D",
+            &t.s("late.xml"),
+            "-o",
+            &t.s("b.tar.zst"),
+            "docs",
+        ])
+        .current_dir(&t.0)
+        .output()
+        .unwrap();
+    assert_eq!(code(&refused), 1, "{}", stderr(&refused));
+
+    let exported = t.s("exported.dict");
+    run(&["archive", "dict", "-q", &archive, "-o", &exported]);
+    assert_eq!(fs::read(&exported).unwrap(), fs::read(&dict).unwrap());
+    let stream = Command::new("zstd")
+        .args(["-q", "-dc", "-D", &exported, &archive])
+        .output()
+        .unwrap();
+    assert!(
+        stream.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stream.stderr)
+    );
+    let mut list = Command::new("tar")
+        .args(["-tf", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    list.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&stream.stdout)
+        .unwrap();
+    let listing = list.wait_with_output().unwrap();
+    assert!(listing.status.success());
+    let listed = String::from_utf8_lossy(&listing.stdout);
+    assert!(
+        listed.contains("docs/d007.xml") && listed.contains("late.xml"),
+        "{listed}"
+    );
+
+    // A portable archive has no dictionary to export.
+    let portable = t.s("p.tar.zst");
+    run(&["archive", "create", "-q", "-o", &portable, "late.xml"]);
+    let none = Command::new(ZALT)
+        .args(["archive", "dict", "-q", &portable, "-o", &t.s("none.dict")])
+        .output()
+        .unwrap();
+    assert_eq!(code(&none), 1);
+    assert!(stderr(&none).contains("portable"), "{}", stderr(&none));
+}
+
+/// `--group` sets the solid-group size: smaller groups, more frames, the
+/// same members; sizes outside 512 B to 1 GiB are refused.
+#[test]
+fn the_group_size_sets_how_many_frames_small_files_share() {
+    let t = TempDir::new("arch-group");
+    fs::create_dir_all(t.0.join("docs")).unwrap();
+    for (i, chunk) in compressible().chunks(600).enumerate() {
+        fs::write(t.0.join(format!("docs/d{i:03}.xml")), chunk).unwrap();
+    }
+    let frames = |extra: &[&str], name: &str| {
+        let archive = t.s(name);
+        let mut args = vec!["archive", "create", "-o", &archive];
+        args.extend_from_slice(extra);
+        args.push("docs");
+        let out = Command::new(ZALT)
+            .args(&args)
+            .current_dir(&t.0)
+            .output()
+            .unwrap();
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        let verified = zalt(&["archive", "verify", "-q", &archive]);
+        assert_eq!(code(&verified), 0, "{}", stderr(&verified));
+        // "... in N data frames" from the summary.
+        let summary = stderr(&out);
+        let n: u64 = summary
+            .split(", ")
+            .find_map(|part| {
+                part.strip_suffix(" data frames\n")
+                    .or(part.strip_suffix(" data frames"))
+            })
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no frame count in {summary}"));
+        n
+    };
+    let default = frames(&[], "default.tar.zst");
+    let small = frames(&["--group", "4K"], "small.tar.zst");
+    assert_eq!(default, 2, "one group and the Terminator by default");
+    assert!(small > 10, "4K groups: {small} data frames");
+
+    for bad in ["100", "2G", "lots"] {
+        let out = zalt(&[
+            "archive",
+            "create",
+            "--group",
+            bad,
+            "-o",
+            &t.s("x.tar.zst"),
+            "docs",
+        ]);
+        assert_eq!(code(&out), EXIT_USAGE, "--group {bad}: {}", stderr(&out));
+    }
 }

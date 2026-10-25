@@ -23,7 +23,7 @@ use crate::layout::SeekEntry;
 use crate::read::{Archive, ReadLimits};
 use crate::tar::BLOCK;
 use crate::write::{Resume, Writer, WriterOptions};
-use crate::{Error, Result, format_err};
+use crate::{Error, Result, format_err, frames};
 
 /// Open `file` — readable, writable, a complete archive — for appending.
 ///
@@ -32,6 +32,13 @@ use crate::{Error, Result, format_err};
 /// and the returned writer adds after it; [`Writer::finish`] writes the new
 /// trailer. `options` sets how the *new* frames are written; the Archive
 /// Header, and with it the `Creator`, stays as it was.
+///
+/// **Dictionaries (§6).** A Dictionary frame cannot be added by appending —
+/// §6 puts them before the first data frame — so `options.dictionary` must be
+/// one the archive holds, or it is refused. Left `None`, the new frames are
+/// written against the dictionary the old Terminator named, if it named one:
+/// an archive goes on being compressed the way it was, and a portable archive
+/// stays portable.
 pub fn append(
     file: std::fs::File,
     options: WriterOptions,
@@ -54,6 +61,7 @@ pub fn append(
         return format_err("the frame before the Central Index is not a data frame (§10)");
     }
     let content = archive.decode_frame(t)?;
+    let options = dictionary_for_append(&archive, &file, &terminator, options)?;
     let ok =
         content.len() >= 2 * BLOCK && content.len() % BLOCK == 0 && content.iter().all(|&b| b == 0);
     if !ok {
@@ -94,4 +102,40 @@ pub fn append(
     file.seek(SeekFrom::Start(terminator.file_offset))
         .map_err(|e| io("seeking to the Terminator", e))?;
     Writer::resume(BufWriter::new(file), options, resume)
+}
+
+/// The options appended frames are written with: `options`, its dictionary
+/// settled as [`append`](fn@append) describes.
+fn dictionary_for_append(
+    archive: &Archive<std::fs::File>,
+    file: &std::fs::File,
+    terminator: &crate::read::Frame,
+    options: WriterOptions,
+) -> Result<WriterOptions> {
+    let held = archive.dictionaries();
+    if let Some(d) = &options.dictionary {
+        if !held.contains(d) {
+            return Err(Error::Refused(format!(
+                "the archive does not hold dictionary {:#010x}, and appending cannot add one (§6, §10)",
+                d.id()
+            )));
+        }
+        return Ok(options);
+    }
+    use std::os::unix::fs::FileExt;
+    let mut head =
+        vec![0u8; (zalt_codec::encode::MAX_HEADER).min(terminator.compressed_size as usize)];
+    file.read_exact_at(&mut head, terminator.file_offset)
+        .map_err(|e| Error::Io("reading the Terminator".into(), e))?;
+    let named =
+        frames::header_of(&head, &zalt_codec::params::DecodeLimits::default())?.dictionary_id;
+    let dictionary = match named {
+        None => None,
+        // `open` decoded the Terminator, so the archive holds what it names.
+        Some(id) => crate::dict::find(held, id).cloned(),
+    };
+    Ok(WriterOptions {
+        dictionary,
+        ..options
+    })
 }

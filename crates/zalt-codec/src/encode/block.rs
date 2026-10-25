@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use super::level::Tuning;
-use super::match_finder;
+use super::match_finder::{self, Prefix};
 use super::sequences;
 use crate::backend::Backend;
 use crate::block::BlockType;
@@ -111,7 +111,12 @@ fn stored_cost(content: &[u8]) -> usize {
     if run { 1 } else { content.len() }
 }
 
-/// Write every block for `input`, splitting at `block_size`.
+/// Write every block for the frame `input[prefix.len..]`, splitting at
+/// `boundaries` (positions in `input`).
+///
+/// `input[..prefix.len]` is dictionary content: history matches may reach
+/// into, never written. With [`Prefix::NONE`] the whole of `input` is the
+/// frame.
 ///
 /// Always emits at least one block, so an empty input becomes an empty final
 /// raw block rather than a frame with no blocks in it — which is what the
@@ -119,12 +124,13 @@ fn stored_cost(content: &[u8]) -> usize {
 pub fn write_all<B: Backend>(
     out: &mut Vec<u8>,
     input: &[u8],
+    prefix: Prefix,
     boundaries: &[usize],
     compress: Option<Tuning>,
     window_log: u8,
 ) -> Vec<Emitted> {
     let mut emitted = Vec::new();
-    if input.is_empty() {
+    if input.len() == prefix.len {
         emitted.push(write_one(out, &[], true));
         return emitted;
     }
@@ -135,10 +141,16 @@ pub fn write_all<B: Backend>(
     // `input.len()` is the whole frame, not this block: the matcher indexes
     // every position of the frame and reaches back across block boundaries, so
     // sizing its tables to one block would alias positions that are still live.
-    let mut matcher = compress
-        .map(|tuning| match_finder::Matcher::<B>::with_tuning(tuning, window_log, input.len()));
+    let mut matcher = compress.map(|tuning| {
+        let mut m =
+            match_finder::Matcher::<B>::with_prefix(tuning, window_log, input.len(), prefix);
+        if prefix.len > 0 {
+            m.prime(input);
+        }
+        m
+    });
 
-    let mut offset = 0usize;
+    let mut offset = prefix.len;
     for &end in boundaries.iter().chain(core::iter::once(&input.len())) {
         if end <= offset {
             continue;
@@ -216,6 +228,7 @@ mod tests {
         let emitted = write_all::<crate::Scalar>(
             &mut out,
             &input,
+            Prefix::NONE,
             &crate::encode::split::fixed(input.len(), 100),
             None,
             17,
@@ -235,7 +248,7 @@ mod tests {
     #[test]
     fn an_empty_input_still_produces_one_final_block() {
         let mut out = Vec::new();
-        let emitted = write_all::<crate::Scalar>(&mut out, &[], &[], None, 17);
+        let emitted = write_all::<crate::Scalar>(&mut out, &[], Prefix::NONE, &[], None, 17);
         assert_eq!(emitted.len(), 1);
         assert!(parse_first(&out).last);
         assert_eq!(parse_first(&out).size, 0);

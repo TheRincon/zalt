@@ -54,6 +54,7 @@
 #![forbid(unsafe_code)]
 
 pub mod append;
+pub mod dict;
 pub mod frames;
 #[cfg(all(unix, feature = "native-fs"))]
 pub mod fs;
@@ -69,6 +70,7 @@ pub mod write;
 pub mod xxh3;
 
 pub use append::append;
+pub use dict::Dictionary;
 pub use hash::Hash;
 pub use index::{Entry, Kind};
 pub use read::{Archive, ReadLimits};

@@ -7,6 +7,7 @@
 //! zalt archive verify ARCHIVE
 //! zalt archive append ARCHIVE [-19] [--threads N] PATH...
 //! zalt archive recover DAMAGED -o OUT
+//! zalt archive dict ARCHIVE -o FILE
 //! ```
 //!
 //! A sub-parser of its own rather than more flags on the top-level one: the
@@ -38,6 +39,7 @@ USAGE
     zalt archive verify ARCHIVE
     zalt archive append ARCHIVE [options] PATH...
     zalt archive recover DAMAGED -o OUT
+    zalt archive dict ARCHIVE -o FILE
 
     (short: zalt a c | t | x | v | r)
 
@@ -45,10 +47,18 @@ CREATE
     -o, --output PATH     the archive to write (required)
     -1 .. -19             compression level (default 3)
     --threads N           frames compressed in parallel (default: one per core)
+    --group SIZE          files smaller than SIZE share frames of up to SIZE
+                          (default 8MiB). Smaller groups make extracting one
+                          file decode less and cost ratio; -D wins some back.
+                          512 to 1GiB; the spec suggests at most 64MiB.
     --hash ALGORITHM      each member's content hash: blake3 (the default),
                           xxh3 (faster; catches accidents, not tampering),
                           or none
     -f, --force           overwrite an existing archive
+    -D, --dict FILE       compress every frame against this zstd dictionary
+                          (as zstd --train writes it). Pays most on many
+                          small, similar files. The archive then needs it:
+                          zstd -dc alone refuses it, zalt reads it as ever.
     --no-xattrs           leave out extended attributes
     --no-acls             leave out ACLs
     --no-fflags           leave out BSD file flags (hidden, uchg, ...)
@@ -72,7 +82,9 @@ APPEND
     except -o and --hash: new members get the archive's own hash. Works on
     a copy that replaces the archive only once complete,
     so a failure leaves the archive as it was. A path already in the archive
-    is refused: members cannot be replaced.
+    is refused: members cannot be replaced. New members are compressed the
+    way the archive's last ones were, against its dictionary if it has one;
+    -D must name that same dictionary, as one cannot be added.
 
 RECOVER
     -o, --output PATH     where to write the recovered archive (required)
@@ -88,11 +100,18 @@ RECOVER
     file is only read. Members it keeps are hashed again, with BLAKE3:
     which hash the damaged archive used was only recorded in its index.
 
+DICT
+    -o, --output PATH     where to write the dictionary (required)
+    -f, --force           overwrite an existing file
+    Writes the dictionary an archive made with -D carries, so stock tools
+    can read it:  zstd -dc -D FILE ARCHIVE | tar -x
+
 COMMON
     -q, --quiet           no per-member output
     -h, --help            this text
 
 Any stock tool reads the result too:  zstd -dc ARCHIVE | tar -x
+(made with -D: zalt archive dict ARCHIVE -o FILE, then zstd -dc -D FILE ...)
 ";
 
 /// Exit 2: the command line was wrong.
@@ -133,6 +152,8 @@ struct Opts {
     keep_provenance: bool,
     search: bool,
     hash: Option<zalt_archive::Hash>,
+    dictionary: Option<PathBuf>,
+    group: Option<u64>,
     paths: Vec<String>,
 }
 
@@ -166,6 +187,7 @@ fn parse(argv: &[String], allowed: &[&str]) -> Result<Opts, Outcome> {
             "-f" | "--force" => "-f",
             "-q" | "--quiet" => "-q",
             "-l" | "--long" => "-l",
+            "-D" | "--dict" => "-D",
             other => other,
         };
         if canonical != "--" && !allowed.contains(&canonical) {
@@ -175,6 +197,7 @@ fn parse(argv: &[String], allowed: &[&str]) -> Result<Opts, Outcome> {
             "--" => literal = true,
             "-o" => o.output = Some(take(&mut it, arg)?.into()),
             "-C" => o.dir = Some(take(&mut it, arg)?.into()),
+            "-D" => o.dictionary = Some(take(&mut it, arg)?.into()),
             "-f" => o.force = true,
             "-q" => o.quiet = true,
             "-l" => o.long = true,
@@ -194,6 +217,15 @@ fn parse(argv: &[String], allowed: &[&str]) -> Result<Opts, Outcome> {
                     "none" => zalt_archive::Hash::None,
                     _ => usage!("--hash: expected blake3, xxh3 or none, got {raw}"),
                 });
+            }
+            "--group" => {
+                let raw = take(&mut it, arg)?;
+                let n = crate::args::parse_size(&raw)
+                    .map_err(|e| Outcome::Usage(Usage(format!("--group: {}", e.0))))?;
+                if !(512..=zalt_archive::frames::MAX_FRAME_CONTENT).contains(&n) {
+                    usage!("--group must be 512 bytes to 1GiB, got {raw}");
+                }
+                o.group = Some(n);
             }
             "--threads" => {
                 let raw = take(&mut it, arg)?;
@@ -227,7 +259,9 @@ pub fn run(argv: &[String]) -> Result<(), Outcome> {
                 "-o",
                 "-N",
                 "--threads",
+                "--group",
                 "--hash",
+                "-D",
                 "-f",
                 "-q",
                 "--no-xattrs",
@@ -257,6 +291,8 @@ pub fn run(argv: &[String]) -> Result<(), Outcome> {
             &[
                 "-N",
                 "--threads",
+                "--group",
+                "-D",
                 "-q",
                 "--no-xattrs",
                 "--no-acls",
@@ -265,13 +301,14 @@ pub fn run(argv: &[String]) -> Result<(), Outcome> {
             ],
         )?),
         "recover" => recover_cmd(parse(rest, &["-o", "-f", "-q", "--search"])?),
+        "dict" => dict_cmd(parse(rest, &["-o", "-f", "-q"])?),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
         }
         other => usage!(
             "unknown archive command: {other}\n\
-             expected one of: create, list, extract, verify, append, recover"
+             expected one of: create, list, extract, verify, append, recover, dict"
         ),
     }
 }
@@ -299,6 +336,8 @@ fn create(o: Opts) -> Result<(), Outcome> {
         level: o.level.unwrap_or(zalt_codec::encode::level::LEVEL_DEFAULT),
         threads: o.threads,
         hash: o.hash.unwrap_or_default(),
+        dictionary: dictionary_option(&o)?,
+        policy: policy_option(&o),
         ..WriterOptions::default()
     };
     let mut writer = Writer::new(BufWriter::new(file), options)?;
@@ -321,6 +360,73 @@ fn create(o: Opts) -> Result<(), Outcome> {
             crate::args::human(summary.archive_size),
             summary.tar_stream_size as f64 / summary.archive_size.max(1) as f64,
             summary.data_frames,
+        );
+    }
+    Ok(())
+}
+
+/// `--group SIZE`: small files share frames of up to SIZE, which is both the
+/// threshold and the group's size, as in the default policy.
+fn policy_option(o: &Opts) -> zalt_archive::FramePolicy {
+    let default = zalt_archive::FramePolicy::default();
+    match o.group {
+        Some(n) => zalt_archive::FramePolicy {
+            small_file_threshold: n,
+            solid_target: n,
+            ..default
+        },
+        None => default,
+    }
+}
+
+/// `-D FILE`, read and checked against §6, if given.
+fn dictionary_option(o: &Opts) -> Result<Option<zalt_archive::Dictionary>, Outcome> {
+    let Some(path) = &o.dictionary else {
+        return Ok(None);
+    };
+    let raw = std::fs::read(path).map_err(|e| failed(path.display(), e))?;
+    zalt_archive::Dictionary::parse(raw)
+        .map(Some)
+        .map_err(|e| failed(path.display(), e))
+}
+
+/// `zalt archive dict`: the archive's dictionary, as the file `zstd -D` reads.
+fn dict_cmd(o: Opts) -> Result<(), Outcome> {
+    let [archive] = o.paths.as_slice() else {
+        usage!("dict needs exactly one archive");
+    };
+    let Some(output) = o.output.clone() else {
+        usage!("dict needs -o FILE");
+    };
+    let file = File::open(archive).map_err(|e| failed(archive, e))?;
+    let opened = Archive::open(Box::new(file), ReadLimits::default())?;
+    let dictionary = match opened.dictionaries() {
+        [] => {
+            return Err(Outcome::Failed(Failed(format!(
+                "{archive}: no dictionary; it is a portable archive, and zstd -dc reads it alone"
+            ))));
+        }
+        [one] => one,
+        many => {
+            return Err(Outcome::Failed(Failed(format!(
+                "{archive}: holds {} dictionaries, and zstd -D takes one",
+                many.len()
+            ))));
+        }
+    };
+    if !o.force && output.exists() {
+        return Err(Outcome::Failed(Failed(format!(
+            "{} exists; pass -f to overwrite",
+            output.display()
+        ))));
+    }
+    std::fs::write(&output, dictionary.raw()).map_err(|e| failed(output.display(), e))?;
+    if !o.quiet {
+        eprintln!(
+            "{}: dictionary {:#010x}, {}",
+            output.display(),
+            dictionary.id(),
+            crate::args::human(dictionary.raw().len() as u64)
         );
     }
     Ok(())
@@ -367,6 +473,8 @@ fn append_cmd(o: Opts) -> Result<(), Outcome> {
         let options = WriterOptions {
             level: o.level.unwrap_or(zalt_codec::encode::level::LEVEL_DEFAULT),
             threads: o.threads,
+            dictionary: dictionary_option(&o)?,
+            policy: policy_option(&o),
             ..WriterOptions::default()
         };
         let mut writer =
