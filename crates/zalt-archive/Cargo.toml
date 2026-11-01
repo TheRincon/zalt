@@ -44,6 +44,11 @@ exacl = { version = "0.13", optional = true }
 [features]
 native-fs = ["dep:cap-std", "dep:cap-fs-ext", "dep:rustix", "dep:nix", "dep:exacl"]
 
+# docs.rs builds default features only, which would leave out the `fs` module
+# and break the crate docs' link to it.
+[package.metadata.docs.rs]
+features = ["native-fs"]
+
 [dev-dependencies]
 # The oracle: libzstd's reference seekable reader, an independent reading of
 # the Central Index (§7), and zstd(1) and tar, judging every archive the
