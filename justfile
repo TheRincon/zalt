@@ -149,7 +149,7 @@ ffi-smoke:
 #   just zalt info file.zst
 #   just zalt d --in-buf 1 file.zst
 zalt *ARGS:
-    @cargo run --release -q -p zalt-cli -- {{ARGS}}
+    @cargo run --release -q -p zalt -- {{ARGS}}
 
 # Decode every reference frame through the CLI, both directions.
 #
@@ -162,7 +162,7 @@ cli-corpus:
     set -uo pipefail
     root=zstd-fixtures
     [ -d "$root" ] || { echo "$root not present -- nothing to check"; exit 0; }
-    cargo build --release -q -p zalt-cli
+    cargo build --release -q -p zalt
     bin=target/release/zalt
 
     echo "=== golden-decompression: all must decode ==="
@@ -998,7 +998,7 @@ decodecorpus COUNT="200" SEED="0":
     n=$(ls "$out"/frames/*.zst 2>/dev/null | wc -l | tr -d ' ')
     echo "generated $n frames in $out/frames"
     [ "$n" -gt 0 ] || exit 1
-    cargo build --release -q -p zalt-cli
+    cargo build --release -q -p zalt
     fail=0
     checked=0
     for f in "$out"/frames/*.zst; do

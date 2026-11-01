@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords = ["zstd", "ffi", "c-abi", "swift", "compression"]
+categories = ["compression", "development-tools::ffi"]
 
 [lib]
 name = "zalt"

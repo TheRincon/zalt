@@ -1,16 +1,23 @@
 [package]
-name = "zalt-cli"
+# Named for the binary rather than the directory, so `cargo install zalt`
+# installs `zalt`.
+name = "zalt"
 description = "zalt(1): compress, decompress and inspect zstd frames, and create and extract ZALT-archives, from the shell."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+readme.workspace = true
+keywords = ["zstd", "zstandard", "compression", "archive", "cli"]
+categories = ["command-line-utilities", "compression"]
 
 [[bin]]
 name = "zalt"
 path = "src/main.rs"
+# `zalt-ffi`'s library is also called `zalt`, and rustdoc writes both to
+# `target/doc/zalt/` (cargo#6313). The binary's docs are its `--help`.
+doc = false
 
 [dependencies]
 zalt-codec.workspace = true

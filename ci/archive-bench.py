@@ -114,7 +114,7 @@ def main():
                  "Free memory (quit browsers, restart) and run again, or pass --force.")
 
     print("building zalt (release)…")
-    sh(f"cargo build --release -q -p zalt-cli", cwd=ROOT)
+    sh(f"cargo build --release -q -p zalt", cwd=ROOT)
 
     size = int(subprocess.run(["du", "-sk", str(corpus)], capture_output=True, text=True)
                .stdout.split()[0]) * 1024

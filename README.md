@@ -19,7 +19,10 @@ The design is described in [`doc/ZALT-MAC.md`](doc/ZALT-MAC.md).
 
 ## Status
 
-> **Pre-release (`0.0.1`).** Not published to crates.io.
+> **Pre-release (`0.1.0`).** Published to crates.io: the libraries, and the
+> CLI as `cargo install zalt`. Until 1.0, APIs and the ZLTA archive format may
+> still change between minor versions. Tested on Apple Silicon macOS and on
+> Linux; the CLI does not build on Windows yet.
 
 | Milestone | | |
 |---|---|---|
@@ -79,6 +82,10 @@ differential testing and benchmarks.
 
 ### As a library
 
+```sh
+cargo add zalt-embed   # or zalt-codec alone, for no_std
+```
+
 ```rust
 use zalt_embed::{Policy, decompress};
 
@@ -94,12 +101,13 @@ match history lives in the decoder rather than in that buffer.
 ### As a CLI
 
 `zalt(1)` compresses, decompresses and inspects zstd frames, and makes and
-reads ZALT-archives. Build it once and call the binary, or go through `just`,
-which builds in release mode first:
+reads ZALT-archives. Install it from crates.io, or in a clone build it once
+and call the binary, or go through `just`, which builds in release mode first:
 
 ```sh
-cargo build --release -p zalt-cli   # → target/release/zalt
-just zalt help                      # the same binary, via just
+cargo install zalt              # → ~/.cargo/bin/zalt
+cargo build --release -p zalt   # → target/release/zalt
+just zalt help                  # the same binary, via just
 ```
 
 `zalt help` and `zalt archive help` print every option; what follows is how
@@ -261,7 +269,7 @@ crates for higher-layer vocabulary and fails the build on a hit.
 | L3 | `zalt-ztml` | The ZTML recipe: a manifest and a dictionary | One content class |
 | — | `zalt-archive` | ZALT-archives built from standard zstd frames | Files and metadata |
 | — | `zalt-ffi` | C ABI, hand-written header | The boundary |
-| — | `zalt-cli` | `zalt(1)` | Files and flags |
+| — | `zalt` (`crates/zalt-cli`) | `zalt(1)` | Files and flags |
 | — | `zalt-bench` | Throughput harness, profiling | Corpora |
 | — | `zalt-recipe-train` | Dev tool: build and measure dictionaries | Sample sets |
 | — | `zlta-seekable-probe` | Test-only: checks ZLTA against zstd's seekable reader | The reference C |

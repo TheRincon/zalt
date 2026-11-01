@@ -25,7 +25,10 @@ fn cstr(p: *const std::ffi::c_char) -> String {
 #[test]
 fn version_and_backend_are_reportable() {
     assert_eq!(zalt_abi_version(), ZALT_ABI_VERSION);
-    assert!(cstr(zalt_version_string()).starts_with("zalt"));
+    assert_eq!(
+        cstr(zalt_version_string()),
+        concat!("zalt ", env!("CARGO_PKG_VERSION"))
+    );
     let backend = cstr(zalt_backend_name());
     assert!(backend == "neon" || backend == "scalar", "{backend}");
 }
