@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords = ["zstd", "zstandard", "dictionary", "compression", "ztml"]
+categories = ["compression", "no-std"]
 
 [dependencies]
 # `default-features = false` is the point, not an optimisation. This crate must
@@ -16,7 +19,7 @@ repository.workspace = true
 # Spelled as a path rather than `workspace = true` because cargo forbids a
 # member overriding an inherited `default-features`, and turning the default
 # off is the whole point here. The version still matches the workspace's.
-zalt-recipe = { path = "../zalt-recipe", version = "0.0.1", default-features = false }
+zalt-recipe = { path = "../zalt-recipe", version = "0.1.0", default-features = false }
 # For `entry()`, which parses the embedded dictionary so the baked-in path
 # resolves without a filesystem. L1, so the dependency points downward.
 zalt-codec.workspace = true
@@ -25,7 +28,7 @@ zalt-codec.workspace = true
 # Tests need the parser, to prove the .toml and the Rust value still agree.
 # Cargo applies dev-dependency features only when building tests, so a plain
 # `cargo build -p zalt-ztml` stays parser-free.
-zalt-recipe = { path = "../zalt-recipe", version = "0.0.1", features = ["parse", "std"] }
+zalt-recipe = { path = "../zalt-recipe", version = "0.1.0", features = ["parse", "std"] }
 
 [features]
 default = []

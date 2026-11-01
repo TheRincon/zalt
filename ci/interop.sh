@@ -35,7 +35,7 @@ command -v "$ZSTD" >/dev/null || { echo "need zstd on PATH (or \$ZSTD)" >&2; exi
 
 echo "building..."
 cargo build -q --release -p zalt-codec --example ruzstd_decompress
-cargo build -q --release -p zalt-cli
+cargo build -q --release -p zalt
 
 RUZSTD="target/release/examples/ruzstd_decompress"
 ZALT="target/release/zalt"

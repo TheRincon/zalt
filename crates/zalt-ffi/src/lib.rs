@@ -118,7 +118,9 @@ pub extern "C" fn zalt_abi_version() -> u32 {
 /// Library version string, NUL-terminated and statically allocated.
 #[unsafe(no_mangle)]
 pub extern "C" fn zalt_version_string() -> *const c_char {
-    c"zalt 0.0.1".as_ptr()
+    concat!("zalt ", env!("CARGO_PKG_VERSION"), "\0")
+        .as_ptr()
+        .cast()
 }
 
 /// Name of the acceleration backend this build selected.

@@ -32,7 +32,7 @@ blake3 = { version = "1.8", default-features = false, features = ["std", "pure"]
 # The oracle. A C dependency, which is acceptable in a dev-only crate and would
 # not be anywhere else — the layering forbids it below L3. `zstd-sys` here
 # tracks libzstd 1.5.7, matching the CLI that generates the fixtures.
-zstd = "0.13"
+zstd = "0.14.3"
 
 [profile.release]
 debug = true

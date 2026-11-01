@@ -6,7 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+readme.workspace = true
+keywords = ["zstd", "archive", "tar", "seekable", "compression"]
+categories = ["compression", "filesystem"]
 
 [dependencies]
 zalt-codec.workspace = true
@@ -41,6 +43,11 @@ exacl = { version = "0.13", optional = true }
 
 [features]
 native-fs = ["dep:cap-std", "dep:cap-fs-ext", "dep:rustix", "dep:nix", "dep:exacl"]
+
+# docs.rs builds default features only, which would leave out the `fs` module
+# and break the crate docs' link to it.
+[package.metadata.docs.rs]
+features = ["native-fs"]
 
 [dev-dependencies]
 # The oracle: libzstd's reference seekable reader, an independent reading of

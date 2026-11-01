@@ -8,6 +8,9 @@ rust-version.workspace = true
 # license (`LICENSE-ZSTD`); see the headers in `src/encode/`.
 license = "(Unlicense OR MIT OR Apache-2.0) AND BSD-3-Clause"
 repository.workspace = true
+readme.workspace = true
+keywords = ["zstd", "zstandard", "compression", "decompression", "rfc8878"]
+categories = ["compression", "no-std"]
 
 [dependencies]
 
