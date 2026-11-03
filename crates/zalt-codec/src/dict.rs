@@ -134,9 +134,8 @@ impl Dictionary {
         rest = &rest[REPEAT_BYTES..];
 
         let mut repeats = [0u32; REPEAT_COUNT];
-        for (slot, chunk) in repeats.iter_mut().zip(repeat_bytes.chunks_exact(4)) {
-            let v: [u8; 4] = chunk.try_into().map_err(|_| Error::Malformed)?;
-            *slot = u32::from_le_bytes(v);
+        for (slot, chunk) in repeats.iter_mut().zip(repeat_bytes.as_chunks::<4>().0) {
+            *slot = u32::from_le_bytes(*chunk);
         }
 
         let content = rest.to_vec();

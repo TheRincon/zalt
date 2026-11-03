@@ -75,7 +75,7 @@ just gate         # everything CI runs, in CI order
 just hooks-install  # activate the pre-push hook (once per clone)
 ```
 
-Requires a stable Rust toolchain (MSRV **1.85**, edition 2024),
+Requires a stable Rust toolchain (MSRV **1.88**, edition 2024),
 [`just`](https://github.com/casey/just) and
 [`cargo-nextest`](https://nexte.st/). `zstd` 1.5.7 is used as the reference for
 differential testing and benchmarks.

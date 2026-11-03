@@ -223,8 +223,8 @@ fn tag_matches(row: &[u8], tag: u8) -> u64 {
     const GATHER: u64 = 0x0102_0408_1020_4080;
     let pattern = u64::from(tag) * 0x0101_0101_0101_0101;
     let mut mask = 0u64;
-    for (i, chunk) in row.chunks_exact(8).enumerate() {
-        let x = u64::from_le_bytes(chunk.try_into().expect("eight bytes")) ^ pattern;
+    for (i, chunk) in row.as_chunks::<8>().0.iter().enumerate() {
+        let x = u64::from_le_bytes(*chunk) ^ pattern;
         let zero = !(((x & LOW7) + LOW7) | x) & HIGH;
         mask |= ((zero >> 7).wrapping_mul(GATHER) >> 56) << (8 * i);
     }

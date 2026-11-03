@@ -390,10 +390,10 @@ mod macos {
                 (n, v)
             })
             .collect();
-        if let Ok(fork) = fs::read(path.join("..namedfork/rsrc")) {
-            if !fork.is_empty() {
-                out.push((RESOURCE_FORK.into(), fork));
-            }
+        if let Ok(fork) = fs::read(path.join("..namedfork/rsrc"))
+            && !fork.is_empty()
+        {
+            out.push((RESOURCE_FORK.into(), fork));
         }
         out.sort();
         out
