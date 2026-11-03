@@ -390,24 +390,22 @@ fn extents<S: Source + ?Sized>(src: &S, header_len: u64) -> (Vec<Extent>, Option
     let limits = ReadLimits::default();
     if let Ok((table, _)) =
         layout::read_seek_table(len, |at, n| src.read_at(at, n), limits.max_frames)
-    {
-        if table
+        && table
             .first()
             .is_some_and(|e| u64::from(e.compressed_size) == header_len)
-        {
-            let mut offset = 0u64;
-            let mut out = Vec::with_capacity(table.len());
-            for e in &table {
-                out.push(Extent {
-                    offset,
-                    size: u64::from(e.compressed_size),
-                    listed: Some((u64::from(e.decompressed_size), e.checksum.unwrap_or(0))),
-                });
-                offset += u64::from(e.compressed_size);
-            }
-            out.remove(0);
-            return (out, None);
+    {
+        let mut offset = 0u64;
+        let mut out = Vec::with_capacity(table.len());
+        for e in &table {
+            out.push(Extent {
+                offset,
+                size: u64::from(e.compressed_size),
+                listed: Some((u64::from(e.decompressed_size), e.checksum.unwrap_or(0))),
+            });
+            offset += u64::from(e.compressed_size);
         }
+        out.remove(0);
+        return (out, None);
     }
 
     let mut out = Vec::new();
@@ -508,10 +506,10 @@ fn decode_data_frame(
         .ok_or("a data frame without Frame_Content_Size (§5.2)")?;
     let content =
         frames::decode_exactly(frame, declared, dictionaries).map_err(|e| e.to_string())?;
-    if let Some((size, checksum)) = listed {
-        if size != content.len() as u64 || frames::seek_checksum(&content) != checksum {
-            return Err("decodes, but not to what the seek table recorded".into());
-        }
+    if let Some((size, checksum)) = listed
+        && (size != content.len() as u64 || frames::seek_checksum(&content) != checksum)
+    {
+        return Err("decodes, but not to what the seek table recorded".into());
     }
     Ok(content)
 }
@@ -735,34 +733,34 @@ pub fn recover_with<S: Source + ?Sized, W: Write>(
         let mut boundary = tar.at_boundary();
         // Lost the thread at damage, and the index knows where a member
         // starts here: take it up again, if the tar header agrees.
-        if tar.broken.is_some() {
-            if let (Some(index), Ok(content)) = (&index, &decoded) {
-                // Entries are in stream order (§7.1), so this is a search, not
-                // a scan per frame.
-                let named = index
-                    .entries
-                    .binary_search_by_key(&stream, |e| e.header_offset)
-                    .ok()
-                    .map(|k| &index.entries[k]);
-                let agrees = named.is_some_and(|e| {
-                    matches!(tar::parse_member_prefix(content), Ok(Some(m)) if m.path == e.path)
-                });
-                if agrees {
-                    tar.resync(stream, false);
-                    boundary = true;
-                    resynced = true;
-                }
+        if tar.broken.is_some()
+            && let (Some(index), Ok(content)) = (&index, &decoded)
+        {
+            // Entries are in stream order (§7.1), so this is a search, not
+            // a scan per frame.
+            let named = index
+                .entries
+                .binary_search_by_key(&stream, |e| e.header_offset)
+                .ok()
+                .map(|k| &index.entries[k]);
+            let agrees = named.is_some_and(
+                |e| matches!(tar::parse_member_prefix(content), Ok(Some(m)) if m.path == e.path),
+            );
+            if agrees {
+                tar.resync(stream, false);
+                boundary = true;
+                resynced = true;
             }
         }
         // No index to ask: if asked to, guess that a frame starting with a
         // valid tar header starts a member.
-        if tar.broken.is_some() && how.search {
-            if let Ok(content) = &decoded {
-                if matches!(tar::parse_member_prefix(content), Ok(Some(_))) {
-                    tar.resync(stream, true);
-                    boundary = true;
-                }
-            }
+        if tar.broken.is_some()
+            && how.search
+            && let Ok(content) = &decoded
+            && matches!(tar::parse_member_prefix(content), Ok(Some(_)))
+        {
+            tar.resync(stream, true);
+            boundary = true;
         }
         match decoded {
             Ok(content) => {

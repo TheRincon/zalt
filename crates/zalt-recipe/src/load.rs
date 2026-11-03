@@ -96,10 +96,10 @@ fn resolve_dictionary(recipe: &Recipe, manifest: &Path) -> Result<Option<Diction
     // does not produce a decode error later — it produces wrong bytes, because
     // a frame can only be decoded with the dictionary that compressed it (§7).
     // The mismatch is cheap to catch here and invisible everywhere after.
-    if let Some(claimed) = reference.id {
-        if dictionary.id() != claimed {
-            return Err(Error::whole_file(ErrorKind::DictionaryIdMismatch));
-        }
+    if let Some(claimed) = reference.id
+        && dictionary.id() != claimed
+    {
+        return Err(Error::whole_file(ErrorKind::DictionaryIdMismatch));
     }
 
     Ok(Some(dictionary))

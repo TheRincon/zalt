@@ -165,10 +165,10 @@ impl FrameHeader {
             }
         };
 
-        if let (Some(limit), Some(declared)) = (limits.max_decoded_size, frame_content_size) {
-            if declared > limit {
-                return Err(Error::TooLarge);
-            }
+        if let (Some(limit), Some(declared)) = (limits.max_decoded_size, frame_content_size)
+            && declared > limit
+        {
+            return Err(Error::TooLarge);
         }
 
         Ok(Self {

@@ -116,11 +116,11 @@ pub fn build(
 
     let mut blob: Vec<u8> = parts.iter().flat_map(|p| p.bytes.iter().copied()).collect();
     let mut trimmed = 0usize;
-    if let Some(limit) = budget {
-        if blob.len() > limit {
-            trimmed = blob.len() - limit;
-            blob.drain(..trimmed);
-        }
+    if let Some(limit) = budget
+        && blob.len() > limit
+    {
+        trimmed = blob.len() - limit;
+        blob.drain(..trimmed);
     }
 
     Ok(Built {

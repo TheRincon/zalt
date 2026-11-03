@@ -278,9 +278,6 @@ impl Recipe {
 }
 
 fn rule_claims(m: &Match, content_type: Option<&str>, filename: Option<&str>) -> bool {
-    // Written without let-chains on purpose: the workspace declares
-    // `rust-version = "1.85"` and let-chains landed in 1.88, so using one here
-    // would break the stated MSRV for a line of syntax.
     if content_type.is_some_and(|ct| m.claims_content_type(ct)) {
         return true;
     }

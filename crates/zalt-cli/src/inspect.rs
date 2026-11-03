@@ -280,14 +280,14 @@ pub fn render(name: &str, data: &[u8], report: &Report) -> String {
                 }
 
                 let _ = writeln!(s, "    frame bytes    {length}");
-                if let Some(content) = header.frame_content_size {
-                    if *length > 0 {
-                        let _ = writeln!(
-                            s,
-                            "    ratio          {:.2}x",
-                            content as f64 / *length as f64
-                        );
-                    }
+                if let Some(content) = header.frame_content_size
+                    && *length > 0
+                {
+                    let _ = writeln!(
+                        s,
+                        "    ratio          {:.2}x",
+                        content as f64 / *length as f64
+                    );
                 }
             }
         }

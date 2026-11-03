@@ -133,7 +133,7 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
                     )
                     .as_bytes(),
                 );
-                if i % 97 == 0 {
+                if i.is_multiple_of(97) {
                     v.extend_from_slice(b"    <!-- a comment that recurs, a long way back -->\n");
                 }
                 i += 1;

@@ -102,7 +102,7 @@ impl Default for FramePolicy {
 impl FramePolicy {
     fn validate(&self) -> Result<()> {
         let block = BLOCK as u64;
-        let ok = self.large_chunk % block == 0
+        let ok = self.large_chunk.is_multiple_of(block)
             && self.large_chunk >= block
             && self.large_chunk <= frames::MAX_FRAME_CONTENT
             && self.solid_target <= frames::MAX_FRAME_CONTENT

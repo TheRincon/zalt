@@ -441,10 +441,10 @@ impl<B: Backend> Decoder<B> {
                     // that dictionary. Decoding it against a different one, or
                     // none, produces plausible output from the wrong history —
                     // which is precisely what the ID is in the format to stop.
-                    if let Some(id) = header.dictionary_id {
-                        if self.dictionary.as_ref().map(|d| d.id()) != Some(id) {
-                            return Err(Error::DictionaryRequired { id });
-                        }
+                    if let Some(id) = header.dictionary_id
+                        && self.dictionary.as_ref().map(|d| d.id()) != Some(id)
+                    {
+                        return Err(Error::DictionaryRequired { id });
                     }
 
                     // Arm the window at the declared ceiling. Nothing is
@@ -785,15 +785,15 @@ impl<B: Backend> Decoder<B> {
             .decoded
             .checked_add(additional)
             .ok_or(Error::TooLarge)?;
-        if let Some(limit) = self.limits.max_decoded_size {
-            if total > limit {
-                return Err(Error::TooLarge);
-            }
+        if let Some(limit) = self.limits.max_decoded_size
+            && total > limit
+        {
+            return Err(Error::TooLarge);
         }
-        if let Some(declared) = self.frame.and_then(|f| f.frame_content_size) {
-            if total > declared {
-                return Err(Error::TooLarge);
-            }
+        if let Some(declared) = self.frame.and_then(|f| f.frame_content_size)
+            && total > declared
+        {
+            return Err(Error::TooLarge);
         }
         Ok(())
     }
@@ -812,10 +812,10 @@ impl<B: Backend> Decoder<B> {
     }
 
     fn verify_declared_size(&self) -> Result<()> {
-        if let Some(declared) = self.frame.and_then(|f| f.frame_content_size) {
-            if self.decoded != declared {
-                return Err(Error::Malformed);
-            }
+        if let Some(declared) = self.frame.and_then(|f| f.frame_content_size)
+            && self.decoded != declared
+        {
+            return Err(Error::Malformed);
         }
         Ok(())
     }

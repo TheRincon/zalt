@@ -622,11 +622,11 @@ impl<'a> Tree<'a> {
         };
         let key = dirs.join(&b'/');
         let name = OsStr::from_bytes(name);
-        if let Some((k, d)) = &self.last {
-            if *k == key {
-                let d = d.try_clone().map_err(|e| io(self.dest, e))?;
-                return Ok(Some((d, name)));
-            }
+        if let Some((k, d)) = &self.last
+            && *k == key
+        {
+            let d = d.try_clone().map_err(|e| io(self.dest, e))?;
+            return Ok(Some((d, name)));
         }
         let mut dir = self.root.try_clone().map_err(|e| io(self.dest, e))?;
         for i in 0..dirs.len() {
@@ -733,19 +733,16 @@ fn apply(
     }
     if let Some(q) = &options.quarantine {
         let own = options.xattrs && m.xattrs.iter().any(|(n, _)| n == meta::XATTR_QUARANTINE);
-        if !own {
-            if let Err(err) = set_xattr(file, meta::XATTR_QUARANTINE, q) {
-                warnings.warn(e, format!("quarantine: {err}"));
-            }
+        if !own && let Err(err) = set_xattr(file, meta::XATTR_QUARANTINE, q) {
+            warnings.warn(e, format!("quarantine: {err}"));
         }
     }
     #[cfg(target_os = "macos")]
-    if options.acls {
-        if let Some(text) = &m.acl {
-            if let Err(why) = macos::apply_acl(file, text) {
-                warnings.warn(e, format!("ACL: {why}"));
-            }
-        }
+    if options.acls
+        && let Some(text) = &m.acl
+        && let Err(why) = macos::apply_acl(file, text)
+    {
+        warnings.warn(e, format!("ACL: {why}"));
     }
     if options.restore_owner {
         std::os::unix::fs::fchown(file, Some(m.uid as u32), Some(m.gid as u32))

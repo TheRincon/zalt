@@ -80,31 +80,24 @@ impl Xxh64 {
         //
         // Borrowed, not copied. The obvious formulation reads each stripe into
         // a local `[u8; 32]` first, which doubles the checksum's memory traffic
-        // — every byte of output moved once more for no reason. `chunks_exact`
-        // already guarantees the length, so the conversion is infallible; it is
-        // written as a match rather than an `unwrap` because nothing reachable
-        // from parsing may panic, and a check the optimiser removes costs
-        // nothing to keep.
+        // — every byte of output moved once more for no reason. `as_chunks`
+        // borrows each stripe and lane as an array, so there is no length
+        // conversion at all, and no panic to keep out of reach of parsing.
         // The four accumulators are hoisted into locals for the whole run and
         // written back once. Reached through `&mut self` they are a field load
         // and store per round; the four chains are independent of each other
         // and *only* of each other, so keeping them in registers across stripes
         // is what lets the four dependent multiply chains overlap at all.
         let mut acc = self.acc;
-        let mut chunks = data.chunks_exact(32);
-        for stripe in &mut chunks {
-            if let Ok(s) = <&[u8; 32]>::try_from(stripe) {
-                for (a, lane) in acc.iter_mut().zip(s.chunks_exact(8)) {
-                    if let Ok(bytes) = <&[u8; 8]>::try_from(lane) {
-                        *a = Self::round(*a, u64::from_le_bytes(*bytes));
-                    }
-                }
+        let (stripes, rem) = data.as_chunks::<32>();
+        for stripe in stripes {
+            for (a, lane) in acc.iter_mut().zip(stripe.as_chunks::<8>().0) {
+                *a = Self::round(*a, u64::from_le_bytes(*lane));
             }
         }
         self.acc = acc;
 
         // Stash the remainder.
-        let rem = chunks.remainder();
         self.buf[..rem.len()].copy_from_slice(rem);
         self.buf_len = rem.len();
     }
