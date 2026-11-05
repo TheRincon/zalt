@@ -13,7 +13,7 @@ Three things it tries to be, in order. Each is useful without the ones below it:
 3. A tuned specialization for Apple Silicon, and separately for specific content
    classes.
 
-The design is described in [`doc/ZALT-MAC.md`](doc/ZALT-MAC.md).
+The design is described in [`doc/ZALT-MAC.md`](https://github.com/TheRincon/zalt/blob/main/doc/ZALT-MAC.md).
 
 ---
 
@@ -312,7 +312,7 @@ anything.
 | 3.4–11.8 KB structured documents | **214 MB/s** | 504 MB/s | 2.36x |
 
 Reproduce with `just bench-corpus` then `just measure corpus 9`. **Read
-[§10's measurement protocol](doc/ZALT-MAC.md) before quoting any of this** —
+[§10's measurement protocol](https://github.com/TheRincon/zalt/blob/main/doc/ZALT-MAC.md) before quoting any of this** —
 these figures have been wrong more than once, always for reasons that had
 nothing to do with the code. In particular: `just measure` stamps the machine
 state on its output and warns when the machine is not quiet, comparing two
@@ -370,7 +370,7 @@ justfile         one entry point for every task; CI runs the same recipes
 zalt builds on other people's work, and tries to say exactly where.
 
 - **Zstandard**, by Yann Collet and the zstd contributors at Meta.
-  [RFC 8878](doc/rfc8878.txt) (Y. Collet and M. Kucherawy) is what the decoder
+  [RFC 8878](https://github.com/TheRincon/zalt/blob/main/doc/rfc8878.txt) (Y. Collet and M. Kucherawy) is what the decoder
   is written from. libzstd 1.5.7 is the reference everything here is measured
   against, and the encoder's starting point. These follow its source, and the
   module docs say how closely:
@@ -398,7 +398,7 @@ zalt builds on other people's work, and tries to say exactly where.
 - **cap-std** and **rustix**, by Dan Gohman, Jakub Konka and the Bytecode
   Alliance: extraction's file system access, relative to directory handles, so
   an archive can't write outside its destination.
-- [RFC 9842](doc/rfc9842.txt), Compression Dictionary Transport (P. Meenan and
+- [RFC 9842](https://github.com/TheRincon/zalt/blob/main/doc/rfc9842.txt), Compression Dictionary Transport (P. Meenan and
   Y. Weiss), which defines the `dcz` streams `zalt-recipe` reads and resolves
   dictionaries for.
 
@@ -408,10 +408,10 @@ zalt is not affiliated with or endorsed by Meta or the zstd project.
 
 ## License
 
-Released into the public domain under the [Unlicense](UNLICENSE). Where a
+Released into the public domain under the [Unlicense](https://github.com/TheRincon/zalt/blob/main/UNLICENSE). Where a
 public-domain dedication is not recognized, or where you prefer a conventional
-license, you may instead use it under [MIT](LICENSE-MIT) or
-[Apache-2.0](LICENSE-APACHE), at your option. Apache-2.0 includes an express
+license, you may instead use it under [MIT](https://github.com/TheRincon/zalt/blob/main/LICENSE-MIT) or
+[Apache-2.0](https://github.com/TheRincon/zalt/blob/main/LICENSE-APACHE), at your option. Apache-2.0 includes an express
 patent grant.
 
 Third-party files keep their own licenses: `zstd-fixtures/` and
@@ -422,7 +422,7 @@ Four of the encoder's modules follow libzstd's source closely enough to be
 treated as derived from it: `optimal.rs`, `sequences.rs`, `fse.rs` and
 `huffman.rs` in `crates/zalt-codec/src/encode/`. Those parts remain under
 zstd's BSD license (Copyright (c) Meta Platforms, Inc. and affiliates), in
-[`crates/zalt-codec/LICENSE-ZSTD`](crates/zalt-codec/LICENSE-ZSTD), so
+[`crates/zalt-codec/LICENSE-ZSTD`](https://github.com/TheRincon/zalt/blob/main/crates/zalt-codec/LICENSE-ZSTD), so
 `zalt-codec` is licensed `(Unlicense OR MIT OR Apache-2.0) AND BSD-3-Clause`.
 In practice: if you redistribute `zalt-codec`, or anything built on it, in
 source or binary form, include that notice, as you would for zstd itself.
