@@ -54,8 +54,24 @@ jobs:
       - uses: extractions/setup-just@v2
       - run: just layering
 
+  # The declared minimum Rust. Every other job builds on stable, where a
+  # feature newer than `rust-version` compiles fine. Both runners, because the
+  # NEON kernels and the macOS metadata code compile only on one of them each.
+  msrv:
+    strategy:
+      matrix:
+        os: [macos-26, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just msrv
+
   # From deny.toml: permissive licenses only, no known security
-  # advisories, crates.io only.
+  # advisories, crates.io only. `audit.yml` runs the same check weekly, for
+  # advisories that land while nothing is pushed.
   deny:
     runs-on: ubuntu-latest
     steps:

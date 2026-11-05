@@ -24,6 +24,11 @@ nostd_target := "thumbv7em-none-eabi"
 # wrong on some hosts. Asking rustc what it is removes the guess.
 fuzz_target_triple := `rustc +nightly -vV 2>/dev/null | awk '/^host:/{print $2}'`
 fixtures := "crates/zalt-codec/tests/fixtures"
+# The crates that ship: the same set `cargo publish --workspace` uploads with
+# these excluded. The three are `publish = false`.
+published := "--workspace --exclude zalt-bench --exclude zalt-recipe-train --exclude zlta-seekable-probe"
+# The declared minimum Rust, read from `rust-version` so it has one source.
+msrv := `sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml`
 
 # List available recipes.
 default:
@@ -195,6 +200,46 @@ no-std:
     cargo build -p zalt-recipe --target {{nostd_target}} --no-default-features
     cargo build -p zalt-recipe --target {{nostd_target}} --no-default-features --features parse
     cargo build -p zalt-ztml --target {{nostd_target}}
+
+# Build what ships on the declared minimum Rust.
+#
+# Nothing else does. `rust-toolchain.toml` pins stable, so a feature newer than
+# `rust-version` compiles everywhere and fails only for a user on the older
+# compiler — 0.1.0 nearly shipped declaring 1.85 with let-chains, which need
+# 1.88. `--locked` checks the dependency versions the lockfile ships, and
+# `+{{msrv}}` is explicit because the toolchain file would otherwise win. Its
+# own target directory, so switching compilers does not throw away the stable
+# build cache. Not in `gate`: it downloads a toolchain the first time.
+[doc("Check the published crates build on the declared MSRV.")]
+msrv:
+    rustup toolchain install {{msrv}} --profile minimal
+    rustup target add --toolchain {{msrv}} {{nostd_target}}
+    CARGO_TARGET_DIR=target/msrv cargo +{{msrv}} check --locked {{published}}
+    CARGO_TARGET_DIR=target/msrv cargo +{{msrv}} check --locked -p zalt-codec -p zalt-ztml --target {{nostd_target}}
+    CARGO_TARGET_DIR=target/msrv cargo +{{msrv}} check --locked -p zalt-recipe --no-default-features --features parse --target {{nostd_target}}
+
+# Package the `zalt` binary for a release, as
+# `target/dist/zalt-v<version>-<target>.tar.gz` plus its `.sha256`, with the
+# licenses and README beside it. The release workflow runs this once per
+# target; locally it packages for this machine. (The host is asked for here
+# rather than in a variable: `just` evaluates every backtick variable on every
+# run, and calling `rustc` makes rustup install the pinned toolchain, even in
+# CI jobs that have no Rust step.)
+[doc("Package the zalt binary and licenses as a release tarball.")]
+dist TARGET="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="{{TARGET}}"
+    [ -n "$target" ] || target=$(rustc -vV | awk '/^host:/{print $2}')
+    version=$(cargo pkgid -p zalt | sed 's/.*[#@]//')
+    name="zalt-v${version}-${target}"
+    cargo build --release --locked -p zalt --target "$target"
+    rm -rf "target/dist/$name" "target/dist/$name.tar.gz" "target/dist/$name.tar.gz.sha256"
+    mkdir -p "target/dist/$name"
+    cp "target/$target/release/zalt" LICENSE-APACHE LICENSE-MIT UNLICENSE README.md "target/dist/$name/"
+    tar -C target/dist -czf "target/dist/$name.tar.gz" "$name"
+    (cd target/dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+    echo "target/dist/$name.tar.gz"
 
 # Miri over the scalar path.
 #
